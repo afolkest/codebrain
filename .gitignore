@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Local DB / cache (rebuildable; never synced — see DESIGN.md)
+*.db
+*.db-wal
+*.db-shm
+var/

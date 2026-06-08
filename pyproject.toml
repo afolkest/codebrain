@@ -1,0 +1,16 @@
+[project]
+name = "codebrain"
+version = "0.0.1"
+description = "Searchable store of coding-agent sessions (Claude, Codex, pi)"
+requires-python = ">=3.9"
+dependencies = []  # stdlib-only for the spine; embeddings/sqlite-vec come later
+
+[project.scripts]
+sessdb = "codebrain.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["codebrain", "codebrain.adapters"]
