@@ -117,24 +117,28 @@ def upsert_session(conn: sqlite3.Connection, s: SessionRow) -> None:
     )
 
 
-def upsert_event(conn: sqlite3.Connection, e: EventRow) -> None:
-    # Copy-consistency check (SCHEMA.md): a hit with differing content signals an
-    # id collision or non-verbatim copy — flag, don't silently merge.
+def upsert_event(conn: sqlite3.Connection, e: EventRow) -> bool:
+    """Insert/refresh one event. Returns True if written, False if SKIPPED due to a
+    copy-consistency conflict — an existing row with the same event_id but different
+    actor/type/text (an id collision or a non-verbatim copy). On conflict we keep the
+    first row untouched and flag it (SCHEMA.md "flag, don't merge"); the caller counts
+    it and the rest of the session still commits. Skipping one event is strictly safer
+    than aborting the whole file, and conflicts are near-impossible (ids are globally
+    unique for claude/codex, copy-invariant for pi)."""
     row = conn.execute(
         "SELECT actor, type, text FROM events WHERE event_id=?", (e.event_id,)
     ).fetchone()
     if row is not None and (row["actor"], row["type"], row["text"]) != (e.actor, e.type, e.text):
-        raise ValueError(
-            f"event_id collision / non-verbatim copy: {e.event_id} "
-            f"({row['actor']}/{row['type']} != {e.actor}/{e.type})"
-        )
+        return False
     conn.execute(
         """
         INSERT INTO events (event_id, origin_session_id, ts, actor, type, text,
             refs, tool_call_event_id, raw)
         VALUES (?,?,?,?,?,?,?,?,?)
         ON CONFLICT(event_id) DO UPDATE SET
-            origin_session_id=COALESCE(excluded.origin_session_id, origin_session_id),
+            -- keep the FIRST non-null origin: an event is authored by exactly one
+            -- session, so a later (inherited) copy must not overwrite it.
+            origin_session_id=COALESCE(origin_session_id, excluded.origin_session_id),
             ts=excluded.ts, actor=excluded.actor, type=excluded.type,
             text=excluded.text, refs=excluded.refs,
             tool_call_event_id=excluded.tool_call_event_id, raw=excluded.raw
@@ -142,6 +146,7 @@ def upsert_event(conn: sqlite3.Connection, e: EventRow) -> None:
         (e.event_id, e.origin_session_id, e.ts, e.actor, e.type, e.text,
          json.dumps(e.refs), e.tool_call_event_id, json.dumps(e.raw)),
     )
+    return True
 
 
 def upsert_placement(conn: sqlite3.Connection, p: PlacementRow) -> None:

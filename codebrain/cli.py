@@ -1,6 +1,6 @@
 """sessdb — thin CLI over the codebrain SQLite cache.
 
-  sessdb ingest [--raw ~/.claude]      build/update the local DB
+  sessdb ingest [--source all]         build/update the local DB (claude+codex+pi)
   sessdb list [--limit N]              recent sessions
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--limit N]    FTS over event text
@@ -18,7 +18,9 @@ import sys
 from pathlib import Path
 
 from codebrain.db import DEFAULT_DB, connect, has_fts5
-from codebrain.ingest import DEFAULT_CLAUDE_ROOT, ingest_claude
+from codebrain.ingest import (
+    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES, ingest_all,
+)
 
 
 def _oneline(s, n=200):
@@ -38,10 +40,11 @@ def _resolve_session(conn, ident: str):
 
 def cmd_ingest(args):
     conn = connect(args.db)
-    print(f"ingesting claude logs from {args.raw} → {args.db}")
-    stats = ingest_claude(conn, raw_root=Path(args.raw))
+    sources = SOURCES if args.source == "all" else (args.source,)
+    print(f"ingesting [{', '.join(sources)}] → {args.db}")
+    total = ingest_all(conn, sources=sources, machine=args.machine)
     conn.close()
-    print("done: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
 
 
 def cmd_list(args):
@@ -118,7 +121,8 @@ def cmd_search(args):
 
 def cmd_grep(args):
     rg = shutil.which("rg")
-    paths = args.paths or [str(Path(args.raw))]
+    default_roots = [str(DEFAULT_CLAUDE_ROOT), str(DEFAULT_CODEX_ROOT), str(DEFAULT_PI_ROOT)]
+    paths = args.paths or [p for p in default_roots if Path(p).exists()]
     if rg:
         sys.exit(subprocess.call([rg, args.pattern, *paths]))
     sys.exit(subprocess.call(["grep", "-rn", args.pattern, *paths]))
@@ -136,7 +140,9 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("ingest", help="build/update the DB from raw logs")
-    sp.add_argument("--raw", default=str(DEFAULT_CLAUDE_ROOT))
+    sp.add_argument("--source", choices=("all",) + SOURCES, default="all",
+                    help="which source(s) to ingest (default all)")
+    sp.add_argument("--machine", default=None, help="override hostname tag")
     sp.set_defaults(func=cmd_ingest)
 
     sp = sub.add_parser("list", help="recent sessions")
@@ -153,10 +159,9 @@ def main(argv=None):
     sp.add_argument("--limit", type=int, default=20)
     sp.set_defaults(func=cmd_search)
 
-    sp = sub.add_parser("grep", help="ripgrep over raw logs")
+    sp = sub.add_parser("grep", help="ripgrep over raw logs (all sources by default)")
     sp.add_argument("pattern")
     sp.add_argument("paths", nargs="*")
-    sp.add_argument("--raw", default=str(DEFAULT_CLAUDE_ROOT))
     sp.set_defaults(func=cmd_grep)
 
     sp = sub.add_parser("schema", help="print the DDL")

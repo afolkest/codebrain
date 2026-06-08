@@ -4,19 +4,22 @@ A searchable store of my coding-agent sessions (Claude, Codex, pi). See
 [DESIGN.md](DESIGN.md) for architecture, [SCHEMA.md](SCHEMA.md) for the canonical
 schema, and [`formats/`](formats/) for the reverse-engineered log formats.
 
-**Status:** spine proven end-to-end for the Claude main-transcript path —
-`raw logs → adapter → SQLite (3 tables) → CLI + FTS + grep + raw SQL`.
+**Status:** all three sources land on one schema —
+`raw logs → per-source adapter → SQLite (3 tables) → CLI + FTS + grep + raw SQL`.
+Proven on real logs: **~1,970 sessions / ~380k events** from Claude, Codex, and pi,
+ingested with zero errors (claude 90% live, codex 98%, pi 94%).
 
 ## Quickstart
 
 ```bash
 pip install -e .            # or run as: python3 -m codebrain <cmd>
 
-sessdb ingest               # build the DB from ~/.claude (read-only) -> ~/.codebrain/codebrain.db
-sessdb list                 # recent sessions
+sessdb ingest               # build the DB from ~/.claude + ~/.codex + ~/.pi (read-only)
+sessdb ingest --source pi   # …or just one source
+sessdb list                 # recent sessions (any source)
 sessdb show <session>       # a session's live transcript (--all includes rolled-back)
-sessdb search <query>       # FTS5 over event text (ranked)
-sessdb grep <pattern>       # ripgrep over the raw logs
+sessdb search <query>       # FTS5 over event text (ranked, cross-source)
+sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
 sessdb schema               # print the DDL
 ```
 
@@ -34,10 +37,26 @@ arbitrary joins — the schema is the interface (`sessdb schema`).
 
 Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER BY seq`.
 
+## What each adapter handles
+
+- **Claude** (`parentUuid` tree) — bridged-parent linearization, parallel-tool
+  results, compaction reconnection, resume re-emission dedup.
+- **Codex** (flat append-only log, no native tree) — **synthesized** turn forest:
+  turns anchored on the clean `user_message` (works on 0.39→0.137, incl. the old
+  logs that lack `task_started`); `thread_rolled_back{n}` pops live user-turns as
+  dead side branches; `apply_patch`/`patch_apply_end` files; sub-agent/fork lineage.
+- **pi** (`parentId` tree) — the cross-file case the schema exists for: resume/branch
+  copies the parent's live prefix **verbatim** into a new file, so a shared event is
+  **one `events` row** with N placements (origin `inherited=0` + copies `inherited=1`),
+  keyed on the copy-invariant `pi:<8hex>:<ts>`.
+
 ## Current limitations
 
-- **Claude only**, **main transcript path only** — sub-agents (`<sessionId>/subagents/`),
-  Codex, and pi adapters are not built yet.
+- **Main transcript path only** — sub-agents are deferred: Claude `<sessionId>/subagents/`
+  (inline `isSidechain` copies are ignored), pi `<session>/<runId>/run-<i>/`. Codex
+  sub-agent rollouts *are* ingested (they're standalone files) with a parent-session
+  link; the spawn-event link (`spawn_event_id`) is a later cross-file slice.
 - Ingest re-reads all files each run (idempotent upserts); incremental ingest,
   the collector→pool step, and embeddings/sqlite-vec are later slices.
-- `bash`-side file mutations aren't tracked in `refs` (known gap across all sources).
+- `bash`-side file mutations aren't tracked in `refs` (known gap across all sources);
+  Codex reasoning is encrypted (≥2026-04) and excluded everywhere.

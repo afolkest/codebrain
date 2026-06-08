@@ -1,6 +1,6 @@
 # Format notes — Codex
 
-Reverse-engineered from real logs on this machine (`~/.codex`), spanning **2025-09 → 2026-06** (cli `0.x`, latest observed `0.136.0`). Empirical, not spec — and it **drifts hard across versions** (see the timeline; it is the headline of this doc). Read alongside `claude.md`: the two formats are structurally opposite — Claude is a `uuid` tree, Codex is a flat append-only log with explicit event markers.
+Reverse-engineered from real logs on this machine (`~/.codex`), spanning **2025-09 → 2026-06** (cli `0.x`, latest observed `0.137.0-alpha.4`). Empirical, not spec — and it **drifts hard across versions** (see the timeline; it is the headline of this doc). Read alongside `claude.md`: the two formats are structurally opposite — Claude is a `uuid` tree, Codex is a flat append-only log with explicit event markers.
 
 ## Location & layout
 
@@ -27,7 +27,9 @@ A *single tool* changed its log schema repeatedly over 9 months. The adapter **m
 | **`session_meta`** | `instructions`, no lineage fields | (transitional) | `base_instructions` + `forked_from_id`/`agent_role`/`agent_nickname`/`dynamic_tools`/`memory_mode` |
 | **multi-agent** | — | — | `spawn_agent`/`wait_agent`/`close_agent` + `agent_role` sessions |
 
-Stable across all versions: the `{type,timestamp,payload}` envelope; `session_meta`/`turn_context`/`response_item`/`event_msg`/`compacted` partition; `function_call`↔`function_call_output` pairing by `call_id`; `task_started`/`task_complete`; `turn_aborted`; `compacted`; `update_plan`.
+Stable across all versions: the `{type,timestamp,payload}` envelope; `session_meta`/`turn_context`/`response_item`/`event_msg`/`compacted` partition; `function_call`↔`function_call_output` pairing by `call_id`; `turn_aborted`; `compacted`; `update_plan`.
+
+**Correction (verified against 0.39, 2025-09):** `task_started`/`task_complete` are **not** universal — the earliest logs have neither (and no `thread_rolled_back` either). So an adapter must **not** anchor turns on `task_started`. The codebrain adapter instead anchors a turn on the clean `event_msg.user_message`, which is present in every version; `thread_rolled_back{n}` (when present) pops the last `n` of those user-turns.
 
 ## The file is a flat append-only event log (no uuid tree)
 

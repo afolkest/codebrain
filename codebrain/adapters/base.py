@@ -7,8 +7,30 @@ An adapter turns one raw session file into a `ParsedSession`:
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+
+def read_records(path: Path) -> list:
+    """Tolerant JSONL read shared by every adapter: skip blank/garbled lines and a
+    partial trailing line in an actively-written session; tag each dict with its
+    0-based source line as ``_line`` (used for ordering / event ids)."""
+    records = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for i, line in enumerate(fh):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                rec["_line"] = i
+                records.append(rec)
+    return records
 
 
 @dataclass

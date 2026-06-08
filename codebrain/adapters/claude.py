@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from codebrain.adapters.base import EventRow, ParsedSession, PlacementRow, SessionRow
+from codebrain.adapters.base import EventRow, ParsedSession, PlacementRow, SessionRow, read_records
 
 SOURCE = "claude"
 
@@ -70,19 +70,7 @@ def _render_tool_result(block: dict, rec: dict):
 
 
 def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSession]:
-    records = []
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for i, line in enumerate(fh):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # tolerate a partial trailing line in an active session
-            if isinstance(rec, dict):
-                rec["_line"] = i
-                records.append(rec)
+    records = read_records(path)
     if not records:
         return None
 
@@ -217,7 +205,7 @@ def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSess
 
     # ---- tip = childless emitted event, max (ts, line, idx) ----
     has_child = set(p for p in parent_of.values() if p)
-    leaves = [e.event_id for e in events if e.event_id not in has_child]
+    leaves = [e.event_id for e in events if e.event_id not in has_child] or [e.event_id for e in events]
     tip = max(leaves, key=lambda eid: (meta[eid]["ts"], meta[eid]["line"], meta[eid]["idx"]))
 
     # ---- live set: ancestors of tip + paired results of live tool_calls ----
