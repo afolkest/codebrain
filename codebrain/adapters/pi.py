@@ -118,7 +118,8 @@ def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSess
     for rec in records:
         if rec.get("type") != "message":
             continue
-        m = rec.get("message") or {}
+        m = rec.get("message")
+        m = m if isinstance(m, dict) else {}   # tolerate a non-dict message (format drift)
         role = m.get("role")
         rid = rec.get("id")
         if not isinstance(rid, str):

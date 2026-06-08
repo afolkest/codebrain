@@ -82,11 +82,15 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) 
             if enrich is not None:
                 enrich(parsed)
             upsert_session(conn, parsed.session)
+            skipped: set = set()
             for e in parsed.events:
                 if not upsert_event(conn, e):  # copy-consistency conflict (SCHEMA.md)
                     conflicts += 1
+                    skipped.add(e.event_id)
                     print(f"  ~ conflict {path.name}: kept first content for {e.event_id}")
             for p in parsed.placements:
+                if p.event_id in skipped:
+                    continue  # the event row we'd point at holds another session's content
                 upsert_placement(conn, p)
         except Exception as exc:  # noqa: BLE001 — a genuine DB error isolates one file
             print(f"  ! write error {path.name}: {exc}")

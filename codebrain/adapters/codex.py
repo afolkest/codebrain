@@ -41,6 +41,13 @@ def _uuid_from_filename(stem: str) -> str:
     return "-".join(parts[-5:]) if len(parts) >= 5 else stem
 
 
+def _payload(rec) -> dict:
+    """Envelope payloads are always objects for the types we read; guard against
+    drift so one valid-JSON record with a non-dict payload can't sink the whole file."""
+    pl = rec.get("payload")
+    return pl if isinstance(pl, dict) else {}
+
+
 def _parse_args(raw) -> dict:
     if isinstance(raw, dict):
         return raw
@@ -141,7 +148,7 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
     # ---- session metadata (first session_meta; resume re-emits the same id) ----
     session_uuid = cwd = repo = created_at = parent_uuid = relation = None
     for r in records:
-        pl = r.get("payload") or {}
+        pl = _payload(r)
         if r.get("type") == "session_meta" and session_uuid is None:
             session_uuid = pl.get("id")
             cwd = pl.get("cwd")
@@ -168,10 +175,10 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
     # MCP results arrive only as event_msg.mcp_tool_call_end; capture those whose
     # call_id has no *_output (otherwise the output already carries the result).
     output_call_ids = {
-        (r.get("payload") or {}).get("call_id")
+        _payload(r).get("call_id")
         for r in records
         if r.get("type") == "response_item"
-        and (r.get("payload") or {}).get("type") in ("function_call_output", "custom_tool_call_output")
+        and _payload(r).get("type") in ("function_call_output", "custom_tool_call_output")
     }
     output_call_ids.discard(None)
 
@@ -224,7 +231,7 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
 
     for rec in records:
         t = rec.get("type")
-        pl = rec.get("payload") or {}
+        pl = _payload(rec)
         pt = pl.get("type")
         if t == "event_msg":
             if pt == "user_message":
