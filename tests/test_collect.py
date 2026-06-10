@@ -5,7 +5,10 @@ from the pool."""
 import contextlib
 import io
 import json
+import os
+import socket
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -115,26 +118,56 @@ class TestSweep(CollectBase):
         self.assertEqual(stats["files"], 2)   # the link was never discovered
         self.assertNotIn("link.jsonl", self.pool_names())
 
+    def test_stale_part_pruned_fresh_kept(self):
+        """Crash leftovers (.part tmps) are swept up once they're old; a tmp young
+        enough to belong to a concurrently running sweep is left alone."""
+        self.pi_home()
+        self.sweep()
+        d = self.pool / "raw" / "t" / "pi" / "agent" / "sessions" / "proj"
+        stale = d / ".dead.jsonl.123.part"
+        stale.write_text("torn", encoding="utf-8")
+        two_hours_ago = time.time() - 7200
+        os.utime(stale, (two_hours_ago, two_hours_ago))
+        fresh = d / ".live.jsonl.456.part"
+        fresh.write_text("inflight", encoding="utf-8")
+        self.sweep()
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+
 
 class TestAllowlists(CollectBase):
     def test_claude_patterns(self):
+        """projects/ (and the other session-data dirs) are taken WHOLE — the
+        acc6608 review found extension lists dropping transcript-referenced
+        sidecars (tool-results, *.meta.json). Env snapshots stay out: env vars
+        hold tokens."""
         proj = self.home / "projects" / "-p-"
-        (proj / "sid1" / "subagents").mkdir(parents=True)
-        (proj / "memory").mkdir()
+        for d in ("sid1/subagents", "sid1/tool-results", "memory", "session-memory"):
+            (proj / d).mkdir(parents=True)
         (proj / "sid1.jsonl").write_text("{}\n", encoding="utf-8")
-        (proj / "sid1" / "subagents" / "agent.jsonl").write_text("{}\n", encoding="utf-8")
+        (proj / "sid1" / "subagents" / "agent-x.jsonl").write_text("{}\n", encoding="utf-8")
+        (proj / "sid1" / "subagents" / "agent-x.meta.json").write_text("{}", encoding="utf-8")
+        (proj / "sid1" / "tool-results" / "r1.txt").write_text("big output", encoding="utf-8")
         (proj / "sessions-index.json").write_text("{}", encoding="utf-8")
         (proj / "memory" / "MEMORY.md").write_text("# m", encoding="utf-8")
+        (proj / "session-memory" / "sm.md").write_text("# sm", encoding="utf-8")
+        for d in ("tasks/s1", "file-history/s1", "teams/t1/inboxes"):
+            (self.home / d).mkdir(parents=True)
+        (self.home / "tasks" / "s1" / "1.json").write_text("{}", encoding="utf-8")
+        (self.home / "file-history" / "s1" / "snap0").write_text("pre-edit", encoding="utf-8")
+        (self.home / "teams" / "t1" / "inboxes" / "m.json").write_text("{}", encoding="utf-8")
         (self.home / "history.jsonl").write_text("{}\n", encoding="utf-8")
-        (self.home / "settings.json").write_text("{}", encoding="utf-8")        # excluded
-        (self.home / ".credentials.json").write_text("SECRET", encoding="utf-8")  # excluded
+        (self.home / "session-env" / "s1").mkdir(parents=True)                     # excluded
+        (self.home / "session-env" / "s1" / "env.json").write_text("TOKEN", encoding="utf-8")
+        (self.home / "settings.json").write_text("{}", encoding="utf-8")           # excluded
+        (self.home / ".credentials.json").write_text("SECRET", encoding="utf-8")   # excluded
         stats = self.sweep(source="claude")
-        self.assertEqual((stats["files"], stats["new"]), (5, 5))
+        self.assertEqual((stats["files"], stats["new"]), (11, 11))
         names = self.pool_names()
-        self.assertIn("agent.jsonl", names)
-        self.assertIn("MEMORY.md", names)
-        self.assertNotIn("settings.json", names)
-        self.assertNotIn(".credentials.json", names)
+        for kept in ("agent-x.meta.json", "r1.txt", "sm.md", "1.json", "snap0", "m.json"):
+            self.assertIn(kept, names)
+        for excluded in ("env.json", "settings.json", ".credentials.json"):
+            self.assertNotIn(excluded, names)
 
     def test_codex_patterns(self):
         (self.home / "sessions" / "2026" / "01" / "02").mkdir(parents=True)
@@ -165,6 +198,54 @@ class TestPoolAsIngestRoot(CollectBase):
         self.assertEqual(stats["sessions"], 1)
         n = conn.execute("SELECT COUNT(*) AS c FROM sessions WHERE session_id='pi:P1'").fetchone()["c"]
         self.assertEqual(n, 1)
+
+    def test_pool_round_trip_preserves_origin_machine(self):
+        """SCHEMA.md: machine comes from the pool path raw/<machine>/<source>.
+        Ingesting another machine's synced subtree — with no machine override —
+        must keep its sessions labeled with the ORIGIN machine, not this host."""
+        self.pi_home()
+        with contextlib.redirect_stdout(io.StringIO()):
+            collect.collect_source("pi", raw_root=self.home,
+                                   pool_root=self.pool, machine="mini")
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        ingest.refresh(conn, sources=("pi",),
+                       roots={"pi": self.pool / "raw" / "mini" / "pi"})
+        row = conn.execute(
+            "SELECT machine FROM sessions WHERE session_id='pi:P1'").fetchone()
+        self.assertEqual(row["machine"], "mini")
+
+
+class TestMachineForRoot(unittest.TestCase):
+    def test_derivation_precedence(self):
+        pool_pi = Path("/x/codebrain-pool/raw/mini/pi")
+        self.assertEqual(ingest._machine_for_root("pi", pool_pi, None), "mini")
+        self.assertEqual(ingest._machine_for_root("pi", pool_pi, "forced"), "forced")
+        # a live tool home (or any non-pool-shaped root) is this machine
+        self.assertEqual(ingest._machine_for_root("pi", Path("/home/u/.pi"), None),
+                         socket.gethostname())
+        self.assertEqual(ingest._machine_for_root("pi", None, None), socket.gethostname())
+        # the trailing component must name the SAME source for path derivation
+        self.assertEqual(ingest._machine_for_root("claude", pool_pi, None),
+                         socket.gethostname())
+
+
+class TestLaunchdPlist(unittest.TestCase):
+    def test_plist_round_trips_weird_paths_and_flags(self):
+        """plistlib must escape what an f-string template would not — a pool path
+        with '&' or '<' previously produced unparseable XML and a hard
+        `launchctl bootstrap` failure."""
+        import plistlib
+        weird = Path("/tmp/we&ird <pool>")
+        spec = collect._plist_dict(interval=600, pool_root=weird,
+                                   source="codex", machine="mini")
+        back = plistlib.loads(plistlib.dumps(spec))   # parse what we'd write
+        argv = back["ProgramArguments"]
+        self.assertIn(str(weird), argv)
+        self.assertEqual(argv[argv.index("--source") + 1], "codex")
+        self.assertEqual(argv[argv.index("--machine") + 1], "mini")
+        self.assertEqual(back["StartInterval"], 600)
+        self.assertEqual(back["Label"], collect.LAUNCHD_LABEL)
 
 
 if __name__ == "__main__":

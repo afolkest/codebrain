@@ -66,7 +66,8 @@ def cmd_ingest(args):
 
 def cmd_collect(args):
     if args.install_launchd:
-        path = install_launchd(interval=args.interval, pool_root=Path(args.pool))
+        path = install_launchd(interval=args.interval, pool_root=Path(args.pool),
+                               source=args.source, machine=args.machine)
         print(f"LaunchAgent loaded: {path}")
         print(f"  sweeps every {args.interval}s → {args.pool}  "
               f"(log: ~/.codebrain/logs/collect.log)")

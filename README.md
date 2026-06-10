@@ -32,11 +32,14 @@ skips it; `sessdb ingest` is only for the first build or a full rebuild.
 **Raw is archived.** `sessdb collect` mirrors the tool homes into an append-only
 pool (`~/codebrain-pool/raw/<machine>/<source>/…`) so upstream cleanup can never
 take sessions with it: allowlisted files only (credentials stay home), incremental
-stat-compare sweeps (ms when idle), shrink-guarded, never deletes. It also captures
-what ingest doesn't parse yet — subagent transcripts, session indexes, project
-memory. `sessdb collect --install-launchd` makes it a periodic LaunchAgent
-(default every 30 min). Cross-machine sync later = point Syncthing at the pool;
-per-machine subtrees can't conflict.
+stat-compare sweeps (ms when idle), shrink-guarded, never deletes. Session-data
+dirs are taken whole, so it also captures what ingest doesn't parse yet — subagent
+transcripts + metadata, tool-result sidecars, session indexes, project memory,
+task state, pre-edit file history. `sessdb collect --install-launchd` makes it a
+periodic LaunchAgent (default every 30 min). Cross-machine sync later = point
+Syncthing at the pool; per-machine subtrees can't conflict, and ingesting a synced
+subtree keeps sessions labeled with their **origin** machine (from the
+`raw/<machine>/` path, per SCHEMA.md).
 
 The DB is a **rebuildable cache** (DESIGN.md golden rule): delete `~/.codebrain/codebrain.db`
 and re-ingest anytime. It is never synced. Point any sqlite3 client at it for
@@ -82,7 +85,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 38 tests, well under a second
+python3 -m unittest discover        # 42 tests, a second or two
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a
@@ -97,5 +100,8 @@ pins the delta path: only changed files re-parse, a grown file flips liveness,
 upstream deletion never deletes from the archive, and the FTS triggers keep the
 index current without rebuilds. `test_collect` pins the pool sweep: allowlists
 keep credentials out, symlinks are never followed, the shrink guard keeps a
-truncated source from clobbering the archive (without wedging recovery), and a
-pool subtree ingests exactly like a live home.
+truncated source from clobbering the archive (without wedging recovery), stale
+tmp files are pruned without touching a concurrent sweep's, the LaunchAgent
+plist survives hostile path characters, and a pool subtree ingests exactly like
+a live home — **with sessions keeping their origin machine's label**, so a
+synced subtree from another machine is never mislabeled.

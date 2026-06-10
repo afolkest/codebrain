@@ -130,8 +130,24 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) 
     return stats
 
 
-def _source_jobs(source: str, machine: str, raw_root: Optional[Path] = None):
+def _machine_for_root(source: str, raw_root: Optional[Path], machine: Optional[str]) -> str:
+    """Which machine produced the sessions under this root. A pool subtree carries
+    its origin in the path — raw/<machine>/<source> (SCHEMA.md) — which is the only
+    record of it: ingesting macmini's synced subtree on the macbook must NOT stamp
+    those sessions 'macbook'. A live tool home is always this machine. An explicit
+    machine= wins over both."""
+    if machine:
+        return machine
+    if raw_root is not None:
+        root = Path(raw_root)
+        if root.name == source and root.parent.parent.name == "raw":
+            return root.parent.name
+    return socket.gethostname()
+
+
+def _source_jobs(source: str, machine: Optional[str], raw_root: Optional[Path] = None):
     """(files, parse_fn, enrich) for one source — shared by full ingest and refresh."""
+    machine = _machine_for_root(source, raw_root, machine)
     if source == "claude":
         root = raw_root or DEFAULT_CLAUDE_ROOT
         return (discover_claude_files(root),
@@ -156,7 +172,6 @@ def _source_jobs(source: str, machine: str, raw_root: Optional[Path] = None):
 
 def ingest_source(conn: sqlite3.Connection, source: str,
                   raw_root: Optional[Path] = None, machine: Optional[str] = None) -> dict:
-    machine = machine or socket.gethostname()
     files, parse_fn, enrich = _source_jobs(source, machine, raw_root)
     return _ingest(conn, files, parse_fn, enrich)
 
@@ -168,7 +183,6 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
     tens of ms when nothing changed — which makes the DB effectively always
     current for this machine: there is no 'not ingested yet' window.
     `roots` optionally overrides a source's raw root ({"pi": Path(...)})."""
-    machine = machine or socket.gethostname()
     state = {r["path"]: (r["mtime"], r["size"])
              for r in conn.execute("SELECT path, mtime, size FROM ingest_state")}
     total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
