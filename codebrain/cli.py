@@ -1,10 +1,14 @@
 """sessdb — thin CLI over the codebrain SQLite cache.
 
-  sessdb ingest [--source all]         build/update the local DB (claude+codex+pi)
+  sessdb ingest [--source all]         full build/rebuild of the local DB
   sessdb list [--limit N]              recent sessions
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--limit N]    FTS over event text
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
+
+Read commands refresh first: changed/new raw files are delta-ingested before the
+query runs (ms when nothing changed), so results are always current for this
+machine — including sessions that are live right now. --no-refresh skips it.
 
 Raw SQL escape hatch: just open the DB with any sqlite3 client (see --schema).
 """
@@ -19,8 +23,19 @@ from pathlib import Path
 
 from codebrain.db import DEFAULT_DB, connect, has_fts5
 from codebrain.ingest import (
-    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES, ingest_all,
+    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES, ingest_all, refresh,
 )
+
+
+def _open(args):
+    """Connect and (unless --no-refresh) delta-ingest whatever changed on disk."""
+    conn = connect(args.db)
+    if not getattr(args, "no_refresh", False):
+        stats = refresh(conn)
+        if stats["files"]:
+            print(f"(refreshed {stats['files']} changed file(s), +{stats['events']} events)",
+                  file=sys.stderr)
+    return conn
 
 
 def _oneline(s, n=200):
@@ -48,7 +63,7 @@ def cmd_ingest(args):
 
 
 def cmd_list(args):
-    conn = connect(args.db)
+    conn = _open(args)
     rows = conn.execute(
         """
         SELECT s.session_id, s.source, s.started_at, s.cwd, s.title,
@@ -69,7 +84,7 @@ def cmd_list(args):
 
 
 def cmd_show(args):
-    conn = connect(args.db)
+    conn = _open(args)
     sid = _resolve_session(conn, args.session)
     if not sid:
         print(f"no session matching {args.session!r}", file=sys.stderr)
@@ -97,17 +112,17 @@ def cmd_show(args):
 
 
 def cmd_search(args):
-    conn = connect(args.db)
+    conn = _open(args)
     if not has_fts5(conn):
         print("FTS5 unavailable in this sqlite build; use `sessdb grep` instead.", file=sys.stderr)
         sys.exit(2)
     rows = conn.execute(
         """
-        SELECT f.event_id, e.actor, e.type, se.session_id, se.seq, e.ts,
+        SELECT e.event_id, e.actor, e.type, se.session_id, se.seq, e.ts,
                snippet(events_fts, 0, '[', ']', '…', 12) AS snip
         FROM events_fts f
-        JOIN events e ON e.event_id = f.event_id
-        JOIN session_events se ON se.event_id = f.event_id AND se.live = 1
+        JOIN events e ON e.rowid = f.rowid
+        JOIN session_events se ON se.event_id = e.event_id AND se.live = 1
         WHERE events_fts MATCH ?
         ORDER BY rank
         LIMIT ?
@@ -147,16 +162,19 @@ def main(argv=None):
 
     sp = sub.add_parser("list", help="recent sessions")
     sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("show", help="a session's transcript")
     sp.add_argument("session")
     sp.add_argument("--all", action="store_true", help="include rolled-back events")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_show)
 
     sp = sub.add_parser("search", help="FTS over event text")
     sp.add_argument("query")
     sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("grep", help="ripgrep over raw logs (all sources by default)")

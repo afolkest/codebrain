@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from codebrain.adapters import claude, codex, pi
-from codebrain.db import rebuild_fts, upsert_event, upsert_placement, upsert_session
+from codebrain.db import upsert_event, upsert_placement, upsert_session
 
 DEFAULT_CLAUDE_ROOT = Path.home() / ".claude"
 DEFAULT_CODEX_ROOT = Path.home() / ".codex"
@@ -63,19 +63,38 @@ def _load_codex_titles(raw_root: Path) -> dict:
     return titles
 
 
+def _record_state(conn, path: Path, st, session_id: Optional[str]) -> None:
+    """Remember the stat a file had when parsed, so refresh() can skip it until it
+    changes. Committed with the file's data (same transaction)."""
+    conn.execute(
+        "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) VALUES (?,?,?,?)",
+        (str(path), st.st_mtime, st.st_size, session_id),
+    )
+
+
 def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) -> dict:
     stats = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
              "skipped": 0, "conflicts": 0, "errors": 0}
     for path in files:
         stats["files"] += 1
         try:
+            # Stat BEFORE parsing: if the file grows mid-parse, the recorded state
+            # is already stale and the next refresh re-parses it. Never the reverse.
+            st = path.stat()
+        except OSError:
+            continue  # vanished between discovery and now; retried next run
+        try:
             parsed = parse_fn(path)
         except Exception as exc:  # noqa: BLE001 — one bad file shouldn't sink the run
             print(f"  ! parse error {path.name}: {exc}")
             stats["errors"] += 1
+            _record_state(conn, path, st, None)  # don't re-error every refresh; a
+            conn.commit()                        # changed file is retried anyway
             continue
         if parsed is None:
             stats["skipped"] += 1  # contentless file (empty / no emittable events)
+            _record_state(conn, path, st, None)
+            conn.commit()
             continue
         conflicts = 0
         try:
@@ -88,10 +107,15 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) 
                     conflicts += 1
                     skipped.add(e.event_id)
                     print(f"  ~ conflict {path.name}: kept first content for {e.event_id}")
+            # A re-parse is authoritative for this session's placements: replace,
+            # don't merge, so no stale placement survives a rewritten/shrunk file.
+            conn.execute("DELETE FROM session_events WHERE session_id=?",
+                         (parsed.session.session_id,))
             for p in parsed.placements:
                 if p.event_id in skipped:
                     continue  # the event row we'd point at holds another session's content
                 upsert_placement(conn, p)
+            _record_state(conn, path, st, parsed.session.session_id)
         except Exception as exc:  # noqa: BLE001 — a genuine DB error isolates one file
             print(f"  ! write error {path.name}: {exc}")
             stats["errors"] += 1
@@ -105,13 +129,12 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) 
     return stats
 
 
-def ingest_source(conn: sqlite3.Connection, source: str,
-                  raw_root: Optional[Path] = None, machine: Optional[str] = None) -> dict:
-    machine = machine or socket.gethostname()
+def _source_jobs(source: str, machine: str, raw_root: Optional[Path] = None):
+    """(files, parse_fn, enrich) for one source — shared by full ingest and refresh."""
     if source == "claude":
         root = raw_root or DEFAULT_CLAUDE_ROOT
-        return _ingest(conn, discover_claude_files(root),
-                       lambda p: claude.parse_file(p, machine=machine))
+        return (discover_claude_files(root),
+                lambda p: claude.parse_file(p, machine=machine), None)
     if source == "codex":
         root = raw_root or DEFAULT_CODEX_ROOT
         titles = _load_codex_titles(root)
@@ -121,16 +144,55 @@ def ingest_source(conn: sqlite3.Connection, source: str,
             if uuid in titles:
                 parsed.session.title = titles[uuid]
 
-        return _ingest(conn, discover_codex_files(root),
-                       lambda p: codex.parse_file(p, machine=machine), enrich)
+        return (discover_codex_files(root),
+                lambda p: codex.parse_file(p, machine=machine), enrich)
     if source == "pi":
         root = raw_root or DEFAULT_PI_ROOT
-        return _ingest(conn, discover_pi_files(root),
-                       lambda p: pi.parse_file(p, machine=machine))
+        return (discover_pi_files(root),
+                lambda p: pi.parse_file(p, machine=machine), None)
     raise ValueError(f"unknown source {source!r}")
 
 
+def ingest_source(conn: sqlite3.Connection, source: str,
+                  raw_root: Optional[Path] = None, machine: Optional[str] = None) -> dict:
+    machine = machine or socket.gethostname()
+    files, parse_fn, enrich = _source_jobs(source, machine, raw_root)
+    return _ingest(conn, files, parse_fn, enrich)
+
+
+def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = None,
+            roots: Optional[dict] = None) -> dict:
+    """Delta ingest: re-parse only files that are new or whose (mtime, size) changed
+    since ingest_state last saw them. Cheap enough to run before every read —
+    tens of ms when nothing changed — which makes the DB effectively always
+    current for this machine: there is no 'not ingested yet' window.
+    `roots` optionally overrides a source's raw root ({"pi": Path(...)})."""
+    machine = machine or socket.gethostname()
+    state = {r["path"]: (r["mtime"], r["size"])
+             for r in conn.execute("SELECT path, mtime, size FROM ingest_state")}
+    total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
+             "skipped": 0, "conflicts": 0, "errors": 0}
+    for src in sources:
+        files, parse_fn, enrich = _source_jobs(src, machine, (roots or {}).get(src))
+        changed = []
+        for f in files:
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if state.get(str(f)) != (st.st_mtime, st.st_size):
+                changed.append(f)
+        if changed:
+            stats = _ingest(conn, changed, parse_fn, enrich)
+            for k, v in stats.items():
+                total[k] += v
+    return total
+
+
 def ingest_all(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = None) -> dict:
+    """Full pass: parse every discovered file (first build / disaster recovery).
+    Also primes ingest_state, so the next refresh() is a delta. FTS stays current
+    via the events triggers — no rebuild step."""
     total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
              "skipped": 0, "conflicts": 0, "errors": 0}
     for src in sources:
@@ -138,7 +200,6 @@ def ingest_all(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str]
         print(f"  {src}: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
         for k, v in stats.items():
             total[k] += v
-    rebuild_fts(conn)
     conn.commit()
     return total
 
@@ -147,6 +208,5 @@ def ingest_all(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str]
 def ingest_claude(conn: sqlite3.Connection, raw_root: Path = DEFAULT_CLAUDE_ROOT,
                   machine: Optional[str] = None) -> dict:
     stats = ingest_source(conn, "claude", raw_root=raw_root, machine=machine)
-    rebuild_fts(conn)
     conn.commit()
     return stats

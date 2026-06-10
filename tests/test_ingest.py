@@ -62,8 +62,11 @@ class TestConflictSkip(unittest.TestCase):
     def test_conflict_skips_only_that_placement(self):
         # two sessions reuse one event_id with DIFFERENT content -> copy-consistency conflict
         from pathlib import Path
-        sess = {Path("A"): self._session("test:A", "ev:1", "content A"),
-                Path("B"): self._session("test:B", "ev:1", "content B DIFFERENT")}
+        d = Path(tempfile.mkdtemp())          # real paths: _ingest stats before parsing
+        (d / "A").touch()
+        (d / "B").touch()
+        sess = {d / "A": self._session("test:A", "ev:1", "content A"),
+                d / "B": self._session("test:B", "ev:1", "content B DIFFERENT")}
         conn = memory_db()
         self.addCleanup(conn.close)
         with contextlib.redirect_stdout(io.StringIO()):   # the conflict line is expected
@@ -165,9 +168,10 @@ class TestFts(unittest.TestCase):
         if not db.has_fts5(conn):
             self.skipTest("sqlite built without FTS5")
         ingest._ingest(conn, [f], lambda p: pi.parse_file(p, machine="t"))
-        db.rebuild_fts(conn)
+        db.rebuild_fts(conn)   # repair path; the triggers already indexed it
         hits = conn.execute(
-            "SELECT event_id FROM events_fts WHERE events_fts MATCH 'quicksilver'").fetchall()
+            "SELECT e.event_id FROM events_fts f JOIN events e ON e.rowid = f.rowid "
+            "WHERE events_fts MATCH 'quicksilver'").fetchall()
         self.assertEqual(len(hits), 1)
 
 

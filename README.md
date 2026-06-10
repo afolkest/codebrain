@@ -14,14 +14,19 @@ ingested with zero errors (claude 90% live, codex 98%, pi 94%).
 ```bash
 pip install -e .            # or run as: python3 -m codebrain <cmd>
 
-sessdb ingest               # build the DB from ~/.claude + ~/.codex + ~/.pi (read-only)
-sessdb ingest --source pi   # …or just one source
+sessdb ingest               # first build from ~/.claude + ~/.codex + ~/.pi (read-only)
 sessdb list                 # recent sessions (any source)
 sessdb show <session>       # a session's live transcript (--all includes rolled-back)
 sessdb search <query>       # FTS5 over event text (ranked, cross-source)
 sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
 sessdb schema               # print the DDL
 ```
+
+**Reads are always current.** `list`/`show`/`search` first delta-ingest whatever
+changed on disk (`refresh()`: stat-scan + re-parse only new/grown files — tens of
+ms when idle), so query results include sessions that are live *right now*; ask
+about another session's last message seconds after it happened. `--no-refresh`
+skips it; `sessdb ingest` is only for the first build or a full rebuild.
 
 The DB is a **rebuildable cache** (DESIGN.md golden rule): delete `~/.codebrain/codebrain.db`
 and re-ingest anytime. It is never synced. Point any sqlite3 client at it for
@@ -56,8 +61,8 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
   (inline `isSidechain` copies are ignored), pi `<session>/<runId>/run-<i>/`. Codex
   sub-agent rollouts *are* ingested (they're standalone files) with a parent-session
   link; the spawn-event link (`spawn_event_id`) is a later cross-file slice.
-- Ingest re-reads all files each run (idempotent upserts); incremental ingest,
-  the collector→pool step, and embeddings/sqlite-vec are later slices.
+- Refresh covers **this machine's** tool homes; the collector→pool (Syncthing)
+  step for cross-machine raw, and embeddings/sqlite-vec, are later slices.
 - `bash`-side file mutations aren't tracked in `refs` (known gap across all sources);
   Codex reasoning is encrypted (≥2026-04) and excluded everywhere.
 
@@ -66,7 +71,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 22 tests, well under a second
+python3 -m unittest discover        # 29 tests, well under a second
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a
@@ -76,4 +81,7 @@ shape spec) pin every adapter and every bug we've fixed: the Codex full-rollback
 hardening. A shared invariant check — source-prefixed unique ids, parents resolve
 in-session, **no live event hanging off a dead parent**, tip is live-or-null, no
 parent cycles — runs on every fixture *and* over a sample of the real logs
-(`test_smoke_real`, which skips cleanly on machines without them).
+(`test_smoke_real`, which skips cleanly on machines without them). `test_refresh`
+pins the delta path: only changed files re-parse, a grown file flips liveness,
+upstream deletion never deletes from the archive, and the FTS triggers keep the
+index current without rebuilds.

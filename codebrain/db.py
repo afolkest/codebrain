@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from codebrain.adapters.base import EventRow, PlacementRow, SessionRow
@@ -58,6 +59,16 @@ CREATE INDEX IF NOT EXISTS ix_se_event           ON session_events(event_id);
 CREATE INDEX IF NOT EXISTS ix_se_parent          ON session_events(parent_event_id);
 CREATE INDEX IF NOT EXISTS ix_ev_origin          ON events(origin_session_id);
 
+-- Internal bookkeeping, NOT part of the canonical model (SCHEMA.md): the
+-- (mtime, size) each raw file had when last parsed, so refresh() re-parses only
+-- what changed. session_id is a debugging convenience (raw file <-> session).
+CREATE TABLE IF NOT EXISTS ingest_state (
+  path       TEXT PRIMARY KEY,
+  mtime      REAL NOT NULL,
+  size       INTEGER NOT NULL,
+  session_id TEXT
+);
+
 CREATE VIEW IF NOT EXISTS transcript AS
   SELECT se.session_id, se.seq, e.event_id, e.ts, e.actor, e.type,
          e.text, e.refs, e.tool_call_event_id, se.parent_event_id,
@@ -71,8 +82,13 @@ def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    # WAL + busy timeout: a refresh-on-read may overlap a scheduled ingest or a
+    # second query; readers must not block on the writer (no-ops on :memory:).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
     _ensure_fts(conn)
+    conn.commit()
     return conn
 
 
@@ -86,11 +102,43 @@ def has_fts5(conn: sqlite3.Connection) -> bool:
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
-    if has_fts5(conn):
+    """events_fts is an external-content FTS5 index over events.text, kept current
+    by triggers — so incremental ingest never needs a full index rebuild. Migrates
+    the pre-trigger standalone table in place (the index is derived data)."""
+    if not has_fts5(conn):
+        return
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='events_fts'"
+    ).fetchone()
+    fresh = row is None
+    if row is not None and "content='events'" not in (row["sql"] or ""):
+        conn.execute("DROP TABLE events_fts")   # old standalone shape -> migrate
+        fresh = True
+    if fresh:
         conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts "
-            "USING fts5(text, event_id UNINDEXED)"
+            "CREATE VIRTUAL TABLE events_fts USING fts5("
+            "text, content='events', content_rowid='rowid')"
         )
+    # Triggers cover every row (even NULL text) so the 'delete' commands always
+    # match what was inserted — the requirement for external-content integrity.
+    conn.executescript("""
+        CREATE TRIGGER IF NOT EXISTS events_fts_ai AFTER INSERT ON events BEGIN
+          INSERT INTO events_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS events_fts_ad AFTER DELETE ON events BEGIN
+          INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS events_fts_au AFTER UPDATE ON events BEGIN
+          INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+          INSERT INTO events_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+    """)
+    if fresh:
+        n = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        if n:
+            print(f"codebrain: rebuilding FTS index over {n} events (one-time)…",
+                  file=sys.stderr)
+            conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')")
 
 
 # ---- idempotent upserts (re-ingest is a no-op; see SCHEMA.md Ingest contract) ----
@@ -163,10 +211,8 @@ def upsert_placement(conn: sqlite3.Connection, p: PlacementRow) -> None:
 
 
 def rebuild_fts(conn: sqlite3.Connection) -> None:
+    """Repair-only: the triggers keep events_fts current; this re-derives the whole
+    index from events (FTS5 'rebuild' command on the external-content table)."""
     if not has_fts5(conn):
         return
-    conn.execute("DELETE FROM events_fts")
-    conn.execute(
-        "INSERT INTO events_fts (event_id, text) "
-        "SELECT event_id, text FROM events WHERE text IS NOT NULL AND text <> ''"
-    )
+    conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')")
