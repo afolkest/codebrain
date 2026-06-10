@@ -1,6 +1,7 @@
 """sessdb — thin CLI over the codebrain SQLite cache.
 
   sessdb ingest [--source all]         full build/rebuild of the local DB
+  sessdb collect [--install-launchd]   mirror raw logs into the append-only pool
   sessdb list [--limit N]              recent sessions
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--limit N]    FTS over event text
@@ -21,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
 from codebrain.db import DEFAULT_DB, connect, has_fts5
 from codebrain.ingest import (
     DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES, ingest_all, refresh,
@@ -59,6 +61,20 @@ def cmd_ingest(args):
     print(f"ingesting [{', '.join(sources)}] → {args.db}")
     total = ingest_all(conn, sources=sources, machine=args.machine)
     conn.close()
+    print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
+
+
+def cmd_collect(args):
+    if args.install_launchd:
+        path = install_launchd(interval=args.interval, pool_root=Path(args.pool))
+        print(f"LaunchAgent loaded: {path}")
+        print(f"  sweeps every {args.interval}s → {args.pool}  "
+              f"(log: ~/.codebrain/logs/collect.log)")
+        print(f"  remove with: launchctl bootout gui/$(id -u)/{LAUNCHD_LABEL} && rm {path}")
+        return
+    sources = SOURCES if args.source == "all" else (args.source,)
+    print(f"collecting [{', '.join(sources)}] → {args.pool}")
+    total = collect_all(sources=sources, machine=args.machine, pool_root=Path(args.pool))
     print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
 
 
@@ -159,6 +175,17 @@ def main(argv=None):
                     help="which source(s) to ingest (default all)")
     sp.add_argument("--machine", default=None, help="override hostname tag")
     sp.set_defaults(func=cmd_ingest)
+
+    sp = sub.add_parser("collect", help="mirror raw logs into the append-only pool")
+    sp.add_argument("--pool", default=str(DEFAULT_POOL), help=f"pool root (default {DEFAULT_POOL})")
+    sp.add_argument("--source", choices=("all",) + SOURCES, default="all",
+                    help="which source(s) to collect (default all)")
+    sp.add_argument("--machine", default=None, help="override hostname subtree")
+    sp.add_argument("--install-launchd", action="store_true",
+                    help="install a LaunchAgent that sweeps periodically (macOS)")
+    sp.add_argument("--interval", type=int, default=1800,
+                    help="LaunchAgent sweep period in seconds (default 1800)")
+    sp.set_defaults(func=cmd_collect)
 
     sp = sub.add_parser("list", help="recent sessions")
     sp.add_argument("--limit", type=int, default=30)

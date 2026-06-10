@@ -15,6 +15,7 @@ ingested with zero errors (claude 90% live, codex 98%, pi 94%).
 pip install -e .            # or run as: python3 -m codebrain <cmd>
 
 sessdb ingest               # first build from ~/.claude + ~/.codex + ~/.pi (read-only)
+sessdb collect              # mirror raw logs → ~/codebrain-pool (append-only archive)
 sessdb list                 # recent sessions (any source)
 sessdb show <session>       # a session's live transcript (--all includes rolled-back)
 sessdb search <query>       # FTS5 over event text (ranked, cross-source)
@@ -27,6 +28,15 @@ changed on disk (`refresh()`: stat-scan + re-parse only new/grown files — tens
 ms when idle), so query results include sessions that are live *right now*; ask
 about another session's last message seconds after it happened. `--no-refresh`
 skips it; `sessdb ingest` is only for the first build or a full rebuild.
+
+**Raw is archived.** `sessdb collect` mirrors the tool homes into an append-only
+pool (`~/codebrain-pool/raw/<machine>/<source>/…`) so upstream cleanup can never
+take sessions with it: allowlisted files only (credentials stay home), incremental
+stat-compare sweeps (ms when idle), shrink-guarded, never deletes. It also captures
+what ingest doesn't parse yet — subagent transcripts, session indexes, project
+memory. `sessdb collect --install-launchd` makes it a periodic LaunchAgent
+(default every 30 min). Cross-machine sync later = point Syncthing at the pool;
+per-machine subtrees can't conflict.
 
 The DB is a **rebuildable cache** (DESIGN.md golden rule): delete `~/.codebrain/codebrain.db`
 and re-ingest anytime. It is never synced. Point any sqlite3 client at it for
@@ -61,8 +71,9 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
   (inline `isSidechain` copies are ignored), pi `<session>/<runId>/run-<i>/`. Codex
   sub-agent rollouts *are* ingested (they're standalone files) with a parent-session
   link; the spawn-event link (`spawn_event_id`) is a later cross-file slice.
-- Refresh covers **this machine's** tool homes; the collector→pool (Syncthing)
-  step for cross-machine raw, and embeddings/sqlite-vec, are later slices.
+- Refresh covers **this machine's** tool homes; the pool is collected locally,
+  but cross-machine replication (point Syncthing at the pool) and
+  embeddings/sqlite-vec are later slices.
 - `bash`-side file mutations aren't tracked in `refs` (known gap across all sources);
   Codex reasoning is encrypted (≥2026-04) and excluded everywhere.
 
@@ -71,7 +82,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 29 tests, well under a second
+python3 -m unittest discover        # 38 tests, well under a second
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a
@@ -84,4 +95,7 @@ parent cycles — runs on every fixture *and* over a sample of the real logs
 (`test_smoke_real`, which skips cleanly on machines without them). `test_refresh`
 pins the delta path: only changed files re-parse, a grown file flips liveness,
 upstream deletion never deletes from the archive, and the FTS triggers keep the
-index current without rebuilds.
+index current without rebuilds. `test_collect` pins the pool sweep: allowlists
+keep credentials out, symlinks are never followed, the shrink guard keeps a
+truncated source from clobbering the archive (without wedging recovery), and a
+pool subtree ingests exactly like a live home.

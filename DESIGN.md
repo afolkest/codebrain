@@ -45,15 +45,18 @@ Access     CLI + raw SQL + grep                   ← agents write scripts
 - **Single writer per path:** each machine writes only `raw/<hostname>/…`, so conflicts can't happen.
 - Pool is separate from live tool dirs; a collector mirrors logs in (firewall between live tool state and the synced archive). Never point Syncthing at `~/.claude` directly.
 
-**Pool layout**
+**Pool layout** (built by `sessdb collect`, default `~/codebrain-pool`)
 ```
-sync-pool/
+codebrain-pool/
   raw/
-    laptop/   claude/*.jsonl  codex/*.jsonl   ← only laptop writes here
-    macmini/  claude/*.jsonl                  ← only mini writes here
+    macbook/  claude/…  codex/…  pi/…         ← only macbook writes here
+    macmini/  …                               ← only the mini writes here
   derivations/
-    <content-hash>.json                       ← embeddings + summaries, content-addressed
+    <content-hash>.json                       ← later: embeddings + summaries, content-addressed
 ```
+Each `<source>` subtree preserves the tool home's internal layout (allowlisted
+files only — credentials and tool-internal databases never enter the pool), so
+ingest can use a pool subtree as a raw root exactly like a live home.
 
 **Format: sync raw, normalize on ingest.**
 - Pool holds original tool format (truest source of truth); every machine runs every adapter as code.

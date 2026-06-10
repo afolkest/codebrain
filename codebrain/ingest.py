@@ -1,9 +1,10 @@
 """Ingest raw logs into the local SQLite cache (idempotent, multi-source).
 
-For the spine this reads each tool's raw home directly (read-only). The
-collector -> pool step (DESIGN.md) comes later; ingest is agnostic to whether the
-root is a live tool dir or a synced pool. All upserts key on copy-invariant ids,
-so re-running is a no-op and the three sources share one deduped `events` table.
+This reads each tool's raw home directly (read-only) and is agnostic to whether
+the root is a live tool dir or a pool subtree (collect.py mirrors homes into
+`<pool>/raw/<machine>/<source>` with relpaths preserved, so either works as a
+root). All upserts key on copy-invariant ids, so re-running is a no-op and the
+three sources share one deduped `events` table.
 """
 from __future__ import annotations
 
