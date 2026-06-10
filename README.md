@@ -60,3 +60,20 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
   the collector→pool step, and embeddings/sqlite-vec are later slices.
 - `bash`-side file mutations aren't tracked in `refs` (known gap across all sources);
   Codex reasoning is encrypted (≥2026-04) and excluded everywhere.
+
+## Tests
+
+Stdlib `unittest`, no dependencies — run from the repo root:
+
+```bash
+python3 -m unittest discover        # 22 tests, well under a second
+```
+
+Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a
+shape spec) pin every adapter and every bug we've fixed: the Codex full-rollback
+**null tip**, MCP capture/dedup, `apply_patch` refs, the **pi cross-file dedup**
+(one `events` row, N placements), and the conflict-skip + malformed-record
+hardening. A shared invariant check — source-prefixed unique ids, parents resolve
+in-session, **no live event hanging off a dead parent**, tip is live-or-null, no
+parent cycles — runs on every fixture *and* over a sample of the real logs
+(`test_smoke_real`, which skips cleanly on machines without them).
