@@ -3,6 +3,7 @@
   sessdb ingest [--source all]         full build/rebuild of the local DB
   sessdb collect [--install-launchd]   mirror raw logs into the append-only pool
   sessdb list [--limit N]              recent sessions
+  sessdb userlog [--limit N]           recent user messages (intent-first)
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--limit N]    FTS over event text
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
@@ -17,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
@@ -45,6 +48,32 @@ def _oneline(s, n=200):
         return ""
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _since_cutoff(value):
+    """Return an ISO-ish cutoff string for SQL text comparison.
+
+    Accepts either an explicit timestamp/date prefix (passed through) or a small
+    relative duration like ``7d``/``12h``. Source timestamps are ISO-8601 UTC, so
+    lexicographic comparison is sufficient for both exact timestamps and
+    YYYY-MM-DD prefixes.
+    """
+    if not value:
+        return None
+    v = value.strip()
+    m = re.fullmatch(r"(\d+)([smhdw])", v)
+    if not m:
+        return v
+    n = int(m.group(1))
+    unit = m.group(2)
+    delta = {
+        "s": timedelta(seconds=n),
+        "m": timedelta(minutes=n),
+        "h": timedelta(hours=n),
+        "d": timedelta(days=n),
+        "w": timedelta(weeks=n),
+    }[unit]
+    return (datetime.now(timezone.utc) - delta).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _resolve_session(conn, ident: str):
@@ -97,6 +126,68 @@ def cmd_list(args):
         started = (r["started_at"] or "")[:19]
         print(f"{started:19}  {r['n']:>5}  {r['source']:6}  {r['session_id']:<44}  "
               f"{_oneline(r['cwd'], 40):<40}  {_oneline(r['title'], 50)}")
+    conn.close()
+
+
+def _userlog_rows(conn, args):
+    """Recent live user-authored messages: the intent-first browsing primitive."""
+    where = [
+        "t.live = 1",
+        "t.actor = 'user'",
+        "t.type = 'message'",
+        "COALESCE(t.text, '') <> ''",
+    ]
+    params: list = []
+    if not getattr(args, "include_inherited", False):
+        where.append("t.inherited = 0")  # pi resume copies are context, not new user intent
+    if args.source:
+        where.append("s.source = ?")
+        params.append(args.source)
+    if args.cwd:
+        where.append("COALESCE(s.cwd, '') LIKE ?")
+        params.append(f"%{args.cwd}%")
+    cutoff = _since_cutoff(args.since)
+    if cutoff:
+        where.append("t.ts >= ?")
+        params.append(cutoff)
+    if args.min_chars:
+        where.append("length(COALESCE(t.text, '')) >= ?")
+        params.append(args.min_chars)
+    if args.max_chars:
+        where.append("length(COALESCE(t.text, '')) <= ?")
+        params.append(args.max_chars)
+    if args.query:
+        where.append("lower(t.text) LIKE ?")
+        params.append(f"%{args.query.lower()}%")
+    params.append(args.limit)
+    return conn.execute(
+        f"""
+        SELECT t.ts, s.source, t.session_id, t.seq, t.event_id, s.cwd, s.title,
+               t.text, length(COALESCE(t.text, '')) AS chars
+        FROM transcript t
+        JOIN sessions s ON s.session_id = t.session_id
+        WHERE {' AND '.join(where)}
+        ORDER BY t.ts DESC, t.session_id DESC, t.seq DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
+
+def cmd_userlog(args):
+    conn = _open(args)
+    rows = _userlog_rows(conn, args)
+    if args.json:
+        out = [dict(r) for r in rows]
+        json.dump(out, sys.stdout, ensure_ascii=False)
+        print()
+    else:
+        for r in rows:
+            text = r["text"] if args.full else _oneline(r["text"], 260)
+            cwd = _oneline(r["cwd"], 60)
+            print(f"{(r['ts'] or '')[:19]:19}  {r['source']:6}  seq={r['seq']:<5}  "
+                  f"chars={r['chars']:<5}  {r['session_id']}  {cwd}")
+            print(f"  {text}")
     conn.close()
 
 
@@ -192,6 +283,21 @@ def main(argv=None):
     sp.add_argument("--limit", type=int, default=30)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("userlog", help="recent live user messages (intent-first)")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--since", help="timestamp/date cutoff, or relative duration like 7d/12h")
+    sp.add_argument("--source", choices=SOURCES, help="filter by source")
+    sp.add_argument("--cwd", help="substring filter on session cwd")
+    sp.add_argument("--query", help="case-insensitive substring filter on user text")
+    sp.add_argument("--min-chars", type=int, default=0, help="minimum message length")
+    sp.add_argument("--max-chars", type=int, default=0, help="maximum message length (0 = no cap)")
+    sp.add_argument("--include-inherited", action="store_true",
+                    help="include pi resume/branch copies (default: authored messages only)")
+    sp.add_argument("--full", action="store_true", help="do not truncate message text")
+    sp.add_argument("--json", action="store_true", help="emit a JSON array")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_userlog)
 
     sp = sub.add_parser("show", help="a session's transcript")
     sp.add_argument("session")

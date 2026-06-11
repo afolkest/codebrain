@@ -17,6 +17,7 @@ pip install -e .            # or run as: python3 -m codebrain <cmd>
 sessdb ingest               # first build from ~/.claude + ~/.codex + ~/.pi (read-only)
 sessdb collect              # mirror raw logs → ~/codebrain-pool (append-only archive)
 sessdb list                 # recent sessions (any source)
+sessdb userlog              # recent live user messages (intent-first)
 sessdb show <session>       # a session's live transcript (--all includes rolled-back)
 sessdb search <query>       # FTS5 over event text (ranked, cross-source)
 sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
