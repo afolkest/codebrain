@@ -82,15 +82,18 @@ class TestTurnsCli(unittest.TestCase):
         rows = json.loads(out)
 
         self.assertEqual([r["user_seq"] for r in rows], [0, 4, 6])
+        self.assertEqual(rows[1]["user_live"], 1)
+        self.assertEqual(rows[1]["user_inherited"], 0)
         self.assertEqual(rows[0]["hidden_tool_events"], 0)
         tool_events = [e for e in rows[0]["events"] if e["type"] == "tool_call"]
         self.assertEqual(len(tool_events), 1)
+        self.assertEqual(tool_events[0]["inherited"], 0)
         self.assertTrue(tool_events[0]["preview"].startswith("bash:"))
 
     def test_turns_all_includes_rolled_back_turns(self):
         self.seed()
         out = self.run_cli("turns", "pi:S", "--no-refresh", "--all", "--limit", "10")
-        self.assertIn("dead user request", out)
+        self.assertIn("user[8] (rolled-back): dead user request", out)
 
 
 if __name__ == "__main__":

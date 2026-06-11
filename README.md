@@ -26,8 +26,9 @@ sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
 sessdb schema               # print the DDL
 ```
 
-**Reads are always current.** `list`/`show`/`search` first delta-ingest whatever
-changed on disk (`refresh()`: stat-scan + re-parse only new/grown files — tens of
+**Reads are always current.** Read commands (`list`/`recent`/`userlog`/`turns`/
+`show`/`search`) first delta-ingest whatever changed on disk (`refresh()`:
+stat-scan + re-parse only new/grown files — tens of
 ms when idle), so query results include sessions that are live *right now*; ask
 about another session's last message seconds after it happened. `--no-refresh`
 skips it; `sessdb ingest` is only for the first build or a full rebuild.
@@ -88,7 +89,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 42 tests, a second or two
+python3 -m unittest discover        # 49 tests, a second or two
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a

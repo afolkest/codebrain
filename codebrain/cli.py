@@ -290,6 +290,8 @@ def _build_turns(rows):
             "user_seq": seq,
             "user_event_id": user_row["event_id"] if user_row is not None else None,
             "user_text": user_row["text"] if user_row is not None else None,
+            "user_live": user_row["live"] if user_row is not None else None,
+            "user_inherited": user_row["inherited"] if user_row is not None else None,
             "events": [],
         }
 
@@ -338,6 +340,15 @@ def _event_preview(e, chars):
     return (e["text"] or "") if chars == 0 else _oneline(e["text"], chars)
 
 
+def _placement_suffix(live, inherited):
+    flags = []
+    if live == 0:
+        flags.append("rolled-back")
+    if inherited:
+        flags.append("inherited")
+    return f" ({', '.join(flags)})" if flags else ""
+
+
 def _turn_json(t, args):
     events, hidden = [], 0
     for e in t["events"]:
@@ -349,12 +360,14 @@ def _turn_json(t, args):
         events.append({
             "seq": e["seq"], "event_id": e["event_id"], "ts": e["ts"],
             "actor": e["actor"], "type": e["type"], "live": e["live"],
-            "preview": _event_preview(e, chars),
+            "inherited": e["inherited"], "preview": _event_preview(e, chars),
         })
     return {
         "turn_index": t["turn_index"], "seq_start": t["seq_start"], "seq_end": t["seq_end"],
         "ts": t["ts"], "user_seq": t["user_seq"], "user_event_id": t["user_event_id"],
-        "user_text": t["user_text"], "hidden_tool_events": hidden, "events": events,
+        "user_text": t["user_text"], "user_live": t["user_live"],
+        "user_inherited": t["user_inherited"], "hidden_tool_events": hidden,
+        "events": events,
     }
 
 
@@ -378,7 +391,8 @@ def cmd_turns(args):
                 print("  user: <none>")
             else:
                 user_text = (t["user_text"] or "") if args.user_chars == 0 else _oneline(t["user_text"], args.user_chars)
-                print(f"  user[{t['user_seq']}]: {user_text}")
+                suffix = _placement_suffix(t["user_live"], t["user_inherited"])
+                print(f"  user[{t['user_seq']}]{suffix}: {user_text}")
             hidden = 0
             for e in t["events"]:
                 is_tool = e["type"] in ("tool_call", "tool_result") or e["actor"] == "tool"
@@ -386,7 +400,8 @@ def cmd_turns(args):
                     hidden += 1
                     continue
                 chars = args.tool_chars if is_tool else args.agent_chars
-                print(f"    {e['actor']}/{e['type']}[{e['seq']}]: {_event_preview(e, chars)}")
+                suffix = _placement_suffix(e["live"], e["inherited"])
+                print(f"    {e['actor']}/{e['type']}[{e['seq']}]{suffix}: {_event_preview(e, chars)}")
             if hidden:
                 print(f"    tools: {hidden} hidden (--show-tools)")
     conn.close()
