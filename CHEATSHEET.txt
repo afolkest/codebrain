@@ -1,0 +1,73 @@
+# codebrain CLI cheatsheet
+
+python3 -m codebrain recent
+# Sessions sorted by latest user message.
+
+python3 -m codebrain recent --limit 10
+# Top 10 recent intent-bearing sessions.
+
+python3 -m codebrain recent --cwd codebrain
+# Recent sessions whose cwd contains "codebrain".
+
+python3 -m codebrain recent --cwd example-project --min-chars 80 --max-chars 700
+# Recent example-project sessions using medium-sized user messages as signal.
+
+python3 -m codebrain recent --source pi --since 7d
+# Recent pi sessions from the last 7 days.
+
+python3 -m codebrain recent --json --limit 5
+# Same as recent, but scriptable JSON.
+
+python3 -m codebrain userlog
+# Newest user messages across all sessions.
+
+python3 -m codebrain userlog --limit 20 --min-chars 80 --max-chars 700
+# Recent medium-sized user messages; often highest signal.
+
+python3 -m codebrain userlog --cwd getrandomness --limit 20
+# Recent user messages in getrandomness sessions.
+
+python3 -m codebrain userlog --query "prefer" --limit 20
+# Recent user messages containing "prefer".
+
+python3 -m codebrain userlog --since 30d --source codex
+# User messages in Codex sessions from the last 30 days.
+
+python3 -m codebrain userlog --json --limit 10
+# Userlog as JSON for scripts/agents.
+
+python3 -m codebrain turns <session_id>
+# Show a session as user-centered turns.
+
+python3 -m codebrain turns <session_id> --around-seq <seq>
+# Expand around a seq from recent/userlog.
+
+python3 -m codebrain turns <session_id> --around-seq <seq> --context-turns 1
+# One turn before and after the target seq.
+
+python3 -m codebrain turns <session_id> --agent-chars 120
+# Shorter assistant previews.
+
+python3 -m codebrain turns <session_id> --show-tools --tool-chars 80
+# Include truncated tool calls/results.
+
+python3 -m codebrain turns <session_id> --all
+# Include rolled-back turns/events too.
+
+python3 -m codebrain show <session_id>
+# Raw live transcript view.
+
+python3 -m codebrain show <session_id> --all
+# Raw transcript including rolled-back events.
+
+python3 -m codebrain search "sqlite refresh"
+# FTS search over all event text.
+
+python3 -m codebrain grep "some literal string"
+# Grep raw logs directly.
+
+python3 -m codebrain schema
+# Print SQLite schema.
+
+sqlite3 ~/.codebrain/codebrain.db
+# Open the database directly for SQL.
