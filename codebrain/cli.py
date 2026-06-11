@@ -3,6 +3,7 @@
   sessdb ingest [--source all]         full build/rebuild of the local DB
   sessdb collect [--install-launchd]   mirror raw logs into the append-only pool
   sessdb list [--limit N]              recent sessions
+  sessdb recent [--limit N]            sessions by latest user activity
   sessdb userlog [--limit N]           recent user messages (intent-first)
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--limit N]    FTS over event text
@@ -129,36 +130,44 @@ def cmd_list(args):
     conn.close()
 
 
-def _userlog_rows(conn, args):
-    """Recent live user-authored messages: the intent-first browsing primitive."""
+def _user_message_where(args):
+    """Shared filters for user-intent browsing commands."""
     where = [
         "t.live = 1",
         "t.actor = 'user'",
         "t.type = 'message'",
         "COALESCE(t.text, '') <> ''",
+        "t.text NOT LIKE '<local-command-%'",
+        "t.text NOT LIKE '<command-name>%'",
     ]
     params: list = []
     if not getattr(args, "include_inherited", False):
         where.append("t.inherited = 0")  # pi resume copies are context, not new user intent
-    if args.source:
+    if getattr(args, "source", None):
         where.append("s.source = ?")
         params.append(args.source)
-    if args.cwd:
+    if getattr(args, "cwd", None):
         where.append("COALESCE(s.cwd, '') LIKE ?")
         params.append(f"%{args.cwd}%")
-    cutoff = _since_cutoff(args.since)
+    cutoff = _since_cutoff(getattr(args, "since", None))
     if cutoff:
         where.append("t.ts >= ?")
         params.append(cutoff)
-    if args.min_chars:
+    if getattr(args, "min_chars", 0):
         where.append("length(COALESCE(t.text, '')) >= ?")
         params.append(args.min_chars)
-    if args.max_chars:
+    if getattr(args, "max_chars", 0):
         where.append("length(COALESCE(t.text, '')) <= ?")
         params.append(args.max_chars)
-    if args.query:
+    if getattr(args, "query", None):
         where.append("lower(t.text) LIKE ?")
         params.append(f"%{args.query.lower()}%")
+    return where, params
+
+
+def _userlog_rows(conn, args):
+    """Recent live user-authored messages: the intent-first browsing primitive."""
+    where, params = _user_message_where(args)
     params.append(args.limit)
     return conn.execute(
         f"""
@@ -172,6 +181,65 @@ def _userlog_rows(conn, args):
         """,
         params,
     ).fetchall()
+
+
+def _recent_rows(conn, args):
+    """Sessions ranked by latest matching user message, not latest agent event."""
+    where, params = _user_message_where(args)
+    params.append(args.limit)
+    return conn.execute(
+        f"""
+        WITH user_hits AS (
+          SELECT t.session_id, t.ts, t.seq, t.event_id, t.text,
+                 length(COALESCE(t.text, '')) AS chars
+          FROM transcript t
+          JOIN sessions s ON s.session_id = t.session_id
+          WHERE {' AND '.join(where)}
+        ), ranked AS (
+          SELECT user_hits.*,
+                 COUNT(*) OVER (PARTITION BY session_id) AS user_msg_count,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY session_id ORDER BY ts DESC, seq DESC
+                 ) AS rn
+          FROM user_hits
+        ), live_counts AS (
+          SELECT session_id, COUNT(*) AS live_event_count
+          FROM session_events
+          WHERE live = 1
+          GROUP BY session_id
+        )
+        SELECT r.ts AS last_user_ts, s.source, r.session_id,
+               r.seq AS last_user_seq, r.event_id AS last_user_event_id,
+               s.cwd, s.title, r.text AS last_user_text,
+               r.chars AS last_user_chars, r.user_msg_count,
+               COALESCE(l.live_event_count, 0) AS live_event_count
+        FROM ranked r
+        JOIN sessions s ON s.session_id = r.session_id
+        LEFT JOIN live_counts l ON l.session_id = r.session_id
+        WHERE r.rn = 1
+        ORDER BY r.ts DESC, r.session_id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
+
+def cmd_recent(args):
+    conn = _open(args)
+    rows = _recent_rows(conn, args)
+    if args.json:
+        out = [dict(r) for r in rows]
+        json.dump(out, sys.stdout, ensure_ascii=False)
+        print()
+    else:
+        for r in rows:
+            text = r["last_user_text"] if args.full else _oneline(r["last_user_text"], 180)
+            cwd = _oneline(r["cwd"], 46)
+            print(f"{(r['last_user_ts'] or '')[:19]:19}  {r['source']:6}  "
+                  f"users={r['user_msg_count']:<4}  events={r['live_event_count']:<5}  "
+                  f"{r['session_id']:<44}  {cwd}")
+            print(f"  [{r['last_user_seq']}] {text}")
+    conn.close()
 
 
 def cmd_userlog(args):
@@ -283,6 +351,20 @@ def main(argv=None):
     sp.add_argument("--limit", type=int, default=30)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("recent", help="sessions by latest live user message")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument("--since", help="timestamp/date cutoff, or relative duration like 7d/12h")
+    sp.add_argument("--source", choices=SOURCES, help="filter by source")
+    sp.add_argument("--cwd", help="substring filter on session cwd")
+    sp.add_argument("--min-chars", type=int, default=0, help="minimum latest-considered user length")
+    sp.add_argument("--max-chars", type=int, default=0, help="maximum latest-considered user length (0 = no cap)")
+    sp.add_argument("--include-inherited", action="store_true",
+                    help="include pi resume/branch copies (default: authored messages only)")
+    sp.add_argument("--full", action="store_true", help="do not truncate last user preview")
+    sp.add_argument("--json", action="store_true", help="emit a JSON array")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_recent)
 
     sp = sub.add_parser("userlog", help="recent live user messages (intent-first)")
     sp.add_argument("--limit", type=int, default=50)
