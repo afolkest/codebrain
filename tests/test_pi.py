@@ -133,7 +133,7 @@ class TestPi(unittest.TestCase):
             _user("aaaa1111", None, "shared", "2026-01-01T00:01:00.000Z"),
             _assistant_text_tool("bbbb2222", "aaaa1111", "launch", "tc-sub", "subagent",
                                  {"agent": "oracle"}, "2026-01-01T00:02:00.000Z"),
-            _user("dddd4444", "bbbb2222", "Task: delegated prompt text",
+            _user("dddd4444", "bbbb2222", "neutral child instruction",
                   "2026-01-01T00:04:00.000Z"),
         ], name="0_CHILD.jsonl")
         assert_session_invariants(self, parsed, "pi")

@@ -90,18 +90,26 @@ class TestUserlogCli(unittest.TestCase):
              actor="assistant", typ="tool_call", inherited=1, raw=raw,
              parent_session_id="pi:PARENT", relation="branch", branch_point_event_id=spawn_eid)
         _add(self.conn, sid="pi:SUB", eid="pi:sub-u", seq=1,
-             ts="2026-01-01T00:03:00Z",
-             text="Task: You are a delegated subagent running from a fork.",
+             ts="2026-01-01T00:03:00Z", text="neutral child instruction",
              parent_session_id="pi:PARENT", relation="branch", branch_point_event_id=spawn_eid)
         _add(self.conn, sid="pi:HUMAN", eid="pi:human-u", seq=0,
              ts="2026-01-01T00:01:00Z", text="human intent")
 
         out = self.run_cli("userlog", "--no-refresh", "--limit", "10")
         self.assertIn("human intent", out)
-        self.assertNotIn("delegated subagent", out)
+        self.assertNotIn("neutral child instruction", out)
 
         out = self.run_cli("userlog", "--no-refresh", "--include-subagents", "--limit", "10")
-        self.assertIn("delegated subagent", out)
+        self.assertIn("neutral child instruction", out)
+
+    def test_userlog_does_not_classify_subagents_from_prompt_text(self):
+        text = "Task: You are a delegated subagent running from a fork of the parent session."
+        _add(self.conn, sid="pi:HUMAN", eid="pi:human-u", seq=0,
+             ts="2026-01-01T00:01:00Z", text=text)
+
+        out = self.run_cli("userlog", "--no-refresh", "--limit", "10")
+
+        self.assertIn(text, out)
 
     def test_userlog_filters_and_json_output(self):
         _add(self.conn, sid="pi:S", source="pi", cwd="/repo/codebrain", eid="pi:u1", seq=0,
@@ -170,7 +178,7 @@ class TestRecentCli(unittest.TestCase):
              actor="assistant", typ="tool_call", inherited=1, raw=raw,
              parent_session_id="pi:PARENT", relation="branch", branch_point_event_id=spawn_eid)
         _add(self.conn, sid="pi:SUB", eid="pi:sub-u", seq=1,
-             ts="2026-01-01T00:04:00Z", text="subagent task prompt",
+             ts="2026-01-01T00:04:00Z", text="neutral child instruction",
              parent_session_id="pi:PARENT", relation="branch", branch_point_event_id=spawn_eid)
         _add(self.conn, sid="pi:HUMAN", eid="pi:human-u", seq=0,
              ts="2026-01-01T00:03:00Z", text="human intent")
