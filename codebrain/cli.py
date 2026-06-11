@@ -5,6 +5,7 @@
   sessdb list [--limit N]              recent sessions
   sessdb recent [--limit N]            sessions by latest user activity
   sessdb userlog [--limit N]           recent user messages (intent-first)
+  sessdb turns <session>               user-centered turns with truncated agent context
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--limit N]    FTS over event text
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
@@ -128,6 +129,11 @@ def cmd_list(args):
         print(f"{started:19}  {r['n']:>5}  {r['source']:6}  {r['session_id']:<44}  "
               f"{_oneline(r['cwd'], 40):<40}  {_oneline(r['title'], 50)}")
     conn.close()
+
+
+def _is_synthetic_user_text(text) -> bool:
+    text = text or ""
+    return text.startswith("<local-command-") or text.startswith("<command-name>")
 
 
 def _user_message_where(args):
@@ -259,6 +265,133 @@ def cmd_userlog(args):
     conn.close()
 
 
+def _turn_rows(conn, session_id: str, include_all: bool):
+    where = "WHERE session_id=?" + ("" if include_all else " AND live=1")
+    return conn.execute(
+        f"""
+        SELECT seq, event_id, ts, actor, type, text, refs, live, inherited
+        FROM transcript {where}
+        ORDER BY seq
+        """,
+        (session_id,),
+    ).fetchall()
+
+
+def _build_turns(rows):
+    turns, cur = [], None
+
+    def new_turn(user_row=None):
+        seq = user_row["seq"] if user_row is not None else None
+        return {
+            "turn_index": len(turns),
+            "seq_start": seq,
+            "seq_end": seq,
+            "ts": user_row["ts"] if user_row is not None else None,
+            "user_seq": seq,
+            "user_event_id": user_row["event_id"] if user_row is not None else None,
+            "user_text": user_row["text"] if user_row is not None else None,
+            "events": [],
+        }
+
+    for r in rows:
+        if r["actor"] == "user" and r["type"] == "message" and _is_synthetic_user_text(r["text"]):
+            continue
+        is_user = r["actor"] == "user" and r["type"] == "message"
+        if is_user:
+            if cur is not None:
+                turns.append(cur)
+            cur = new_turn(r)
+            continue
+        if cur is None:
+            cur = new_turn()
+            cur["seq_start"] = r["seq"]
+        cur["events"].append(dict(r))
+        cur["seq_end"] = r["seq"]
+    if cur is not None:
+        turns.append(cur)
+    for i, t in enumerate(turns):
+        t["turn_index"] = i
+    return turns
+
+
+def _turn_window(turns, args):
+    if args.around_seq is None:
+        return turns[: args.limit] if args.limit else turns
+    target = None
+    for i, t in enumerate(turns):
+        if t["seq_start"] is not None and t["seq_start"] <= args.around_seq <= t["seq_end"]:
+            target = i
+            break
+    if target is None:
+        for i, t in enumerate(turns):
+            if t["seq_start"] is not None and t["seq_start"] >= args.around_seq:
+                target = i
+                break
+    if target is None:
+        target = max(0, len(turns) - 1)
+    lo = max(0, target - args.context_turns)
+    hi = min(len(turns), target + args.context_turns + 1)
+    return turns[lo:hi]
+
+
+def _event_preview(e, chars):
+    return (e["text"] or "") if chars == 0 else _oneline(e["text"], chars)
+
+
+def _turn_json(t, args):
+    events, hidden = [], 0
+    for e in t["events"]:
+        is_tool = e["type"] in ("tool_call", "tool_result") or e["actor"] == "tool"
+        if is_tool and not args.show_tools:
+            hidden += 1
+            continue
+        chars = args.tool_chars if is_tool else args.agent_chars
+        events.append({
+            "seq": e["seq"], "event_id": e["event_id"], "ts": e["ts"],
+            "actor": e["actor"], "type": e["type"], "live": e["live"],
+            "preview": _event_preview(e, chars),
+        })
+    return {
+        "turn_index": t["turn_index"], "seq_start": t["seq_start"], "seq_end": t["seq_end"],
+        "ts": t["ts"], "user_seq": t["user_seq"], "user_event_id": t["user_event_id"],
+        "user_text": t["user_text"], "hidden_tool_events": hidden, "events": events,
+    }
+
+
+def cmd_turns(args):
+    conn = _open(args)
+    sid = _resolve_session(conn, args.session)
+    if not sid:
+        print(f"no session matching {args.session!r}", file=sys.stderr)
+        sys.exit(1)
+    rows = _turn_rows(conn, sid, args.all)
+    turns = _turn_window(_build_turns(rows), args)
+    if args.json:
+        json.dump([_turn_json(t, args) for t in turns], sys.stdout, ensure_ascii=False)
+        print()
+    else:
+        print(f"session {sid}")
+        for t in turns:
+            label = f"turn {t['turn_index']} seq {t['seq_start']}..{t['seq_end']}"
+            print(f"\n{label}")
+            if t["user_seq"] is None:
+                print("  user: <none>")
+            else:
+                user_text = (t["user_text"] or "") if args.user_chars == 0 else _oneline(t["user_text"], args.user_chars)
+                print(f"  user[{t['user_seq']}]: {user_text}")
+            hidden = 0
+            for e in t["events"]:
+                is_tool = e["type"] in ("tool_call", "tool_result") or e["actor"] == "tool"
+                if is_tool and not args.show_tools:
+                    hidden += 1
+                    continue
+                chars = args.tool_chars if is_tool else args.agent_chars
+                print(f"    {e['actor']}/{e['type']}[{e['seq']}]: {_event_preview(e, chars)}")
+            if hidden:
+                print(f"    tools: {hidden} hidden (--show-tools)")
+    conn.close()
+
+
 def cmd_show(args):
     conn = _open(args)
     sid = _resolve_session(conn, args.session)
@@ -380,6 +513,25 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_userlog)
+
+    sp = sub.add_parser("turns", help="display a session as user-centered turns")
+    sp.add_argument("session")
+    sp.add_argument("--around-seq", type=int, help="show turns around this transcript seq")
+    sp.add_argument("--context-turns", type=int, default=2,
+                    help="turns before/after --around-seq (default 2)")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="max turns without --around-seq; 0 means all (default 50)")
+    sp.add_argument("--user-chars", type=int, default=500,
+                    help="user preview chars; 0 means no cap (default 500)")
+    sp.add_argument("--agent-chars", type=int, default=300,
+                    help="assistant preview chars; 0 means no cap (default 300)")
+    sp.add_argument("--tool-chars", type=int, default=80,
+                    help="tool preview chars with --show-tools; 0 means no cap (default 80)")
+    sp.add_argument("--show-tools", action="store_true", help="include tool calls/results")
+    sp.add_argument("--all", action="store_true", help="include rolled-back events")
+    sp.add_argument("--json", action="store_true", help="emit a JSON array")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_turns)
 
     sp = sub.add_parser("show", help="a session's transcript")
     sp.add_argument("session")

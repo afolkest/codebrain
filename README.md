@@ -19,6 +19,7 @@ sessdb collect              # mirror raw logs → ~/codebrain-pool (append-only 
 sessdb list                 # recent sessions (any source)
 sessdb recent               # sessions by latest live user message
 sessdb userlog              # recent live user messages (intent-first)
+sessdb turns <session>      # user-centered turns with truncated agent context
 sessdb show <session>       # a session's live transcript (--all includes rolled-back)
 sessdb search <query>       # FTS5 over event text (ranked, cross-source)
 sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
