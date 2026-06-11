@@ -64,8 +64,9 @@ class TestUserlogCli(unittest.TestCase):
         self.assertNotIn("copied intent", out)
         self.assertNotIn("generated command transcript", out)
         self.assertNotIn("command-message", out)
-        self.assertIn("pi:S", out)
-        self.assertIn("seq=6", out)
+        self.assertIn("session: pi:S", out)
+        self.assertIn("seq: 6", out)
+        self.assertIn("expand: sessdb turns pi:S --around-seq 6", out)
 
     def test_userlog_filters_and_json_output(self):
         _add(self.conn, sid="pi:S", source="pi", cwd="/repo/codebrain", eid="pi:u1", seq=0,
@@ -120,6 +121,11 @@ class TestRecentCli(unittest.TestCase):
         self.assertEqual([r["session_id"] for r in rows], ["pi:S2", "pi:S1"])
         self.assertEqual(rows[0]["last_user_text"], "newer user request")
         self.assertEqual(rows[1]["live_event_count"], 2)
+
+        text_out = self.run_cli("recent", "--no-refresh", "--limit", "1")
+        self.assertIn("session: pi:S2", text_out)
+        self.assertIn("seq: 0", text_out)
+        self.assertIn("expand: sessdb turns pi:S2 --around-seq 0", text_out)
 
     def test_recent_filters_to_matching_user_activity(self):
         _add(self.conn, sid="pi:S1", source="pi", cwd="/repo/codebrain", eid="pi:s1-u", seq=0,

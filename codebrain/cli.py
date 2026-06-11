@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -50,6 +51,26 @@ def _oneline(s, n=200):
         return ""
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _short_path(path, n=70):
+    if not path:
+        return ""
+    s = str(path)
+    home = str(Path.home())
+    if s == home:
+        s = "~"
+    elif s.startswith(home + "/"):
+        s = "~" + s[len(home):]
+    return s if len(s) <= n else "…" + s[-(n - 1):]
+
+
+def _wrapped(label, text, chars=0, width=100):
+    body = (text or "") if chars == 0 else _oneline(text, chars)
+    if not body:
+        return label.rstrip()
+    return textwrap.fill(body, width=width, initial_indent=label,
+                         subsequent_indent=" " * len(label))
 
 
 def _since_cutoff(value):
@@ -238,13 +259,18 @@ def cmd_recent(args):
         json.dump(out, sys.stdout, ensure_ascii=False)
         print()
     else:
-        for r in rows:
-            text = r["last_user_text"] if args.full else _oneline(r["last_user_text"], 180)
-            cwd = _oneline(r["cwd"], 46)
-            print(f"{(r['last_user_ts'] or '')[:19]:19}  {r['source']:6}  "
-                  f"users={r['user_msg_count']:<4}  events={r['live_event_count']:<5}  "
-                  f"{r['session_id']:<44}  {cwd}")
-            print(f"  [{r['last_user_seq']}] {text}")
+        for i, r in enumerate(rows):
+            if i:
+                print()
+            sid = r["session_id"]
+            seq = r["last_user_seq"]
+            print(f"{(r['last_user_ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
+            print(f"session: {sid}")
+            print(f"seq: {seq}  users: {r['user_msg_count']}  events: {r['live_event_count']}")
+            if r["title"]:
+                print(_wrapped("title: ", r["title"], 120))
+            print(_wrapped("user: ", r["last_user_text"], 0 if args.full else 260))
+            print(f"expand: sessdb turns {sid} --around-seq {seq}")
     conn.close()
 
 
@@ -256,12 +282,16 @@ def cmd_userlog(args):
         json.dump(out, sys.stdout, ensure_ascii=False)
         print()
     else:
-        for r in rows:
-            text = r["text"] if args.full else _oneline(r["text"], 260)
-            cwd = _oneline(r["cwd"], 60)
-            print(f"{(r['ts'] or '')[:19]:19}  {r['source']:6}  seq={r['seq']:<5}  "
-                  f"chars={r['chars']:<5}  {r['session_id']}  {cwd}")
-            print(f"  {text}")
+        for i, r in enumerate(rows):
+            if i:
+                print()
+            sid = r["session_id"]
+            seq = r["seq"]
+            print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
+            print(f"session: {sid}")
+            print(f"seq: {seq}  chars: {r['chars']}")
+            print(_wrapped("user: ", r["text"], 0 if args.full else 320))
+            print(f"expand: sessdb turns {sid} --around-seq {seq}")
     conn.close()
 
 
@@ -383,16 +413,15 @@ def cmd_turns(args):
         json.dump([_turn_json(t, args) for t in turns], sys.stdout, ensure_ascii=False)
         print()
     else:
-        print(f"session {sid}")
+        print(f"session: {sid}")
         for t in turns:
-            label = f"turn {t['turn_index']} seq {t['seq_start']}..{t['seq_end']}"
+            label = f"turn {t['turn_index']}  seq {t['seq_start']}..{t['seq_end']}"
             print(f"\n{label}")
             if t["user_seq"] is None:
-                print("  user: <none>")
+                print("user: <none>")
             else:
-                user_text = (t["user_text"] or "") if args.user_chars == 0 else _oneline(t["user_text"], args.user_chars)
                 suffix = _placement_suffix(t["user_live"], t["user_inherited"])
-                print(f"  user[{t['user_seq']}]{suffix}: {user_text}")
+                print(_wrapped(f"user[{t['user_seq']}]{suffix}: ", t["user_text"], args.user_chars))
             hidden = 0
             for e in t["events"]:
                 is_tool = e["type"] in ("tool_call", "tool_result") or e["actor"] == "tool"
@@ -401,9 +430,9 @@ def cmd_turns(args):
                     continue
                 chars = args.tool_chars if is_tool else args.agent_chars
                 suffix = _placement_suffix(e["live"], e["inherited"])
-                print(f"    {e['actor']}/{e['type']}[{e['seq']}]{suffix}: {_event_preview(e, chars)}")
+                print(_wrapped(f"{e['actor']}/{e['type']}[{e['seq']}]{suffix}: ", e["text"], chars))
             if hidden:
-                print(f"    tools: {hidden} hidden (--show-tools)")
+                print(f"tools: {hidden} hidden (--show-tools)")
     conn.close()
 
 

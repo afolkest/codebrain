@@ -64,11 +64,11 @@ class TestTurnsCli(unittest.TestCase):
         self.seed()
         out = self.run_cli("turns", "pi:S", "--no-refresh", "--limit", "2", "--agent-chars", "30")
 
-        self.assertIn("turn 0 seq 0..3", out)
+        self.assertIn("turn 0  seq 0..3", out)
         self.assertIn("user[0]: first user request", out)
         self.assertIn("assistant/message[1]: first assistant answer", out)
         self.assertIn("tools: 2 hidden", out)
-        self.assertIn("turn 1 seq 4..5", out)
+        self.assertIn("turn 1  seq 4..5", out)
         self.assertNotIn("secret command details", out)
         self.assertNotIn("third user request", out)
         self.assertNotIn("dead user request", out)
