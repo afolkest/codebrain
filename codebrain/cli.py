@@ -153,8 +153,35 @@ def cmd_list(args):
 
 
 def _is_synthetic_user_text(text) -> bool:
-    text = text or ""
-    return text.startswith("<local-command-") or text.startswith("<command-name>")
+    text = (text or "").lstrip()
+    return (
+        text.startswith("<local-command-")
+        or text.startswith("<command-name>")
+        or text.startswith("<task-notification>")
+    )
+
+
+def _not_subagent_session_sql() -> str:
+    """Exclude subagent/fork sessions via structured lineage/tool-call evidence.
+
+    Existing DBs may not have relation='subagent' until their raw files are
+    re-parsed with the newer pi adapter, so also inspect the branch-point event's
+    raw toolCall block. This deliberately avoids classifying sessions from the
+    child prompt text.
+    """
+    return """
+        COALESCE(s.relation, '') != 'subagent'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM events bp, json_each(bp.raw, '$.message.content') AS block
+          WHERE bp.event_id = s.branch_point_event_id
+            AND json_extract(block.value, '$.type') = 'toolCall'
+            AND json_extract(block.value, '$.name') = 'subagent'
+            AND bp.event_id = 'pi:' || json_extract(bp.raw, '$.id') || ':' ||
+                              json_extract(bp.raw, '$.timestamp') || ':' ||
+                              json_extract(block.value, '$.id')
+        )
+    """
 
 
 def _user_message_where(args):
@@ -166,8 +193,11 @@ def _user_message_where(args):
         "COALESCE(t.text, '') <> ''",
         "t.text NOT LIKE '<local-command-%'",
         "t.text NOT LIKE '<command-name>%'",
+        "t.text NOT LIKE '<task-notification>%'",
     ]
     params: list = []
+    if not getattr(args, "include_subagents", False):
+        where.append(_not_subagent_session_sql())
     if not getattr(args, "include_inherited", False):
         where.append("t.inherited = 0")  # pi resume copies are context, not new user intent
     if getattr(args, "source", None):
@@ -538,6 +568,8 @@ def main(argv=None):
     sp.add_argument("--max-chars", type=int, default=0, help="maximum latest-considered user length (0 = no cap)")
     sp.add_argument("--include-inherited", action="store_true",
                     help="include pi resume/branch copies (default: authored messages only)")
+    sp.add_argument("--include-subagents", action="store_true",
+                    help="include sessions spawned by subagent tool calls")
     sp.add_argument("--full", action="store_true", help="do not truncate last user preview")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
@@ -553,6 +585,8 @@ def main(argv=None):
     sp.add_argument("--max-chars", type=int, default=0, help="maximum message length (0 = no cap)")
     sp.add_argument("--include-inherited", action="store_true",
                     help="include pi resume/branch copies (default: authored messages only)")
+    sp.add_argument("--include-subagents", action="store_true",
+                    help="include sessions spawned by subagent tool calls")
     sp.add_argument("--full", action="store_true", help="do not truncate message text")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")

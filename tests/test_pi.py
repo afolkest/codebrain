@@ -126,6 +126,24 @@ class TestPi(unittest.TestCase):
         # branch point = the last live inherited event
         self.assertEqual(parsed.session.branch_point_event_id, "pi:bbbb2222:2026-01-01T00:02:00.000Z")
 
+    def test_subagent_branch_uses_structured_tool_call_lineage(self):
+        parent_path = "/some/dir/2026-01-01T00-00-00-000Z_PARENT.jsonl"
+        parsed = self.parse([
+            _session("CHILD", "2026-01-01T00:03:00.000Z", parent=parent_path),
+            _user("aaaa1111", None, "shared", "2026-01-01T00:01:00.000Z"),
+            _assistant_text_tool("bbbb2222", "aaaa1111", "launch", "tc-sub", "subagent",
+                                 {"agent": "oracle"}, "2026-01-01T00:02:00.000Z"),
+            _user("dddd4444", "bbbb2222", "Task: delegated prompt text",
+                  "2026-01-01T00:04:00.000Z"),
+        ], name="0_CHILD.jsonl")
+        assert_session_invariants(self, parsed, "pi")
+
+        spawn = "pi:bbbb2222:2026-01-01T00:02:00.000Z:tc-sub"
+        self.assertEqual(parsed.session.relation, "subagent")
+        self.assertEqual(parsed.session.parent_session_id, "pi:PARENT")
+        self.assertEqual(parsed.session.branch_point_event_id, spawn)
+        self.assertEqual(parsed.session.spawn_event_id, spawn)
+
 
 if __name__ == "__main__":
     unittest.main()

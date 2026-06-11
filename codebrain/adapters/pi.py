@@ -99,6 +99,7 @@ def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSess
     meta: dict[str, dict] = {}                  # eid -> {rid, line, idx, ts}
     record_emitted: dict[str, list] = {}        # 8hex record id -> [eid, ...] (block order)
     call_to_eid: dict[str, str] = {}            # toolCall.id -> tool_call eid
+    tool_name_by_eid: dict[str, str] = {}       # tool_call eid -> structured tool name
     result_tcid: dict[str, str] = {}            # tool_result eid -> toolCallId (resolve later)
 
     def emit(rec, eid, rid, actor, typ, text, refs, idx, tool_call_event_id=None):
@@ -150,8 +151,10 @@ def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSess
                 elif bt == "toolCall":
                     cid = b.get("id") or f"b{idx}"
                     eid = f"{SOURCE}:{rid}:{ts}:{cid}"
-                    text, refs = _render_tool_call(b.get("name") or "?", b.get("arguments"))
+                    name = b.get("name") or "?"
+                    text, refs = _render_tool_call(name, b.get("arguments"))
                     emit(rec, eid, rid, "assistant", "tool_call", text, refs, idx)
+                    tool_name_by_eid[eid] = name
                     if isinstance(b.get("id"), str):
                         call_to_eid[b["id"]] = eid
                     idx += 1
@@ -218,13 +221,20 @@ def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSess
         if inh and lv and seq > branch_seq:
             branch_seq, branch_eid = seq, e.event_id
 
+    branch_point_event_id = branch_eid if parent_sid else None
+    spawn_event_id = None
+    if branch_point_event_id and tool_name_by_eid.get(branch_point_event_id) == "subagent":
+        relation = "subagent"
+        spawn_event_id = branch_point_event_id
+
     all_ts = [m["ts"] for m in meta.values() if m["ts"]]
     session = SessionRow(
         session_id=sid, source=SOURCE, machine=machine, cwd=cwd,
         created_at=created_at or None, started_at=min(all_ts) if all_ts else None,
         ended_at=max(all_ts) if all_ts else None,
         parent_session_id=parent_sid, relation=relation,
-        branch_point_event_id=branch_eid if parent_sid else None,
+        spawn_event_id=spawn_event_id,
+        branch_point_event_id=branch_point_event_id,
         tip_event_id=tip, title=None,
     )
     return ParsedSession(session=session, events=events, placements=placements)
