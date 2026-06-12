@@ -122,7 +122,8 @@ Acceptance criteria:
 
 - Searching a phrase includes current/active sessions by default.
 - Searching a phrase with `--exclude-session` removes hits from that session.
-- Searching with `--only-session` supports deliberate self-search/pre-compact recovery.
+- Searching with `--only-session` supports deliberate self-search/pre-compact recovery,
+  including inherited live context in that one session.
 - Searching with `--before` excludes later/current self-referential hits.
 - Searching with `--actor user` can isolate user confirmations/preferences.
 - `--json` output is stable and scriptable.

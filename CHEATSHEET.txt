@@ -70,7 +70,7 @@ python3 -m codebrain search "ExamplePriority" --exclude-session <session_id>
 # Explicitly remove a noisy/current session from results.
 
 python3 -m codebrain search "ExamplePriority" --only-session <session_id>
-# Deliberately search one long/current session, e.g. pre-compact recovery.
+# Deliberately search one long/current session, including inherited live context for pre-compact recovery.
 
 python3 -m codebrain search "ExamplePriority" --exclude-recent 1h --json
 # Scriptable search, excluding very recent self-referential results.

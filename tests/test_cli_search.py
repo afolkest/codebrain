@@ -77,13 +77,39 @@ class TestSearchCli(unittest.TestCase):
         rows = json.loads(out)
 
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ts"], "2026-01-01T00:01:00Z")
+        self.assertEqual(rows[0]["source"], "pi")
         self.assertEqual(rows[0]["session_id"], "pi:S1")
         self.assertEqual(rows[0]["seq"], 0)
         self.assertEqual(rows[0]["event_id"], "pi:s1-u")
+        self.assertEqual(rows[0]["cwd"], "/repo/codebrain")
         self.assertEqual(rows[0]["actor"], "user")
         self.assertEqual(rows[0]["type"], "message")
+        self.assertEqual(rows[0]["inherited"], 0)
+        self.assertIn("[needle]", rows[0]["snippet"])
         self.assertEqual(rows[0]["text"], "needle user preference")
         self.assertEqual(rows[0]["expand_command"], "sessdb turns pi:S1 --around-seq 0")
+
+    def test_search_timestamp_filters_handle_fractional_boundaries(self):
+        _add(self.conn, sid="pi:S", eid="pi:exact", seq=0,
+             ts="2026-01-01T00:02:00.000Z", text="boundneedle exact boundary")
+        _add(self.conn, sid="pi:S", eid="pi:later", seq=1,
+             ts="2026-01-01T00:02:00.001Z", text="boundneedle just later")
+
+        rows = json.loads(self.run_cli(
+            "search", "boundneedle", "--no-refresh", "--json", "--after", "2026-01-01T00:02:00Z"
+        ))
+        self.assertEqual({r["event_id"] for r in rows}, {"pi:exact", "pi:later"})
+
+        rows = json.loads(self.run_cli(
+            "search", "boundneedle", "--no-refresh", "--json", "--before", "2026-01-01T00:02:00Z"
+        ))
+        self.assertEqual(rows, [])
+
+        rows = json.loads(self.run_cli(
+            "search", "boundneedle", "--no-refresh", "--json", "--before", "2026-01-01T00:02:00.001Z"
+        ))
+        self.assertEqual([r["event_id"] for r in rows], ["pi:exact"])
 
     def test_search_session_and_recent_filters_are_explicit(self):
         now = datetime.now(timezone.utc)
@@ -91,19 +117,29 @@ class TestSearchCli(unittest.TestCase):
              ts=_iso(now - timedelta(hours=2)), text="freshneedle older intent")
         _add(self.conn, sid="pi:NOW", eid="pi:now-u", seq=0,
              ts=_iso(now), text="freshneedle current session echo")
+        _add(self.conn, sid="pi:NOW", eid="pi:now-copy", seq=1,
+             ts=_iso(now), text="copiedneedle inherited current context", inherited=1)
 
         rows = json.loads(self.run_cli("search", "freshneedle", "--no-refresh", "--json"))
         self.assertEqual({r["session_id"] for r in rows}, {"pi:OLD", "pi:NOW"})
 
         rows = json.loads(self.run_cli(
-            "search", "freshneedle", "--no-refresh", "--json", "--exclude-session", "NOW"
+            "search", "freshneedle", "--no-refresh", "--json", "--exclude-session", "pi:N"
         ))
         self.assertEqual([r["session_id"] for r in rows], ["pi:OLD"])
 
         rows = json.loads(self.run_cli(
-            "search", "freshneedle", "--no-refresh", "--json", "--only-session", "NOW"
+            "search", "freshneedle", "--no-refresh", "--json", "--only-session", "pi:N"
         ))
         self.assertEqual([r["session_id"] for r in rows], ["pi:NOW"])
+
+        rows = json.loads(self.run_cli("search", "copiedneedle", "--no-refresh", "--json"))
+        self.assertEqual(rows, [])
+
+        rows = json.loads(self.run_cli(
+            "search", "copiedneedle", "--no-refresh", "--json", "--only-session", "pi:N"
+        ))
+        self.assertEqual([(r["session_id"], r["inherited"]) for r in rows], [("pi:NOW", 1)])
 
         rows = json.loads(self.run_cli(
             "search", "freshneedle", "--no-refresh", "--json", "--exclude-recent", "1h"

@@ -74,12 +74,12 @@ def _wrapped(label, text, chars=0, width=100):
 
 
 def _since_cutoff(value):
-    """Return an ISO-ish cutoff string for SQL text comparison.
+    """Return a timestamp/date cutoff string for SQLite date comparisons.
 
-    Accepts either an explicit timestamp/date prefix (passed through) or a small
-    relative duration like ``7d``/``12h``. Source timestamps are ISO-8601 UTC, so
-    lexicographic comparison is sufficient for both exact timestamps and
-    YYYY-MM-DD prefixes.
+    Accepts either an explicit timestamp/date (passed through) or a small
+    relative duration like ``7d``/``12h``. Callers compare with SQLite date
+    functions instead of raw text so fractional and non-fractional timestamps
+    share the same boundary semantics.
     """
     if not value:
         return None
@@ -100,11 +100,27 @@ def _since_cutoff(value):
 
 
 def _resolve_session(conn, ident: str):
+    ident = (ident or "").strip()
+    if not ident:
+        return None
+    row = conn.execute("SELECT session_id FROM sessions WHERE session_id = ?", (ident,)).fetchone()
+    if row:
+        return row["session_id"]
+    patterns = [f"{ident}%", *(f"{source}:{ident}%" for source in SOURCES)]
     row = conn.execute(
-        "SELECT session_id FROM sessions WHERE session_id = ? OR session_id LIKE ? LIMIT 1",
-        (ident, f"%{ident}%"),
+        f"""
+        SELECT session_id FROM sessions
+        WHERE {' OR '.join('session_id LIKE ?' for _ in patterns)}
+        ORDER BY session_id
+        LIMIT 1
+        """,
+        patterns,
     ).fetchone()
     return row["session_id"] if row else None
+
+
+def _timestamp_where(column: str, op: str) -> str:
+    return f"julianday({column}) {op} julianday(?)"
 
 
 def cmd_ingest(args):
@@ -208,7 +224,7 @@ def _user_message_where(args):
         params.append(f"%{args.cwd}%")
     cutoff = _since_cutoff(getattr(args, "since", None))
     if cutoff:
-        where.append("t.ts >= ?")
+        where.append(_timestamp_where("t.ts", ">="))
         params.append(cutoff)
     if getattr(args, "min_chars", 0):
         where.append("length(COALESCE(t.text, '')) >= ?")
@@ -498,9 +514,10 @@ def _search_rows(conn, args):
     where = ["events_fts MATCH ?", "se.live = 1", "COALESCE(e.text, '') <> ''"]
     params: list = [args.query]
 
+    only_session = getattr(args, "only_session", None)
     if not getattr(args, "include_subagents", False):
         where.append(_not_subagent_session_sql())
-    if not getattr(args, "include_inherited", False):
+    if not getattr(args, "include_inherited", False) and not only_session:
         where.append("se.inherited = 0")
     if getattr(args, "actor", None):
         where.append("e.actor = ?")
@@ -517,18 +534,18 @@ def _search_rows(conn, args):
 
     after = _since_cutoff(getattr(args, "after", None))
     if after:
-        where.append("e.ts >= ?")
+        where.append(_timestamp_where("e.ts", ">="))
         params.append(after)
     before = _since_cutoff(getattr(args, "before", None))
     if before:
-        where.append("e.ts < ?")
+        where.append(_timestamp_where("e.ts", "<"))
         params.append(before)
     recent_cutoff = _since_cutoff(getattr(args, "exclude_recent", None))
     if recent_cutoff:
-        where.append("e.ts < ?")
+        where.append(_timestamp_where("e.ts", "<"))
         params.append(recent_cutoff)
 
-    if getattr(args, "only_session", None):
+    if only_session:
         sid = _resolve_session(conn, args.only_session)
         if sid:
             where.append("se.session_id = ?")
@@ -697,7 +714,7 @@ def main(argv=None):
     sp.add_argument("--before", help="event timestamp upper bound, or relative duration like 7d/12h")
     sp.add_argument("--exclude-session", action="append", default=[],
                     help="exclude a session id/prefix; repeatable")
-    sp.add_argument("--only-session", help="only search one session id/prefix")
+    sp.add_argument("--only-session", help="only search one session id/prefix, including inherited live context")
     sp.add_argument("--exclude-recent", help="exclude events newer than a relative duration like 1h")
     sp.add_argument("--include-inherited", action="store_true",
                     help="include pi resume/branch copies (default: authored events only)")
