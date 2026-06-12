@@ -84,6 +84,15 @@ python3 -m codebrain lineage <session_id>
 python3 -m codebrain lineage <session_id> --json
 # Lineage as JSON for scripts/agents.
 
+python3 -m codebrain refs <session_id>
+# Files, commands, and commit hashes referenced by a session.
+
+python3 -m codebrain refs <session_id> --around-seq <seq> --context-turns 1
+# References only near a specific turn/window.
+
+python3 -m codebrain refs <session_id> --json
+# References as JSON for scripts/agents.
+
 python3 -m codebrain grep "some literal string"
 # Grep raw logs directly.
 

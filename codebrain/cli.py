@@ -9,6 +9,7 @@
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--around N]   FTS over filtered event text
   sessdb lineage <session>             factual parent/child session lineage
+  sessdb refs <session>                files/commands/commits referenced by a session
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
 
 Read commands refresh first: changed/new raw files are delta-ingested before the
@@ -630,6 +631,140 @@ def cmd_search(args):
     conn.close()
 
 
+COMMIT_RE = re.compile(r"(?<![0-9A-Fa-f])(?:[0-9a-f]{7,40})(?![0-9A-Fa-f])")
+
+
+def _refs_json(value):
+    try:
+        refs = json.loads(value or "{}") if isinstance(value, str) else (value or {})
+    except json.JSONDecodeError:
+        refs = {}
+    files = refs.get("files") if isinstance(refs, dict) else []
+    commands = refs.get("commands") if isinstance(refs, dict) else []
+    return {
+        "files": [x for x in files if isinstance(x, str) and x],
+        "commands": [x for x in commands if isinstance(x, str) and x],
+    }
+
+
+def _refs_evidence(r, sid: str):
+    return {
+        "seq": r["seq"], "event_id": r["event_id"], "ts": r["ts"],
+        "actor": r["actor"], "type": r["type"],
+        "preview": _oneline(r["text"], 180),
+        "expand_command": f"sessdb turns {sid} --around-seq {r['seq']}",
+    }
+
+
+def _refs_add(grouped, key, evidence):
+    if not key:
+        return
+    item = grouped.setdefault(key, {"value": key, "events": []})
+    seen = {(e["event_id"], e["seq"]) for e in item["events"]}
+    ident = (evidence["event_id"], evidence["seq"])
+    if ident not in seen:
+        item["events"].append(evidence)
+
+
+def _refs_rows(conn, sid: str, args):
+    rows = _turn_rows(conn, sid, args.all)
+    if args.around_seq is None:
+        return rows, {"all": bool(args.all), "around_seq": None, "context_turns": None}
+    window_args = argparse.Namespace(
+        around_seq=args.around_seq, context_turns=args.context_turns, limit=0,
+    )
+    turns = _turn_window(_build_turns(rows), window_args)
+    if not turns:
+        return [], {"all": bool(args.all), "around_seq": args.around_seq,
+                    "context_turns": args.context_turns, "seq_start": None, "seq_end": None}
+    seqs = [x for t in turns for x in (t["seq_start"], t["seq_end"]) if x is not None]
+    lo, hi = min(seqs), max(seqs)
+    return [r for r in rows if lo <= r["seq"] <= hi], {
+        "all": bool(args.all), "around_seq": args.around_seq,
+        "context_turns": args.context_turns, "seq_start": lo, "seq_end": hi,
+    }
+
+
+def _refs_model(conn, sid: str, args):
+    session = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
+    rows, scope = _refs_rows(conn, sid, args)
+    files, commands, commits = {}, {}, {}
+    for r in rows:
+        evidence = _refs_evidence(r, sid)
+        refs = _refs_json(r["refs"])
+        for file in refs["files"]:
+            _refs_add(files, file, evidence)
+        for command in refs["commands"]:
+            _refs_add(commands, command, evidence)
+            for commit in COMMIT_RE.findall(command):
+                _refs_add(commits, commit, evidence)
+        for commit in COMMIT_RE.findall(r["text"] or ""):
+            _refs_add(commits, commit, evidence)
+    return {
+        "session": dict(session) if session else {"session_id": sid},
+        "scope": scope,
+        "files": sorted(files.values(), key=lambda x: x["value"]),
+        "commands": sorted(commands.values(), key=lambda x: x["events"][0]["seq"]),
+        "commits": sorted(commits.values(), key=lambda x: x["events"][0]["seq"]),
+    }
+
+
+def _git_show_file_hints(files):
+    hints = []
+    for file in files or []:
+        value = file["value"]
+        if value.startswith(("/", "~")):
+            continue
+        hints.append(value)
+    return hints
+
+
+def _print_refs_group(name, items, *, command_hints=False, git_files=None):
+    print(f"\n{name}:")
+    if not items:
+        print("  <none>")
+        return
+    for item in items:
+        value = item["value"]
+        print(_wrapped("  - ", value, 220))
+        if command_hints:
+            print(f"    git show {value}")
+            for file in _git_show_file_hints(git_files)[:3]:
+                print(f"    git show {value}:{file}")
+        for e in item["events"][:5]:
+            print(f"    seq {e['seq']}  {e['actor']}/{e['type']}  {e['event_id']}")
+            if e["preview"]:
+                print(_wrapped("      ", e["preview"], 180))
+            print(f"      expand: {e['expand_command']}")
+        if len(item["events"]) > 5:
+            print(f"      ... {len(item['events']) - 5} more event(s)")
+
+
+def cmd_refs(args):
+    conn = _open(args)
+    sid = _resolve_session(conn, args.session)
+    if not sid:
+        print(f"no session matching {args.session!r}", file=sys.stderr)
+        sys.exit(1)
+    model = _refs_model(conn, sid, args)
+    if args.json:
+        print(json.dumps(model, indent=2))
+    else:
+        s = model["session"]
+        print(f"session: {sid}")
+        print(f"source: {s.get('source')}  cwd: {_short_path(s.get('cwd'))}")
+        scope = model["scope"]
+        if scope.get("around_seq") is not None:
+            print(f"scope: seq {scope.get('seq_start')}..{scope.get('seq_end')} "
+                  f"around {scope['around_seq']} ±{scope['context_turns']} turn(s)")
+        else:
+            print("scope: " + ("all placements" if scope.get("all") else "live placements"))
+        _print_refs_group("files", model["files"])
+        _print_refs_group("commands", model["commands"])
+        _print_refs_group("commits", model["commits"], command_hints=True, git_files=model["files"])
+    conn.close()
+
+
 def _latest_user_for_session(conn, sid: str):
     rows = conn.execute(
         """
@@ -954,6 +1089,16 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit a JSON object")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_lineage)
+
+    sp = sub.add_parser("refs", help="files/commands/commits referenced by a session")
+    sp.add_argument("session")
+    sp.add_argument("--around-seq", type=int, help="only include refs in turns around this seq")
+    sp.add_argument("--context-turns", type=int, default=2,
+                    help="turns before/after --around-seq (default 2)")
+    sp.add_argument("--all", action="store_true", help="include rolled-back events")
+    sp.add_argument("--json", action="store_true", help="emit a JSON object")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_refs)
 
     sp = sub.add_parser("grep", help="ripgrep over raw logs (all sources by default)")
     sp.add_argument("pattern")

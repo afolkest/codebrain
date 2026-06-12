@@ -16,7 +16,11 @@ archaeology loop smoother without turning `codebrain` into a magic memory oracle
   user-centered turns, with hidden/truncated tool context and structured JSON.
 - [x] `lineage <session>` primitive: factual root/parent/current/children/siblings
   from structured session parent links, with latest-user previews and JSON.
-- [ ] `refs <session>` primitive.
+- [x] `refs <session>` primitive: grouped files, commands, and commit hashes from
+  structured event refs plus conservative commit-token extraction, with seq evidence
+  and JSON.
+- [ ] `touched <path>` primitive for file-first archaeology, if the `refs` output
+  shape continues to feel useful.
 - [ ] JSON/docs/cheatsheet consistency pass.
 
 ## Core lesson
@@ -298,7 +302,8 @@ observable CLI behavior primitive and evidence-first.
 2. Add turn-centered search expansion.
 3. Add `lineage <session>`.
 4. Add `refs <session>`.
-5. Do a JSON/docs/cheatsheet consistency pass.
+5. Consider `touched <path>` as the inverse artifact-to-session primitive.
+6. Do a JSON/docs/cheatsheet consistency pass.
 
 Keep each slice small and reviewable. Prefer shipping a narrow primitive that works
 well over a broad command with hidden judgment.
