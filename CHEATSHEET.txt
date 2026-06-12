@@ -93,6 +93,18 @@ python3 -m codebrain refs <session_id> --around-seq <seq> --context-turns 1
 python3 -m codebrain refs <session_id> --json
 # References as JSON for scripts/agents.
 
+python3 -m codebrain touched docs/wip/pipeline-redesign.md
+# Sessions/events with that structured file ref; relative paths also match absolute refs by suffix.
+
+python3 -m codebrain touched pipeline-redesign.md --basename
+# Match structured file refs by basename.
+
+python3 -m codebrain touched docs/wip/ --prefix --cwd example-project
+# Match structured refs under a directory/path prefix.
+
+python3 -m codebrain touched docs/wip/pipeline-redesign.md --json
+# File-first archaeology as JSON for scripts/agents.
+
 python3 -m codebrain grep "some literal string"
 # Grep raw logs directly.
 

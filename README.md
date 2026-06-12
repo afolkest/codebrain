@@ -25,12 +25,13 @@ sessdb show <session>       # a session's live transcript (--all includes rolled
 sessdb search <query>       # FTS5 over event text; filters + optional turn context
 sessdb lineage <session>    # factual parent/child session lineage
 sessdb refs <session>       # files/commands/commits referenced by a session
+sessdb touched <path>       # sessions/events with structured file refs
 sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
 sessdb schema               # print the DDL
 ```
 
 **Reads are always current.** Read commands (`list`/`recent`/`userlog`/`turns`/
-`show`/`search`/`lineage`/`refs`) first delta-ingest whatever changed on disk (`refresh()`:
+`show`/`search`/`lineage`/`refs`/`touched`) first delta-ingest whatever changed on disk (`refresh()`:
 stat-scan + re-parse only new/grown files — tens of
 ms when idle), so query results include sessions that are live *right now*; ask
 about another session's last message seconds after it happened. `--no-refresh`
@@ -98,15 +99,15 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 - Refresh covers **this machine's** tool homes; the pool is collected locally,
   but cross-machine replication (point Syncthing at the pool) and
   embeddings/sqlite-vec are later slices.
-- `bash`-side file mutations aren't tracked in `refs` (known gap across all sources);
-  Codex reasoning is encrypted (≥2026-04) and excluded everywhere.
+- `bash`-side file mutations aren't tracked in `refs`/`touched` (known gap across
+  all sources); Codex reasoning is encrypted (≥2026-04) and excluded everywhere.
 
 ## Tests
 
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 78 tests, a second or two
+python3 -m unittest discover        # 81 tests, a second or two
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a

@@ -11,6 +11,7 @@
   sessdb search <query> [--around N]   FTS over filtered event text
   sessdb lineage <session>             factual parent/child session lineage
   sessdb refs <session>                files/commands/commits referenced by a session
+  sessdb touched <path>                sessions/events with structured file refs
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
 
 Read commands refresh first: changed/new raw files are delta-ingested before the
@@ -821,6 +822,213 @@ def cmd_refs(args):
     conn.close()
 
 
+def _path_norm(value):
+    s = str(value or "").strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def _path_is_absolute_or_home(value):
+    return value.startswith("/") or value == "~" or value.startswith("~/")
+
+
+def _path_basename(value):
+    value = _path_norm(value).rstrip("/")
+    return value.rsplit("/", 1)[-1] if value else ""
+
+
+def _path_prefix_match(file_value, query):
+    f = _path_norm(file_value).rstrip("/")
+    q = _path_norm(query).rstrip("/")
+    if not f or not q:
+        return False
+    if f == q or f.startswith(q + "/"):
+        return True
+    if not _path_is_absolute_or_home(q):
+        return f"/{q}/" in f"/{f}/"
+    return False
+
+
+def _path_exact_or_suffix_match(file_value, query):
+    f = _path_norm(file_value)
+    q = _path_norm(query)
+    if not f or not q:
+        return False
+    if f == q:
+        return True
+    if not _path_is_absolute_or_home(q) and "/" in q:
+        return f.endswith("/" + q)
+    return False
+
+
+def _touched_file_matches(file_value, args):
+    if args.basename:
+        return _path_basename(file_value) == _path_basename(args.path)
+    if args.prefix:
+        return _path_prefix_match(file_value, args.path)
+    return _path_exact_or_suffix_match(file_value, args.path)
+
+
+def _touched_mode(args):
+    if args.basename:
+        return "basename"
+    if args.prefix:
+        return "prefix"
+    return "path"
+
+
+def _nearest_user(conn, sid: str, seq: int, include_all: bool):
+    live_clause = "" if include_all else "AND live=1"
+    rows = conn.execute(
+        f"""
+        SELECT seq, event_id, ts, text, live, inherited
+        FROM transcript
+        WHERE session_id=? {live_clause}
+          AND actor='user' AND type='message' AND seq <= ?
+        ORDER BY seq DESC
+        LIMIT 5
+        """,
+        (sid, seq),
+    ).fetchall()
+    for r in rows:
+        if _is_synthetic_user_text(r["text"]):
+            continue
+        return {
+            "seq": r["seq"], "event_id": r["event_id"], "ts": r["ts"],
+            "text": r["text"], "preview": _oneline(r["text"], 240),
+            "live": r["live"], "inherited": r["inherited"],
+        }
+    return None
+
+
+def _touched_expand_command(r):
+    suffix = " --all" if r["live"] == 0 else ""
+    return f"sessdb turns {r['session_id']} --around-seq {r['seq']}{suffix}"
+
+
+def _touched_refs_command(r):
+    suffix = " --all" if r["live"] == 0 else ""
+    return f"sessdb refs {r['session_id']} --around-seq {r['seq']} --context-turns 0{suffix}"
+
+
+def _touched_row_json(conn, r, file_value, args):
+    return {
+        "ts": r["ts"], "source": r["source"], "session_id": r["session_id"],
+        "seq": r["seq"], "event_id": r["event_id"], "cwd": r["cwd"],
+        "title": r["title"], "actor": r["actor"], "type": r["type"],
+        "live": r["live"], "inherited": r["inherited"], "file": file_value,
+        "preview": _oneline(r["text"], 240),
+        "nearest_user": _nearest_user(conn, r["session_id"], r["seq"], args.all),
+        "expand_command": _touched_expand_command(r),
+        "refs_command": _touched_refs_command(r),
+    }
+
+
+def _touched_candidates(conn, args):
+    where = ["COALESCE(t.refs, '') <> ''"]
+    params: list = []
+    if not args.all:
+        where.append("t.live = 1")
+    only_session = getattr(args, "only_session", None)
+    if not getattr(args, "include_subagents", False):
+        where.append(_not_subagent_session_sql())
+    if not getattr(args, "include_inherited", False) and not only_session:
+        where.append("t.inherited = 0")
+    if getattr(args, "source", None):
+        where.append("s.source = ?")
+        params.append(args.source)
+    if getattr(args, "cwd", None):
+        where.append("COALESCE(s.cwd, '') LIKE ?")
+        params.append(f"%{args.cwd}%")
+    after = _since_cutoff(getattr(args, "after", None))
+    if after:
+        where.append(_timestamp_where("t.ts", ">="))
+        params.append(after)
+    before = _since_cutoff(getattr(args, "before", None))
+    if before:
+        where.append(_timestamp_where("t.ts", "<"))
+        params.append(before)
+    recent_cutoff = _since_cutoff(getattr(args, "exclude_recent", None))
+    if recent_cutoff:
+        where.append(_timestamp_where("t.ts", "<"))
+        params.append(recent_cutoff)
+    if only_session:
+        sid = _resolve_session(conn, args.only_session)
+        if sid:
+            where.append("t.session_id = ?")
+            params.append(sid)
+        else:
+            where.append("0")
+    for ident in getattr(args, "exclude_session", None) or []:
+        where.append("t.session_id != ?")
+        params.append(_resolve_session(conn, ident) or ident)
+    return conn.execute(
+        f"""
+        SELECT t.ts, s.source, t.session_id, t.seq, t.event_id, s.cwd, s.title,
+               t.actor, t.type, t.text, t.refs, t.live, t.inherited
+        FROM transcript t
+        JOIN sessions s ON s.session_id = t.session_id
+        WHERE {' AND '.join(where)}
+        ORDER BY julianday(t.ts) DESC, t.session_id DESC, t.seq DESC
+        """,
+        params,
+    ).fetchall()
+
+
+def _touched_matches(conn, args):
+    out = []
+    limit = max(0, args.limit)
+    for r in _touched_candidates(conn, args):
+        refs = _refs_json(r["refs"])
+        for file_value in refs["files"]:
+            if not _touched_file_matches(file_value, args):
+                continue
+            out.append(_touched_row_json(conn, r, file_value, args))
+            if limit and len(out) >= limit:
+                return out
+    return out
+
+
+def _touched_query_json(args):
+    return {
+        "path": args.path, "mode": _touched_mode(args), "limit": args.limit,
+        "source": args.source, "cwd": args.cwd, "after": args.after,
+        "before": args.before, "exclude_session": args.exclude_session,
+        "only_session": args.only_session, "exclude_recent": args.exclude_recent,
+        "all": bool(args.all), "include_inherited": bool(args.include_inherited),
+        "include_subagents": bool(args.include_subagents),
+    }
+
+
+def cmd_touched(args):
+    conn = _open(args)
+    matches = _touched_matches(conn, args)
+    if args.json:
+        print(json.dumps({"query": _touched_query_json(args), "matches": matches}, indent=2))
+    else:
+        print(f"path: {args.path}  mode: {_touched_mode(args)}")
+        if not matches:
+            print("<no structured file refs>")
+        for i, r in enumerate(matches):
+            if i:
+                print()
+            print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
+            print(f"session: {r['session_id']}")
+            suffix = _placement_suffix(r["live"], r["inherited"])
+            print(f"seq: {r['seq']}  event: {r['event_id']}  {r['actor']}/{r['type']}{suffix}")
+            print(_wrapped("file: ", r["file"], 180))
+            if r["nearest_user"]:
+                u = r["nearest_user"]
+                usuffix = _placement_suffix(u["live"], u["inherited"])
+                print(_wrapped(f"nearest_user[{u['seq']}]{usuffix}: ", u["text"], 260))
+            if r["preview"]:
+                print(_wrapped("event: ", r["preview"], 220))
+            print(f"expand: {r['expand_command']}")
+            print(f"refs: {r['refs_command']}")
+    conn.close()
+
+
 def _latest_user_for_session(conn, sid: str):
     rows = conn.execute(
         """
@@ -1180,6 +1388,30 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit a JSON object")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_refs)
+
+    sp = sub.add_parser("touched", help="sessions/events with structured file refs")
+    sp.add_argument("path")
+    mode = sp.add_mutually_exclusive_group()
+    mode.add_argument("--basename", action="store_true", help="match by basename only")
+    mode.add_argument("--prefix", action="store_true", help="match a directory/path prefix")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="maximum matches; 0 means all (default 50)")
+    sp.add_argument("--source", choices=SOURCES, help="filter by source")
+    sp.add_argument("--cwd", help="substring filter on session cwd")
+    sp.add_argument("--after", help="event timestamp lower bound, or relative duration like 7d/12h")
+    sp.add_argument("--before", help="event timestamp upper bound, or relative duration like 7d/12h")
+    sp.add_argument("--exclude-session", action="append", default=[],
+                    help="exclude a session id/prefix; repeatable")
+    sp.add_argument("--only-session", help="only scan one session id/prefix, including inherited live context")
+    sp.add_argument("--exclude-recent", help="exclude events newer than a relative duration like 1h")
+    sp.add_argument("--include-inherited", action="store_true",
+                    help="include pi resume/branch copies (default: authored events only)")
+    sp.add_argument("--include-subagents", action="store_true",
+                    help="include sessions spawned by subagent tool calls")
+    sp.add_argument("--all", action="store_true", help="include rolled-back events")
+    sp.add_argument("--json", action="store_true", help="emit a JSON object")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_touched)
 
     sp = sub.add_parser("grep", help="ripgrep over raw logs (all sources by default)")
     sp.add_argument("pattern")

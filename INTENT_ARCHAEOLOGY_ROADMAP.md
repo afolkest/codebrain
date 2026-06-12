@@ -19,9 +19,12 @@ archaeology loop smoother without turning `codebrain` into a magic memory oracle
 - [x] `refs <session>` primitive: grouped files, commands, and commit hashes from
   structured event refs plus conservative commit-token extraction, with seq evidence
   and JSON.
-- [ ] `touched <path>` primitive for file-first archaeology, if the `refs` output
-  shape continues to feel useful.
+- [x] `touched <path>` primitive: file-first archaeology over structured
+  `events.refs.files`, with exact/suffix, basename, prefix, filters, expand hints,
+  and JSON.
 - [ ] JSON/docs/cheatsheet consistency pass.
+- [ ] Polish/hardening/simplification/testing/analysis mode; no more feature-add
+  mode unless empirical use clearly justifies it.
 
 ## Core lesson
 
@@ -79,6 +82,7 @@ sessdb search "ExamplePriority" --cwd example-project --actor user --before 2026
 sessdb turns <session> --around-seq <seq> --context-turns 2
 sessdb lineage <session>
 sessdb refs <session>
+sessdb touched <path>
 git show <commit>:<path>
 ```
 
@@ -257,9 +261,36 @@ Acceptance criteria:
 - File refs are grouped/deduplicated but retain seq/event evidence.
 - JSON output is suitable for scripts.
 
-## Slice 5 — JSON and CLI consistency pass
+## Slice 5 — `touched <path>` primitive
 
-Once the above primitives exist, make the interface regular.
+After `refs <session>` gives conversation → artifacts, add the inverse primitive:
+artifact → conversations. Keep it structured: match only `events.refs.files`, not
+free-text path-looking mentions.
+
+Example:
+
+```bash
+sessdb touched docs/wip/pipeline-redesign.md
+sessdb touched pipeline-redesign.md --basename
+sessdb touched docs/wip/ --prefix --cwd example-project
+sessdb touched docs/wip/pipeline-redesign.md --json
+```
+
+Output should include source/cwd/session metadata, seq/event evidence, nearest user
+context, and copy-pastable `turns` / `refs` expansion commands. Default behavior can
+match a relative path against an absolute structured ref by path-boundary suffix;
+`--basename` and `--prefix` make broader matching explicit.
+
+Acceptance criteria:
+
+- A known file can lead back to sessions/turns that structurally referenced it.
+- Free-text path mentions do not become evidence unless the adapter put the path in
+  `events.refs.files`.
+- JSON output is suitable for scripts.
+
+## Slice 6 — JSON and CLI consistency pass
+
+Once the archaeology primitives exist, make the interface regular.
 
 Checklist:
 
@@ -284,7 +315,7 @@ shape of the tool unless the user explicitly reverses this product direction:
   underlying transcript/file/commit evidence
 
 These can be reconstructed by composing search filters, `turns`, `lineage`, `refs`,
-and git. That is the point.
+`touched`, and git. That is the point.
 
 Semantic/vector search is also suspect. If it is ever added, it should be a low-trust
 recall aid only: opt-in, evidence-preserving, and always returning concrete sessions,
@@ -301,8 +332,10 @@ observable CLI behavior primitive and evidence-first.
 2. Add turn-centered search expansion.
 3. Add `lineage <session>`.
 4. Add `refs <session>`.
-5. Consider `touched <path>` as the inverse artifact-to-session primitive.
+5. Add `touched <path>` as the inverse artifact-to-session primitive.
 6. Do a JSON/docs/cheatsheet consistency pass.
+7. Shift to polish, hardening, simplification, testing, and empirical analysis.
 
 Keep each slice small and reviewable. Prefer shipping a narrow primitive that works
-well over a broad command with hidden judgment.
+well over a broad command with hidden judgment. After `touched`, default to improving
+and measuring the existing loop rather than adding new commands.
