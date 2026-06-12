@@ -41,13 +41,15 @@ Good primitives:
 - provide JSON for scripts and future agents
 - compose naturally with `git`, `sqlite3`, `rg`, and existing `turns`
 
-Avoid for now:
+Do not build:
 
 - automatic canonical-decision extraction
 - `find-discussion` classifiers
 - LLM-generated memory as source of truth
 - regex classification of intent/subagents/decisions from prompt text
-- semantic/vector search until the basic loop is clearly insufficient
+- automatic discussion-heavy ranking/classifiers
+- automatic preference extraction
+- semantic/vector search as an oracle or replacement for evidence traversal
 
 A future agent should be able to reconstruct a sophisticated workflow by repeatedly
 calling simple commands.
@@ -246,19 +248,31 @@ Checklist:
 - filters use the same names across commands where possible
 - docs and `CHEATSHEET.txt` include the archaeology workflow
 
-## Deferred ideas
+## Explicit non-goals / probably-never features
 
-Do not implement these until repeated use proves the primitives are insufficient:
+The following should not be treated as deferred backlog. They are contrary to the
+shape of the tool unless the user explicitly reverses this product direction:
 
-- semantic/vector search
 - automatic decision summaries
 - `decision-pack`
 - discussion-heavy ranking/classifiers
-- canonical-intent or preference extraction
-- materialized turn tables unless live SQL becomes slow
+- canonical-intent extraction
+- automatic preference extraction
+- LLM-authored memory as source of truth
+- any command that claims to know the user's "real" decision without showing the
+  underlying transcript/file/commit evidence
 
 These can be reconstructed by composing search filters, `turns`, `lineage`, `refs`,
 and git. That is the point.
+
+Semantic/vector search is also suspect. If it is ever added, it should be a low-trust
+recall aid only: opt-in, evidence-preserving, and always returning concrete sessions,
+turns, and event ids to inspect. It must not become an intent oracle, ranker of
+canonical decisions, or replacement for exact search plus transcript traversal.
+
+Materialized turn tables are different: they are an implementation/cache detail, not
+a product feature. Add them only if live SQL becomes too slow or awkward, and keep the
+observable CLI behavior primitive and evidence-first.
 
 ## Recommended implementation order
 
