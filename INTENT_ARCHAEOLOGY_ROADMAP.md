@@ -14,7 +14,8 @@ archaeology loop smoother without turning `codebrain` into a magic memory oracle
   `--exclude-recent`, `--include-inherited`, `--include-subagents`, `--json`.
 - [x] Turn-centered search expansion: `search --around N` inlines nearby
   user-centered turns, with hidden/truncated tool context and structured JSON.
-- [ ] `lineage <session>` primitive.
+- [x] `lineage <session>` primitive: factual root/parent/current/children/siblings
+  from structured session parent links, with latest-user previews and JSON.
 - [ ] `refs <session>` primitive.
 - [ ] JSON/docs/cheatsheet consistency pass.
 

@@ -8,6 +8,7 @@
   sessdb turns <session>               user-centered turns with truncated agent context
   sessdb show <session> [--all]        a session's transcript (live by default)
   sessdb search <query> [--around N]   FTS over filtered event text
+  sessdb lineage <session>             factual parent/child session lineage
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
 
 Read commands refresh first: changed/new raw files are delta-ingested before the
@@ -629,6 +630,192 @@ def cmd_search(args):
     conn.close()
 
 
+def _latest_user_for_session(conn, sid: str):
+    rows = conn.execute(
+        """
+        SELECT ts, seq, event_id, text, inherited
+        FROM transcript
+        WHERE session_id=? AND live=1 AND actor='user' AND type='message'
+          AND COALESCE(text, '') <> ''
+        ORDER BY julianday(ts) DESC, seq DESC
+        LIMIT 20
+        """,
+        (sid,),
+    ).fetchall()
+    for r in rows:
+        if not _is_synthetic_user_text(r["text"]):
+            return dict(r)
+    return None
+
+
+def _tool_name_for_event_raw(conn, event_id: str | None):
+    if not event_id:
+        return None
+    row = conn.execute("SELECT raw FROM events WHERE event_id=?", (event_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        raw = json.loads(row["raw"] or "{}")
+    except json.JSONDecodeError:
+        return None
+    content = ((raw.get("message") or {}).get("content") or [])
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "toolCall":
+            continue
+        bid = block.get("id")
+        rid = raw.get("id")
+        ts = raw.get("timestamp")
+        expected = f"pi:{rid}:{ts}:{bid}" if rid and ts and bid else None
+        if expected == event_id or (bid and event_id.endswith(f":{bid}")):
+            return block.get("name")
+    return None
+
+
+def _lineage_summary(conn, sid: str):
+    row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
+    if row is None:
+        return {"session_id": sid, "missing": True}
+    out = dict(row)
+    out["missing"] = False
+    out["stored_relation"] = out.get("relation")
+    if out.get("relation") != "subagent" and _tool_name_for_event_raw(conn, out.get("branch_point_event_id")) == "subagent":
+        out["relation"] = "subagent"
+        out["spawn_event_id"] = out.get("spawn_event_id") or out.get("branch_point_event_id")
+    latest = _latest_user_for_session(conn, sid)
+    if latest:
+        latest["expand_command"] = f"sessdb turns {sid} --around-seq {latest['seq']}"
+    out["last_user"] = latest
+    out["expand_command"] = f"sessdb turns {sid}"
+    return out
+
+
+def _lineage_ancestors(conn, sid: str):
+    ids, seen, cur = [], set(), sid
+    while cur and cur not in seen and len(ids) < 100:
+        ids.append(cur)
+        seen.add(cur)
+        row = conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE session_id=?", (cur,)
+        ).fetchone()
+        if row is None or not row["parent_session_id"]:
+            break
+        cur = row["parent_session_id"]
+    return ids
+
+
+def _related_session_ids(conn, where_sql: str, params: list, limit: int):
+    total = conn.execute(f"SELECT COUNT(*) FROM sessions WHERE {where_sql}", params).fetchone()[0]
+    ids = [
+        r["session_id"] for r in conn.execute(
+            f"""
+            SELECT session_id
+            FROM sessions
+            WHERE {where_sql}
+            ORDER BY COALESCE(julianday(created_at), julianday(started_at), julianday(ended_at), 0),
+                     session_id
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    ]
+    return ids, total
+
+
+def _lineage_model(conn, sid: str, limit: int):
+    ancestor_ids = _lineage_ancestors(conn, sid)
+    root_id = ancestor_ids[-1] if ancestor_ids else sid
+    current = _lineage_summary(conn, sid)
+    parent_id = current.get("parent_session_id") if not current.get("missing") else None
+    children_ids, children_total = _related_session_ids(
+        conn, "parent_session_id=?", [sid], limit
+    )
+    if parent_id:
+        sibling_ids, siblings_total = _related_session_ids(
+            conn, "parent_session_id=? AND session_id != ?", [parent_id, sid], limit
+        )
+    else:
+        sibling_ids, siblings_total = [], 0
+    return {
+        "root": _lineage_summary(conn, root_id),
+        "parent": _lineage_summary(conn, parent_id) if parent_id else None,
+        "current": current,
+        "ancestors": [_lineage_summary(conn, x) for x in reversed(ancestor_ids)],
+        "children": [_lineage_summary(conn, x) for x in children_ids],
+        "children_total": children_total,
+        "siblings": [_lineage_summary(conn, x) for x in sibling_ids],
+        "siblings_total": siblings_total,
+    }
+
+
+def _print_lineage_summary(summary, *, indent="  "):
+    sid = summary["session_id"]
+    if summary.get("missing"):
+        print(f"{indent}{sid}  (not in db)")
+        return
+    created = summary.get("created_at")
+    started = summary.get("started_at")
+    ended = summary.get("ended_at")
+    bits = [sid, summary.get("source") or "?", _short_path(summary.get("cwd"))]
+    if summary.get("relation"):
+        bits.append(f"relation={summary['relation']}")
+    if created:
+        bits.append(f"created={created[:19]}")
+    elif started:
+        bits.append(f"started={started[:19]}")
+    elif ended:
+        bits.append(f"ended={ended[:19]}")
+    print(f"{indent}" + "  ".join(bits))
+    if summary.get("parent_session_id"):
+        print(f"{indent}parent: {summary['parent_session_id']}")
+    if summary.get("branch_point_event_id"):
+        print(f"{indent}branch_point: {summary['branch_point_event_id']}")
+    if summary.get("spawn_event_id"):
+        print(f"{indent}spawn: {summary['spawn_event_id']}")
+    latest = summary.get("last_user")
+    if latest:
+        print(_wrapped(f"{indent}last_user[{latest['seq']}]: ", latest["text"], 180))
+        print(f"{indent}expand: {latest['expand_command']}")
+    else:
+        print(f"{indent}expand: {summary['expand_command']}")
+
+
+def _print_lineage_section(name, items, total=None):
+    print(f"\n{name}:")
+    if items is None:
+        print("  <none>")
+        return
+    if isinstance(items, dict):
+        _print_lineage_summary(items)
+        return
+    if not items:
+        print("  <none>")
+        return
+    for item in items:
+        _print_lineage_summary(item)
+    if total is not None and total > len(items):
+        print(f"  ... showing {len(items)} of {total}; use --limit to show more")
+
+
+def cmd_lineage(args):
+    conn = _open(args)
+    sid = _resolve_session(conn, args.session)
+    if not sid:
+        print(f"no session matching {args.session!r}", file=sys.stderr)
+        sys.exit(1)
+    model = _lineage_model(conn, sid, args.limit)
+    if args.json:
+        print(json.dumps(model, indent=2))
+    else:
+        path = " -> ".join(x["session_id"] for x in model["ancestors"])
+        print(f"lineage: {path}")
+        _print_lineage_section("root", model["root"])
+        _print_lineage_section("parent", model["parent"])
+        _print_lineage_section("current", model["current"])
+        _print_lineage_section("children", model["children"], model["children_total"])
+        _print_lineage_section("siblings", model["siblings"], model["siblings_total"])
+    conn.close()
+
+
 def cmd_grep(args):
     rg = shutil.which("rg")
     default_roots = [str(DEFAULT_CLAUDE_ROOT), str(DEFAULT_CODEX_ROOT), str(DEFAULT_PI_ROOT)]
@@ -759,6 +946,14 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_search)
+
+    sp = sub.add_parser("lineage", help="factual parent/child session lineage")
+    sp.add_argument("session")
+    sp.add_argument("--limit", type=int, default=50,
+                    help="maximum children/siblings to show (default 50)")
+    sp.add_argument("--json", action="store_true", help="emit a JSON object")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_lineage)
 
     sp = sub.add_parser("grep", help="ripgrep over raw logs (all sources by default)")
     sp.add_argument("pattern")

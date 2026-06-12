@@ -78,6 +78,12 @@ python3 -m codebrain search "ExamplePriority" --exclude-recent 1h --json
 python3 -m codebrain search "ExamplePriority" --actor user --around 2
 # Search and inline nearby user-centered turns, with tools hidden by default.
 
+python3 -m codebrain lineage <session_id>
+# Show factual parent/root/children/sibling lineage for a session.
+
+python3 -m codebrain lineage <session_id> --json
+# Lineage as JSON for scripts/agents.
+
 python3 -m codebrain grep "some literal string"
 # Grep raw logs directly.
 
