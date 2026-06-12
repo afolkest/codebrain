@@ -59,6 +59,9 @@ class TestRefsCli(unittest.TestCase):
                    "files": ["docs/wip/pipeline-redesign.md"],
                    "commands": [],
                })
+        _event(self.conn, eid="pi:a3", seq=3, ts="2026-01-01T00:03:00Z",
+               text="unrelated file plus bogus abc1234g and numeric 1234567 tokens",
+               actor="assistant", refs={"files": ["unrelated.md"], "commands": []})
 
         out = self.run_cli("refs", "pi:S", "--no-refresh")
 
@@ -71,6 +74,10 @@ class TestRefsCli(unittest.TestCase):
         self.assertIn("git show 6ec541b", out)
         self.assertIn("git show 6ec541b:docs/wip/pipeline-redesign.md", out)
         self.assertIn("git show deadbeef", out)
+        self.assertNotIn("git show 6ec541b:unrelated.md", out)
+        self.assertNotIn("git show deadbeef:unrelated.md", out)
+        self.assertNotIn("git show abc1234", out)
+        self.assertNotIn("git show 1234567", out)
         self.assertIn("expand: sessdb turns pi:S --around-seq 1", out)
         self.assertIn("expand: sessdb turns pi:S --around-seq 2", out)
 
@@ -78,13 +85,42 @@ class TestRefsCli(unittest.TestCase):
         self.assertEqual(model["session"]["session_id"], "pi:S")
         self.assertEqual(model["scope"]["all"], False)
         self.assertEqual([x["value"] for x in model["files"]],
-                         ["docs/wip/pipeline-redesign.md"])
+                         ["docs/wip/pipeline-redesign.md", "unrelated.md"])
         self.assertEqual(model["files"][0]["events"][0]["seq"], 1)
         self.assertEqual([x["value"] for x in model["commands"]],
                          ["git show 6ec541b:docs/wip/pipeline-redesign.md"])
         self.assertEqual({x["value"] for x in model["commits"]}, {"6ec541b", "deadbeef"})
         self.assertEqual(model["commits"][0]["events"][0]["expand_command"],
                          "sessdb turns pi:S --around-seq 1")
+
+    def test_refs_ignores_malformed_unstructured_and_text_only_file_mentions(self):
+        _event(self.conn, eid="pi:bad", seq=0, ts="2026-01-01T00:00:00Z",
+               text="mentions docs/free-text.md and commit abc1234g but has bad refs",
+               actor="assistant", refs={"files": None, "commands": "git show feedabc"})
+        self.conn.execute("UPDATE events SET refs=? WHERE event_id=?", ("{not json", "pi:bad"))
+        _event(self.conn, eid="pi:null", seq=1, ts="2026-01-01T00:01:00Z",
+               text="another docs/only-text.md mention with numeric 1234567",
+               actor="assistant", refs={"files": "docs/not-a-list.md", "commands": None})
+
+        model = json.loads(self.run_cli("refs", "pi:S", "--no-refresh", "--json"))
+
+        self.assertEqual(model["files"], [])
+        self.assertEqual(model["commands"], [])
+        self.assertEqual(model["commits"], [])
+
+    def test_refs_defaults_to_live_events_and_all_includes_rolled_back_refs(self):
+        _event(self.conn, eid="pi:live", seq=0, ts="2026-01-01T00:00:00Z",
+               text="live ref", actor="assistant",
+               refs={"files": ["live.md"], "commands": []})
+        _event(self.conn, eid="pi:dead", seq=1, ts="2026-01-01T00:01:00Z",
+               text="dead ref", actor="assistant", live=0,
+               refs={"files": ["dead.md"], "commands": []})
+
+        model = json.loads(self.run_cli("refs", "pi:S", "--no-refresh", "--json"))
+        self.assertEqual([x["value"] for x in model["files"]], ["live.md"])
+
+        model = json.loads(self.run_cli("refs", "pi:S", "--no-refresh", "--json", "--all"))
+        self.assertEqual([x["value"] for x in model["files"]], ["dead.md", "live.md"])
 
     def test_refs_can_scope_to_turn_window(self):
         _event(self.conn, eid="pi:u0", seq=0, ts="2026-01-01T00:00:00Z",

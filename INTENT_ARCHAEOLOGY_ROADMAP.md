@@ -227,7 +227,6 @@ Output categories:
 - files from `events.refs.files`
 - commands from `events.refs.commands`
 - commit hashes mentioned in event text or structured command output
-- branches if present in structured commands/output
 - cwd/source/session metadata
 - event ids and seqs where each ref appeared
 

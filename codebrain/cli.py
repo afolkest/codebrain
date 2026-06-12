@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -631,7 +632,12 @@ def cmd_search(args):
     conn.close()
 
 
-COMMIT_RE = re.compile(r"(?<![0-9A-Fa-f])(?:[0-9a-f]{7,40})(?![0-9A-Fa-f])")
+COMMIT_RE = re.compile(r"(?<![0-9A-Za-z])([0-9A-Fa-f]{7,40})(?![0-9A-Za-z])")
+COMMIT_HAS_LETTER_RE = re.compile(r"[A-Fa-f]")
+
+
+def _refs_list(value):
+    return [x for x in value if isinstance(x, str) and x] if isinstance(value, list) else []
 
 
 def _refs_json(value):
@@ -639,12 +645,25 @@ def _refs_json(value):
         refs = json.loads(value or "{}") if isinstance(value, str) else (value or {})
     except json.JSONDecodeError:
         refs = {}
-    files = refs.get("files") if isinstance(refs, dict) else []
-    commands = refs.get("commands") if isinstance(refs, dict) else []
+    if not isinstance(refs, dict):
+        refs = {}
     return {
-        "files": [x for x in files if isinstance(x, str) and x],
-        "commands": [x for x in commands if isinstance(x, str) and x],
+        "files": _refs_list(refs.get("files")),
+        "commands": _refs_list(refs.get("commands")),
     }
+
+
+def _commit_tokens(text):
+    out = []
+    seen = set()
+    for token in COMMIT_RE.findall(text or ""):
+        if not COMMIT_HAS_LETTER_RE.search(token):
+            continue
+        token = token.lower()
+        if token not in seen:
+            out.append(token)
+            seen.add(token)
+    return out
 
 
 def _refs_evidence(r, sid: str):
@@ -696,9 +715,9 @@ def _refs_model(conn, sid: str, args):
             _refs_add(files, file, evidence)
         for command in refs["commands"]:
             _refs_add(commands, command, evidence)
-            for commit in COMMIT_RE.findall(command):
+            for commit in _commit_tokens(command):
                 _refs_add(commits, commit, evidence)
-        for commit in COMMIT_RE.findall(r["text"] or ""):
+        for commit in _commit_tokens(r["text"]):
             _refs_add(commits, commit, evidence)
     return {
         "session": dict(session) if session else {"session_id": sid},
@@ -709,13 +728,16 @@ def _refs_model(conn, sid: str, args):
     }
 
 
-def _git_show_file_hints(files):
+def _git_show_file_hints(files, commit_item):
+    commit_events = {e["event_id"] for e in commit_item.get("events", [])}
     hints = []
     for file in files or []:
         value = file["value"]
         if value.startswith(("/", "~")):
             continue
-        hints.append(value)
+        file_events = {e["event_id"] for e in file.get("events", [])}
+        if commit_events & file_events:
+            hints.append(value)
     return hints
 
 
@@ -728,9 +750,9 @@ def _print_refs_group(name, items, *, command_hints=False, git_files=None):
         value = item["value"]
         print(_wrapped("  - ", value, 220))
         if command_hints:
-            print(f"    git show {value}")
-            for file in _git_show_file_hints(git_files)[:3]:
-                print(f"    git show {value}:{file}")
+            print(f"    git show {shlex.quote(value)}")
+            for file in _git_show_file_hints(git_files, item)[:3]:
+                print(f"    git show {shlex.quote(f'{value}:{file}')}")
         for e in item["events"][:5]:
             print(f"    seq {e['seq']}  {e['actor']}/{e['type']}  {e['event_id']}")
             if e["preview"]:
