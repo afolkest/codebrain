@@ -80,6 +80,14 @@ class TestTouchedCli(unittest.TestCase):
         self.assertEqual(model["matches"][1]["refs_command"],
                          "sessdb refs pi:S --around-seq 1 --context-turns 0")
 
+        model = json.loads(self.run_cli(
+            "touched", "/repo/example-project/docs/wip/pipeline-redesign.md", "--no-refresh", "--json"
+        ))
+        self.assertEqual([m["file"] for m in model["matches"]], [
+            "/repo/example-project/docs/wip/pipeline-redesign.md",
+            "docs/wip/pipeline-redesign.md",
+        ])
+
         out = self.run_cli("touched", "docs/wip/pipeline-redesign.md", "--no-refresh")
         self.assertIn("path: docs/wip/pipeline-redesign.md  mode: path", out)
         self.assertIn("file: docs/wip/pipeline-redesign.md", out)
@@ -102,6 +110,10 @@ class TestTouchedCli(unittest.TestCase):
             "touched", "foo.md", "--basename", "--no-refresh", "--json"
         ))
         self.assertEqual({m["file"] for m in model["matches"]}, {"docs/wip/foo.md", "notes/foo.md"})
+
+        _event(self.conn, sid="pi:ARCH", cwd="/repo/example-project", eid="pi:arch", seq=0,
+               ts="2026-01-02T00:00:30Z", text="nested archive file",
+               refs={"files": ["archive/docs/wip/foo.md"], "commands": []})
 
         model = json.loads(self.run_cli(
             "touched", "docs/wip/", "--prefix", "--source", "pi", "--cwd", "example-project",

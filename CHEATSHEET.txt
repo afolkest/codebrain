@@ -94,7 +94,7 @@ python3 -m codebrain refs <session_id> --json
 # References as JSON for scripts/agents.
 
 python3 -m codebrain touched docs/wip/pipeline-redesign.md
-# Sessions/events with that structured file ref; relative paths also match absolute refs by suffix.
+# Sessions/events with that structured file ref; relative path queries also match absolute refs.
 
 python3 -m codebrain touched pipeline-redesign.md --basename
 # Match structured file refs by basename.

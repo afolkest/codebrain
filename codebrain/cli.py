@@ -824,13 +824,15 @@ def cmd_refs(args):
 
 def _path_norm(value):
     s = str(value or "").strip().replace("\\", "/")
+    if s == "~" or s.startswith("~/"):
+        s = str(Path.home()).replace("\\", "/") + s[1:]
     while s.startswith("./"):
         s = s[2:]
     return s
 
 
 def _path_is_absolute_or_home(value):
-    return value.startswith("/") or value == "~" or value.startswith("~/")
+    return _path_norm(value).startswith("/")
 
 
 def _path_basename(value):
@@ -838,36 +840,50 @@ def _path_basename(value):
     return value.rsplit("/", 1)[-1] if value else ""
 
 
-def _path_prefix_match(file_value, query):
+def _path_with_cwd(value, cwd):
+    v = _path_norm(value).strip("/")
+    if not v:
+        return ""
+    if _path_is_absolute_or_home(value):
+        return _path_norm(value).rstrip("/")
+    c = _path_norm(cwd).rstrip("/")
+    return f"{c}/{v}" if c else v
+
+
+def _path_prefix_match(file_value, query, cwd=None):
     f = _path_norm(file_value).rstrip("/")
     q = _path_norm(query).rstrip("/")
     if not f or not q:
         return False
     if f == q or f.startswith(q + "/"):
         return True
-    if not _path_is_absolute_or_home(q):
-        return f"/{q}/" in f"/{f}/"
+    if cwd:
+        af = _path_with_cwd(file_value, cwd)
+        aq = _path_with_cwd(query, cwd)
+        return af == aq or af.startswith(aq + "/")
     return False
 
 
-def _path_exact_or_suffix_match(file_value, query):
-    f = _path_norm(file_value)
-    q = _path_norm(query)
+def _path_exact_or_suffix_match(file_value, query, cwd=None):
+    f = _path_norm(file_value).rstrip("/")
+    q = _path_norm(query).rstrip("/")
     if not f or not q:
         return False
     if f == q:
         return True
-    if not _path_is_absolute_or_home(q) and "/" in q:
+    if cwd and _path_with_cwd(file_value, cwd) == _path_with_cwd(query, cwd):
+        return True
+    if not _path_is_absolute_or_home(query) and "/" in q:
         return f.endswith("/" + q)
     return False
 
 
-def _touched_file_matches(file_value, args):
+def _touched_file_matches(file_value, cwd, args):
     if args.basename:
         return _path_basename(file_value) == _path_basename(args.path)
     if args.prefix:
-        return _path_prefix_match(file_value, args.path)
-    return _path_exact_or_suffix_match(file_value, args.path)
+        return _path_prefix_match(file_value, args.path, cwd)
+    return _path_exact_or_suffix_match(file_value, args.path, cwd)
 
 
 def _touched_mode(args):
@@ -926,7 +942,7 @@ def _touched_row_json(conn, r, file_value, args):
 
 
 def _touched_candidates(conn, args):
-    where = ["COALESCE(t.refs, '') <> ''"]
+    where = ["json_valid(t.refs)", "COALESCE(json_array_length(t.refs, '$.files'), 0) > 0"]
     params: list = []
     if not args.all:
         where.append("t.live = 1")
@@ -982,7 +998,7 @@ def _touched_matches(conn, args):
     for r in _touched_candidates(conn, args):
         refs = _refs_json(r["refs"])
         for file_value in refs["files"]:
-            if not _touched_file_matches(file_value, args):
+            if not _touched_file_matches(file_value, r["cwd"], args):
                 continue
             out.append(_touched_row_json(conn, r, file_value, args))
             if limit and len(out) >= limit:
