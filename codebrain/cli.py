@@ -7,7 +7,7 @@
   sessdb userlog [--limit N]           recent user messages (intent-first)
   sessdb turns <session>               user-centered turns with truncated agent context
   sessdb show <session> [--all]        a session's transcript (live by default)
-  sessdb search <query> [--actor user] FTS over filtered event text
+  sessdb search <query> [--around N]   FTS over filtered event text
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
 
 Read commands refresh first: changed/new raw files are delta-ingested before the
@@ -447,6 +447,28 @@ def _turn_json(t, args):
     }
 
 
+def _print_turns(turns, args, indent=""):
+    for t in turns:
+        label = f"turn {t['turn_index']}  seq {t['seq_start']}..{t['seq_end']}"
+        print(f"\n{indent}{label}")
+        if t["user_seq"] is None:
+            print(f"{indent}user: <none>")
+        else:
+            suffix = _placement_suffix(t["user_live"], t["user_inherited"])
+            print(_wrapped(f"{indent}user[{t['user_seq']}]{suffix}: ", t["user_text"], args.user_chars))
+        hidden = 0
+        for e in t["events"]:
+            is_tool = e["type"] in ("tool_call", "tool_result") or e["actor"] == "tool"
+            if is_tool and not args.show_tools:
+                hidden += 1
+                continue
+            chars = args.tool_chars if is_tool else args.agent_chars
+            suffix = _placement_suffix(e["live"], e["inherited"])
+            print(_wrapped(f"{indent}{e['actor']}/{e['type']}[{e['seq']}]{suffix}: ", e["text"], chars))
+        if hidden:
+            print(f"{indent}tools: {hidden} hidden (--show-tools)")
+
+
 def cmd_turns(args):
     conn = _open(args)
     sid = _resolve_session(conn, args.session)
@@ -460,25 +482,7 @@ def cmd_turns(args):
         print()
     else:
         print(f"session: {sid}")
-        for t in turns:
-            label = f"turn {t['turn_index']}  seq {t['seq_start']}..{t['seq_end']}"
-            print(f"\n{label}")
-            if t["user_seq"] is None:
-                print("user: <none>")
-            else:
-                suffix = _placement_suffix(t["user_live"], t["user_inherited"])
-                print(_wrapped(f"user[{t['user_seq']}]{suffix}: ", t["user_text"], args.user_chars))
-            hidden = 0
-            for e in t["events"]:
-                is_tool = e["type"] in ("tool_call", "tool_result") or e["actor"] == "tool"
-                if is_tool and not args.show_tools:
-                    hidden += 1
-                    continue
-                chars = args.tool_chars if is_tool else args.agent_chars
-                suffix = _placement_suffix(e["live"], e["inherited"])
-                print(_wrapped(f"{e['actor']}/{e['type']}[{e['seq']}]{suffix}: ", e["text"], chars))
-            if hidden:
-                print(f"tools: {hidden} hidden (--show-tools)")
+        _print_turns(turns, args)
     conn.close()
 
 
@@ -584,6 +588,25 @@ def _search_row_json(r):
     }
 
 
+def _search_turn_context(conn, r, args):
+    window_args = argparse.Namespace(
+        around_seq=r["seq"], context_turns=args.around, limit=0,
+    )
+    return _turn_window(_build_turns(_turn_rows(conn, r["session_id"], False)), window_args)
+
+
+def _search_json(conn, rows, args):
+    if args.around is None:
+        return [_search_row_json(r) for r in rows]
+    return [
+        {
+            "match": _search_row_json(r),
+            "turns": [_turn_json(t, args) for t in _search_turn_context(conn, r, args)],
+        }
+        for r in rows
+    ]
+
+
 def cmd_search(args):
     conn = _open(args)
     if not has_fts5(conn):
@@ -591,7 +614,7 @@ def cmd_search(args):
         sys.exit(2)
     rows = _search_rows(conn, args)
     if args.json:
-        print(json.dumps([_search_row_json(r) for r in rows], indent=2))
+        print(json.dumps(_search_json(conn, rows, args), indent=2))
     else:
         for r in rows:
             print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
@@ -599,6 +622,9 @@ def cmd_search(args):
             print(f"seq: {r['seq']}  event: {r['event_id']}  {r['actor']}/{r['type']}")
             print(_wrapped("match: ", r["snip"], width=100))
             print(f"expand: sessdb turns {r['session_id']} --around-seq {r['seq']}")
+            if args.around is not None:
+                print("context:")
+                _print_turns(_search_turn_context(conn, r, args), args, indent="  ")
             print()
     conn.close()
 
@@ -706,6 +732,16 @@ def main(argv=None):
     sp = sub.add_parser("search", help="FTS over event text")
     sp.add_argument("query")
     sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--around", type=int,
+                    help="inline N user-centered turns before/after each hit")
+    sp.add_argument("--user-chars", type=int, default=500,
+                    help="user preview chars with --around; 0 means no cap (default 500)")
+    sp.add_argument("--agent-chars", type=int, default=300,
+                    help="assistant preview chars with --around; 0 means no cap (default 300)")
+    sp.add_argument("--tool-chars", type=int, default=80,
+                    help="tool preview chars with --around --show-tools; 0 means no cap (default 80)")
+    sp.add_argument("--show-tools", action="store_true",
+                    help="include tool calls/results in --around context")
     sp.add_argument("--actor", choices=("user", "assistant", "tool"), help="filter by event actor")
     sp.add_argument("--type", choices=("message", "tool_call", "tool_result"), help="filter by event type")
     sp.add_argument("--source", choices=SOURCES, help="filter by source")

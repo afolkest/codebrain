@@ -146,6 +146,48 @@ class TestSearchCli(unittest.TestCase):
         ))
         self.assertEqual([r["session_id"] for r in rows], ["pi:OLD"])
 
+    def test_search_around_inlines_turn_context(self):
+        _add(self.conn, sid="pi:S", eid="pi:u0", seq=0,
+             ts="2026-01-01T00:00:00Z", text="before turn")
+        _add(self.conn, sid="pi:S", eid="pi:a1", seq=1,
+             ts="2026-01-01T00:00:10Z", text="before assistant", actor="assistant")
+        _add(self.conn, sid="pi:S", eid="pi:u2", seq=2,
+             ts="2026-01-01T00:01:00Z", text="findme target turn")
+        _add(self.conn, sid="pi:S", eid="pi:a3", seq=3,
+             ts="2026-01-01T00:01:10Z", text="target assistant", actor="assistant")
+        _add(self.conn, sid="pi:S", eid="pi:t4", seq=4,
+             ts="2026-01-01T00:01:20Z", text="target tool result", actor="tool", typ="tool_result")
+        _add(self.conn, sid="pi:S", eid="pi:u5", seq=5,
+             ts="2026-01-01T00:02:00Z", text="after turn")
+
+        out = self.run_cli("search", "findme", "--no-refresh", "--actor", "user", "--around", "1")
+
+        self.assertIn("context:", out)
+        self.assertIn("user[0]: before turn", out)
+        self.assertIn("user[2]: findme target turn", out)
+        self.assertIn("assistant/message[3]: target assistant", out)
+        self.assertIn("tools: 1 hidden (--show-tools)", out)
+        self.assertIn("user[5]: after turn", out)
+        self.assertIn("expand: sessdb turns pi:S --around-seq 2", out)
+
+    def test_search_around_json_separates_match_and_turns(self):
+        _add(self.conn, sid="pi:S", eid="pi:u0", seq=0,
+             ts="2026-01-01T00:00:00Z", text="jsonbefore")
+        _add(self.conn, sid="pi:S", eid="pi:u1", seq=1,
+             ts="2026-01-01T00:01:00Z", text="jsonneedle target")
+        _add(self.conn, sid="pi:S", eid="pi:a2", seq=2,
+             ts="2026-01-01T00:01:10Z", text="json assistant", actor="assistant")
+
+        rows = json.loads(self.run_cli(
+            "search", "jsonneedle", "--no-refresh", "--json", "--around", "1"
+        ))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["match"]["session_id"], "pi:S")
+        self.assertEqual(rows[0]["match"]["seq"], 1)
+        self.assertEqual([t["user_seq"] for t in rows[0]["turns"]], [0, 1])
+        self.assertEqual(rows[0]["turns"][1]["events"][0]["preview"], "json assistant")
+
     def test_search_subagent_filter_uses_structured_signal_not_prompt_text(self):
         raw = _subagent_spawn_raw()
         spawn_eid = "pi:spawn111:2026-01-01T00:02:00Z:tc-sub"

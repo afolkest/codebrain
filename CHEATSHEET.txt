@@ -75,6 +75,9 @@ python3 -m codebrain search "ExamplePriority" --only-session <session_id>
 python3 -m codebrain search "ExamplePriority" --exclude-recent 1h --json
 # Scriptable search, excluding very recent self-referential results.
 
+python3 -m codebrain search "ExamplePriority" --actor user --around 2
+# Search and inline nearby user-centered turns, with tools hidden by default.
+
 python3 -m codebrain grep "some literal string"
 # Grep raw logs directly.
 

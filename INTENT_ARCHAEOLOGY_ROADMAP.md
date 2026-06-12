@@ -12,7 +12,8 @@ archaeology loop smoother without turning `codebrain` into a magic memory oracle
 - [x] Search filters/noise exclusion: `--actor`, `--type`, `--source`, `--cwd`,
   `--before`, `--after`, `--exclude-session`, `--only-session`,
   `--exclude-recent`, `--include-inherited`, `--include-subagents`, `--json`.
-- [ ] Turn-centered search expansion.
+- [x] Turn-centered search expansion: `search --around N` inlines nearby
+  user-centered turns, with hidden/truncated tool context and structured JSON.
 - [ ] `lineage <session>` primitive.
 - [ ] `refs <session>` primitive.
 - [ ] JSON/docs/cheatsheet consistency pass.
