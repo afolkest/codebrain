@@ -7,7 +7,7 @@
   sessdb userlog [--limit N]           recent user messages (intent-first)
   sessdb turns <session>               user-centered turns with truncated agent context
   sessdb show <session> [--all]        a session's transcript (live by default)
-  sessdb search <query> [--limit N]    FTS over event text
+  sessdb search <query> [--actor user] FTS over filtered event text
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
 
 Read commands refresh first: changed/new raw files are delta-ingested before the
@@ -494,26 +494,95 @@ def cmd_show(args):
     conn.close()
 
 
+def _search_rows(conn, args):
+    where = ["events_fts MATCH ?", "se.live = 1", "COALESCE(e.text, '') <> ''"]
+    params: list = [args.query]
+
+    if not getattr(args, "include_subagents", False):
+        where.append(_not_subagent_session_sql())
+    if not getattr(args, "include_inherited", False):
+        where.append("se.inherited = 0")
+    if getattr(args, "actor", None):
+        where.append("e.actor = ?")
+        params.append(args.actor)
+    if getattr(args, "type", None):
+        where.append("e.type = ?")
+        params.append(args.type)
+    if getattr(args, "source", None):
+        where.append("s.source = ?")
+        params.append(args.source)
+    if getattr(args, "cwd", None):
+        where.append("COALESCE(s.cwd, '') LIKE ?")
+        params.append(f"%{args.cwd}%")
+
+    after = _since_cutoff(getattr(args, "after", None))
+    if after:
+        where.append("e.ts >= ?")
+        params.append(after)
+    before = _since_cutoff(getattr(args, "before", None))
+    if before:
+        where.append("e.ts < ?")
+        params.append(before)
+    recent_cutoff = _since_cutoff(getattr(args, "exclude_recent", None))
+    if recent_cutoff:
+        where.append("e.ts < ?")
+        params.append(recent_cutoff)
+
+    if getattr(args, "only_session", None):
+        sid = _resolve_session(conn, args.only_session)
+        if sid:
+            where.append("se.session_id = ?")
+            params.append(sid)
+        else:
+            where.append("0")
+    for ident in getattr(args, "exclude_session", None) or []:
+        where.append("se.session_id != ?")
+        params.append(_resolve_session(conn, ident) or ident)
+
+    params.append(args.limit)
+    return conn.execute(
+        f"""
+        SELECT e.event_id, e.actor, e.type, e.text, se.session_id, se.seq,
+               se.inherited, e.ts, s.source, s.cwd, s.title,
+               snippet(events_fts, 0, '[', ']', '…', 12) AS snip
+        FROM events_fts
+        JOIN events e ON e.rowid = events_fts.rowid
+        JOIN session_events se ON se.event_id = e.event_id
+        JOIN sessions s ON s.session_id = se.session_id
+        WHERE {' AND '.join(where)}
+        ORDER BY rank, e.ts DESC, se.session_id DESC, se.seq DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+
+
+def _search_row_json(r):
+    return {
+        "ts": r["ts"], "source": r["source"], "session_id": r["session_id"],
+        "seq": r["seq"], "event_id": r["event_id"], "cwd": r["cwd"],
+        "title": r["title"], "actor": r["actor"], "type": r["type"],
+        "inherited": r["inherited"], "snippet": r["snip"], "text": r["text"],
+        "expand_command": f"sessdb turns {r['session_id']} --around-seq {r['seq']}",
+    }
+
+
 def cmd_search(args):
     conn = _open(args)
     if not has_fts5(conn):
         print("FTS5 unavailable in this sqlite build; use `sessdb grep` instead.", file=sys.stderr)
         sys.exit(2)
-    rows = conn.execute(
-        """
-        SELECT e.event_id, e.actor, e.type, se.session_id, se.seq, e.ts,
-               snippet(events_fts, 0, '[', ']', '…', 12) AS snip
-        FROM events_fts f
-        JOIN events e ON e.rowid = f.rowid
-        JOIN session_events se ON se.event_id = e.event_id AND se.live = 1
-        WHERE events_fts MATCH ?
-        ORDER BY rank
-        LIMIT ?
-        """,
-        (args.query, args.limit),
-    ).fetchall()
-    for r in rows:
-        print(f"{r['session_id']} [seq {r['seq']}] {r['actor']}/{r['type']}: {_oneline(r['snip'], 160)}")
+    rows = _search_rows(conn, args)
+    if args.json:
+        print(json.dumps([_search_row_json(r) for r in rows], indent=2))
+    else:
+        for r in rows:
+            print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
+            print(f"session: {r['session_id']}")
+            print(f"seq: {r['seq']}  event: {r['event_id']}  {r['actor']}/{r['type']}")
+            print(_wrapped("match: ", r["snip"], width=100))
+            print(f"expand: sessdb turns {r['session_id']} --around-seq {r['seq']}")
+            print()
     conn.close()
 
 
@@ -620,6 +689,21 @@ def main(argv=None):
     sp = sub.add_parser("search", help="FTS over event text")
     sp.add_argument("query")
     sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--actor", choices=("user", "assistant", "tool"), help="filter by event actor")
+    sp.add_argument("--type", choices=("message", "tool_call", "tool_result"), help="filter by event type")
+    sp.add_argument("--source", choices=SOURCES, help="filter by source")
+    sp.add_argument("--cwd", help="substring filter on session cwd")
+    sp.add_argument("--after", help="event timestamp lower bound, or relative duration like 7d/12h")
+    sp.add_argument("--before", help="event timestamp upper bound, or relative duration like 7d/12h")
+    sp.add_argument("--exclude-session", action="append", default=[],
+                    help="exclude a session id/prefix; repeatable")
+    sp.add_argument("--only-session", help="only search one session id/prefix")
+    sp.add_argument("--exclude-recent", help="exclude events newer than a relative duration like 1h")
+    sp.add_argument("--include-inherited", action="store_true",
+                    help="include pi resume/branch copies (default: authored events only)")
+    sp.add_argument("--include-subagents", action="store_true",
+                    help="include sessions spawned by subagent tool calls")
+    sp.add_argument("--json", action="store_true", help="emit a JSON array")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_search)
 

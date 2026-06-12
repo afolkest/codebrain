@@ -61,7 +61,19 @@ python3 -m codebrain show <session_id> --all
 # Raw transcript including rolled-back events.
 
 python3 -m codebrain search "sqlite refresh"
-# FTS search over all event text.
+# FTS search over live, authored event text.
+
+python3 -m codebrain search "ExamplePriority" --actor user --before 2026-06-11
+# Search user messages before a date; useful for decision archaeology without current-session echoes.
+
+python3 -m codebrain search "ExamplePriority" --exclude-session <session_id>
+# Explicitly remove a noisy/current session from results.
+
+python3 -m codebrain search "ExamplePriority" --only-session <session_id>
+# Deliberately search one long/current session, e.g. pre-compact recovery.
+
+python3 -m codebrain search "ExamplePriority" --exclude-recent 1h --json
+# Scriptable search, excluding very recent self-referential results.
 
 python3 -m codebrain grep "some literal string"
 # Grep raw logs directly.

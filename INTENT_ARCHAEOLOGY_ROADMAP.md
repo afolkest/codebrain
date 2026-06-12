@@ -7,6 +7,16 @@ It complements `AGENT_RETRIEVAL_PLAN.md`: the first browsing primitives
 (`recent`, `userlog`, `turns`) now exist. The next work should make the successful
 archaeology loop smoother without turning `codebrain` into a magic memory oracle.
 
+## Progress
+
+- [x] Search filters/noise exclusion: `--actor`, `--type`, `--source`, `--cwd`,
+  `--before`, `--after`, `--exclude-session`, `--only-session`,
+  `--exclude-recent`, `--include-inherited`, `--include-subagents`, `--json`.
+- [ ] Turn-centered search expansion.
+- [ ] `lineage <session>` primitive.
+- [ ] `refs <session>` primitive.
+- [ ] JSON/docs/cheatsheet consistency pass.
+
 ## Core lesson
 
 `codebrain` is valuable when the question is:
@@ -84,15 +94,18 @@ sessdb search "query" --cwd example-project
 sessdb search "query" --before 2026-06-11
 sessdb search "query" --after 2026-06-01
 sessdb search "query" --exclude-session <session_id>
+sessdb search "query" --only-session <session_id>
 sessdb search "query" --exclude-recent 1h
 sessdb search "query" --include-inherited
 sessdb search "query" --include-subagents
 sessdb search "query" --json
 ```
 
-Default behavior should remain understandable, but archaeology usually wants to
-remove current/live noise. `--before`, `--exclude-session`, and `--exclude-recent`
-are the highest-value filters from the real use case.
+Default behavior should remain understandable and should include all sessions,
+including the active/current one. Do **not** guess or silently exclude the current
+session: long sessions and pre-compact recovery often need self-search. Make this an
+explicit filter instead. `--before`, `--exclude-session`, `--only-session`, and
+`--exclude-recent` are the highest-value filters from the real use case.
 
 Implementation notes:
 
@@ -107,7 +120,9 @@ Implementation notes:
 
 Acceptance criteria:
 
+- Searching a phrase includes current/active sessions by default.
 - Searching a phrase with `--exclude-session` removes hits from that session.
+- Searching with `--only-session` supports deliberate self-search/pre-compact recovery.
 - Searching with `--before` excludes later/current self-referential hits.
 - Searching with `--actor user` can isolate user confirmations/preferences.
 - `--json` output is stable and scriptable.

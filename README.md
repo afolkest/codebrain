@@ -21,7 +21,7 @@ sessdb recent               # sessions by latest live user message
 sessdb userlog              # recent live user messages (intent-first)
 sessdb turns <session>      # user-centered turns with truncated agent context
 sessdb show <session>       # a session's live transcript (--all includes rolled-back)
-sessdb search <query>       # FTS5 over event text (ranked, cross-source)
+sessdb search <query>       # FTS5 over event text; supports actor/time/session filters
 sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
 sessdb schema               # print the DDL
 ```
@@ -89,7 +89,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 53 tests, a second or two
+python3 -m unittest discover        # 56 tests, a second or two
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a
