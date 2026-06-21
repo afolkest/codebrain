@@ -115,6 +115,27 @@ class TestClaudeLinear(unittest.TestCase):
         self.assertEqual(ids, ["claude:u1", "claude:a1"])  # no side1, no duplicate u1
         self.assertTrue(all("side1" not in e.event_id for e in parsed.events))
 
+    def test_future_bridged_parent_falls_back_to_prior_emitted_event(self):
+        """Compaction/local-command records can make raw parent bridges point
+        forward in file order. The normalized transcript predecessor must remain
+        an earlier emitted event, otherwise placement parent chains can cycle."""
+        records = [
+            _user("u0", None, "before compact", "2026-01-01T00:00:01Z"),
+            # Dropped record: it participates in the raw parentUuid topology but
+            # emits no canonical event. Its parent points to a future user record.
+            {"type": "attachment", "uuid": "bridge", "parentUuid": "stdout",
+             "sessionId": "S1", "cwd": "/work", "timestamp": "2026-01-01T00:00:02Z",
+             "attachment": {"type": "date_change", "newDate": "2026-01-01"}},
+            _user("real", "bridge", "real prompt", "2026-01-01T00:00:03Z"),
+            _user("stdout", "real", "<local-command-stdout>done</local-command-stdout>",
+                  "2026-01-01T00:00:04Z"),
+        ]
+        parsed = self.parse(records)
+        assert_session_invariants(self, parsed, "claude")
+        parents = {p.event_id: p.parent_event_id for p in parsed.placements}
+        self.assertEqual(parents["claude:real"], "claude:u0")
+        self.assertEqual(parents["claude:stdout"], "claude:real")
+
 
 if __name__ == "__main__":
     unittest.main()

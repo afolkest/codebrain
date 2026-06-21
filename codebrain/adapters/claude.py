@@ -194,6 +194,20 @@ def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSess
         prev_in_order[e.event_id] = order[i - 1].event_id if i > 0 else None
 
     parent_of: dict[str, Optional[str]] = {}
+
+    def earlier(parent_eid: Optional[str], child_eid: str) -> Optional[str]:
+        """A normalized transcript predecessor must come before its child.
+
+        Some compact/local-command sequences can bridge through source parents
+        that appear later in the append log, creating a raw cycle. Falling back
+        to the prior emitted record keeps placement order acyclic while leaving
+        the original source topology in raw for forensics.
+        """
+        if parent_eid is None:
+            return None
+        pm, cm = meta[parent_eid], meta[child_eid]
+        return parent_eid if (pm["line"], pm["idx"]) < (cm["line"], cm["idx"]) else None
+
     for e in events:
         m = meta[e.event_id]
         if m["idx"] > 0:
@@ -201,7 +215,10 @@ def parse_file(path: Path, machine: Optional[str] = None) -> Optional[ParsedSess
             parent_of[e.event_id] = siblings[siblings.index(e.event_id) - 1]
         else:
             bp = bridged_parent(m["uuid"])
-            parent_of[e.event_id] = bp if bp is not None else prev_in_order[e.event_id]
+            parent_of[e.event_id] = (
+                earlier(bp, e.event_id)
+                or earlier(prev_in_order[e.event_id], e.event_id)
+            )
 
     # ---- tip = childless emitted event, max (ts, line, idx) ----
     has_child = set(p for p in parent_of.values() if p)

@@ -162,11 +162,11 @@ class TestAllowlists(CollectBase):
         (self.home / "settings.json").write_text("{}", encoding="utf-8")           # excluded
         (self.home / ".credentials.json").write_text("SECRET", encoding="utf-8")   # excluded
         stats = self.sweep(source="claude")
-        self.assertEqual((stats["files"], stats["new"]), (11, 11))
+        self.assertEqual((stats["files"], stats["new"]), (10, 10))
         names = self.pool_names()
-        for kept in ("agent-x.meta.json", "r1.txt", "sm.md", "1.json", "snap0", "m.json"):
+        for kept in ("agent-x.meta.json", "r1.txt", "sm.md", "1.json", "m.json"):
             self.assertIn(kept, names)
-        for excluded in ("env.json", "settings.json", ".credentials.json"):
+        for excluded in ("snap0", "env.json", "settings.json", ".credentials.json"):
             self.assertNotIn(excluded, names)
 
     def test_codex_patterns(self):

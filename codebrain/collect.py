@@ -57,7 +57,6 @@ PATTERNS = {
         "tasks/**/*",                     # per-session task state
         "todos/**/*",                     # per-session todo state (older versions)
         "teams/**/*",                     # agent-team inboxes
-        "file-history/**/*",              # pre-edit file snapshots, session-keyed
         "history.jsonl",                  # prompt history
     ),
     "codex": (

@@ -16,6 +16,7 @@ pip install -e .            # or run as: python3 -m codebrain <cmd>
 
 sessdb ingest               # first build from ~/.claude + ~/.codex + ~/.pi (read-only)
 sessdb collect              # mirror raw logs → ~/codebrain-pool (append-only archive)
+sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
 sessdb list                 # recent sessions (any source)
 sessdb recent               # sessions by latest live user message
 sessdb userlog              # recent live user messages (intent-first)
@@ -41,11 +42,24 @@ take sessions with it: allowlisted files only (credentials stay home), increment
 stat-compare sweeps (ms when idle), shrink-guarded, never deletes. Session-data
 dirs are taken whole, so it also captures what ingest doesn't parse yet — subagent
 transcripts + metadata, tool-result sidecars, session indexes, project memory,
-task state, pre-edit file history. `sessdb collect --install-launchd` makes it a
+task state. `sessdb collect --install-launchd` makes it a
 periodic LaunchAgent (default every 30 min). Cross-machine sync later = point
 Syncthing at the pool; per-machine subtrees can't conflict, and ingesting a synced
 subtree keeps sessions labeled with their **origin** machine (from the
 `raw/<machine>/` path, per SCHEMA.md).
+
+**Old Claude backups are backfilled, not restored into live `~/.claude`.**
+`sessdb backfill-claude <zip-or-dir>` scans historical Claude `.zip` snapshots
+read-only, selects one best main transcript per structured Claude `sessionId`,
+retargets old top-level `agent-*.jsonl` sidechain files into the modern
+`<session>/subagents/` sidecar layout, skips `file-history/`, and writes a
+manifest into `~/codebrain-pool/raw/claude-backfill/claude/`. Then ingest that
+pool-shaped root:
+
+```bash
+sessdb backfill-claude ~/claude-restore
+sessdb ingest --source claude --raw-root ~/codebrain-pool/raw/claude-backfill/claude
+```
 
 The DB is a **rebuildable cache** (DESIGN.md golden rule): delete `~/.codebrain/codebrain.db`
 and re-ingest anytime. It is never synced. Point any sqlite3 client at it for
@@ -91,7 +105,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 66 tests, a second or two
+python3 -m unittest discover        # 78 tests, a second or two
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a

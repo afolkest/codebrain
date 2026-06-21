@@ -2,6 +2,7 @@
 
   sessdb ingest [--source all]         full build/rebuild of the local DB
   sessdb collect [--install-launchd]   mirror raw logs into the append-only pool
+  sessdb backfill-claude <path>        import historical Claude backups into pool
   sessdb list [--limit N]              recent sessions
   sessdb recent [--limit N]            sessions by latest user activity
   sessdb userlog [--limit N]           recent user messages (intent-first)
@@ -31,10 +32,12 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from codebrain.backfill_claude import DEFAULT_ORIGIN, backfill as backfill_claude
 from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
 from codebrain.db import DEFAULT_DB, connect, has_fts5
 from codebrain.ingest import (
-    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES, ingest_all, refresh,
+    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES,
+    ingest_all, ingest_source, refresh,
 )
 
 
@@ -127,10 +130,19 @@ def _timestamp_where(column: str, op: str) -> str:
 
 
 def cmd_ingest(args):
-    conn = connect(args.db)
     sources = SOURCES if args.source == "all" else (args.source,)
+    if args.raw_root:
+        if args.source == "all":
+            print("--raw-root requires --source claude|codex|pi", file=sys.stderr)
+            sys.exit(2)
+    conn = connect(args.db)
     print(f"ingesting [{', '.join(sources)}] → {args.db}")
-    total = ingest_all(conn, sources=sources, machine=args.machine)
+    if args.raw_root:
+        total = ingest_source(conn, args.source, raw_root=Path(args.raw_root),
+                              machine=args.machine)
+        conn.commit()
+    else:
+        total = ingest_all(conn, sources=sources, machine=args.machine)
     conn.close()
     print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
 
@@ -148,6 +160,27 @@ def cmd_collect(args):
     print(f"collecting [{', '.join(sources)}] → {args.pool}")
     total = collect_all(sources=sources, machine=args.machine, pool_root=Path(args.pool))
     print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
+
+
+def cmd_backfill_claude(args):
+    manifest = backfill_claude(
+        [Path(p) for p in args.paths],
+        pool_root=Path(args.pool),
+        origin=args.origin,
+        dry_run=args.dry_run,
+        manifest_path=Path(args.manifest) if args.manifest else None,
+    )
+    if args.json:
+        print(json.dumps(manifest, indent=2))
+        return
+    stats = manifest["stats"]
+    print(f"backfilled Claude backups → {manifest['dest_root']}")
+    print("done: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    if manifest.get("manifest_path"):
+        print(f"manifest: {manifest['manifest_path']}")
+    if not args.dry_run:
+        print("ingest restored sessions with:")
+        print(f"  sessdb ingest --source claude --raw-root {shlex.quote(manifest['dest_root'])}")
 
 
 def cmd_list(args):
@@ -977,9 +1010,19 @@ def cmd_grep(args):
     rg = shutil.which("rg")
     default_roots = [str(DEFAULT_CLAUDE_ROOT), str(DEFAULT_CODEX_ROOT), str(DEFAULT_PI_ROOT)]
     paths = args.paths or [p for p in default_roots if Path(p).exists()]
+    cmd = _grep_command(args.pattern, paths, rg)
+    if cmd is None:
+        sys.exit(1)
+    sys.exit(subprocess.call(cmd))
+
+
+def _grep_command(pattern: str, paths: list[str], rg: str | None):
+    paths = [p for p in paths if "file-history" not in Path(p).parts]
+    if not paths:
+        return None
     if rg:
-        sys.exit(subprocess.call([rg, args.pattern, *paths]))
-    sys.exit(subprocess.call(["grep", "-rn", args.pattern, *paths]))
+        return [rg, "--glob", "!**/file-history/**", "--", pattern, *paths]
+    return ["grep", "-rn", "--exclude-dir=file-history", "--", pattern, *paths]
 
 
 def cmd_schema(args):
@@ -997,6 +1040,8 @@ def main(argv=None):
     sp.add_argument("--source", choices=("all",) + SOURCES, default="all",
                     help="which source(s) to ingest (default all)")
     sp.add_argument("--machine", default=None, help="override hostname tag")
+    sp.add_argument("--raw-root",
+                    help="override one source root; requires --source claude|codex|pi")
     sp.set_defaults(func=cmd_ingest)
 
     sp = sub.add_parser("collect", help="mirror raw logs into the append-only pool")
@@ -1009,6 +1054,19 @@ def main(argv=None):
     sp.add_argument("--interval", type=int, default=1800,
                     help="LaunchAgent sweep period in seconds (default 1800)")
     sp.set_defaults(func=cmd_collect)
+
+    sp = sub.add_parser("backfill-claude",
+                        help="one-shot import of historical Claude backup zips into the pool")
+    sp.add_argument("paths", nargs="+",
+                    help="zip file(s), or directories containing .zip backups")
+    sp.add_argument("--pool", default=str(DEFAULT_POOL), help=f"pool root (default {DEFAULT_POOL})")
+    sp.add_argument("--origin", default=DEFAULT_ORIGIN,
+                    help=f"pool raw/<origin>/claude subtree (default {DEFAULT_ORIGIN})")
+    sp.add_argument("--manifest", help="write manifest to this path instead of the pool subtree")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="scan and select, but do not write pool files or manifest")
+    sp.add_argument("--json", action="store_true", help="emit the manifest JSON to stdout")
+    sp.set_defaults(func=cmd_backfill_claude)
 
     sp = sub.add_parser("list", help="recent sessions")
     sp.add_argument("--limit", type=int, default=30)

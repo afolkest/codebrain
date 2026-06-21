@@ -10,7 +10,7 @@ Reverse-engineered from real logs on this machine (`~/.claude`, Claude Code `ver
   - `<encoded-cwd>` = the cwd with `/` → `-`. **Lossy** (a real `-` in a path is indistinguishable from a separator). Don't decode it — read the `cwd` field inside records instead.
 - Other relevant top-level dirs/files (later sources, not transcripts):
   - `~/.claude/history.jsonl` — global prompt history.
-  - `~/.claude/file-history/` — actual file backups behind the checkpoint/undo system.
+  - `~/.claude/file-history/` — actual file backups behind the checkpoint/undo system; codebrain does not collect these file bodies.
   - `~/.claude/sessions/`, `tasks/`, `plans/`, `todos`-like state.
 
 ### Record types seen across the whole corpus (160 files)
@@ -104,7 +104,7 @@ The only real duplication is **sub-agent records, which appear twice**: inline i
 - Primary: on `user`/tool_result records, `toolUseResult` for edit tools carries `filePath`, `structuredPatch` (the diff), `originalFile`, `userModified`. Confirmed: captured the `DESIGN.md` Write this session.
 - Edit tool names to scan: `Write`, `Edit`, `MultiEdit`, `NotebookEdit` (`tool_use.name`).
 - **Limitation:** files changed via `Bash` (e.g. `git`, `sed`, redirects) are **invisible** here — no structured record. Heuristic Bash-command parsing would be unreliable; flag as a known gap.
-- Secondary/corroborating: `file-history-snapshot.trackedFileBackups` + `~/.claude/file-history/`.
+- Secondary/corroborating: `file-history-snapshot.trackedFileBackups`. The actual backup bodies under `~/.claude/file-history/` are intentionally not collected.
 
 ## Mapping → canonical envelope
 
