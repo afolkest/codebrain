@@ -185,6 +185,48 @@ def _candidate_from_member(zf: zipfile.ZipFile, archive: Path,
     )
 
 
+def _session_id_from_jsonl(path: Path) -> Optional[str]:
+    first_session_id = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                sid = rec.get("sessionId")
+                if isinstance(sid, str) and sid:
+                    first_session_id = sid
+                    break
+    except OSError:
+        return None
+    return first_session_id or path.stem
+
+
+def _existing_session_ids(raw_root: Optional[Path]) -> tuple[set[str], dict]:
+    stats = {"existing_root_files": 0, "existing_root_sessions": 0, "existing_root_errors": 0}
+    if raw_root is None:
+        return set(), stats
+    projects = Path(raw_root).expanduser() / "projects"
+    if not projects.is_dir():
+        return set(), stats
+    out = set()
+    for path in sorted(projects.glob("*/*.jsonl")):
+        stats["existing_root_files"] += 1
+        sid = _session_id_from_jsonl(path)
+        if sid is None:
+            stats["existing_root_errors"] += 1
+            continue
+        out.add(sid)
+    stats["existing_root_sessions"] = len(out)
+    return out, stats
+
+
 def _is_legacy_top_level_subagent(c: Candidate) -> bool:
     """Old Claude exports can put subagent files at projects/<project>/*.jsonl.
 
@@ -518,7 +560,8 @@ def _prune_unplanned(dest_root: Path, planned_rels: set[str],
 
 def backfill(inputs, pool_root: Path = DEFAULT_POOL, origin: str = DEFAULT_ORIGIN,
              dry_run: bool = False,
-             manifest_path: Optional[Path] = None) -> dict:
+             manifest_path: Optional[Path] = None,
+             existing_root: Optional[Path] = None) -> dict:
     """Import historical Claude backup zips into a Claude-shaped raw pool subtree.
 
     The selection policy groups main transcripts by the structured Claude
@@ -532,6 +575,10 @@ def backfill(inputs, pool_root: Path = DEFAULT_POOL, origin: str = DEFAULT_ORIGI
     input_paths = [Path(p) for p in (inputs if isinstance(inputs, (list, tuple)) else [inputs])]
     archives = _discover_archives(input_paths)
     by_session, legacy_subagents, project_sidecars, scan_stats = _scan_archives(archives)
+    existing_session_ids, existing_stats = _existing_session_ids(existing_root)
+    skipped_existing_sessions = sorted(set(by_session) & existing_session_ids)
+    for session_id in skipped_existing_sessions:
+        del by_session[session_id]
 
     dest_root = Path(pool_root).expanduser() / "raw" / origin / "claude"
     sessions = []
@@ -604,6 +651,8 @@ def backfill(inputs, pool_root: Path = DEFAULT_POOL, origin: str = DEFAULT_ORIGI
 
     stats = {
         **scan_stats,
+        **existing_stats,
+        "skipped_existing_sessions": len(skipped_existing_sessions),
         "selected_sessions": len(selected),
         "duplicate_sessions": sum(1 for candidates in by_session.values() if len(candidates) > 1),
         "exact_duplicate_sessions": sum(
@@ -633,10 +682,12 @@ def backfill(inputs, pool_root: Path = DEFAULT_POOL, origin: str = DEFAULT_ORIGI
         "origin": origin,
         "dest_root": str(dest_root),
         "run_id": run_id,
+        "existing_root": str(Path(existing_root).expanduser()) if existing_root is not None else None,
         "dry_run": dry_run,
         "stats": stats,
         "planned_paths": sorted(canonical_rels),
         "collision_paths": sorted(p.member.rel for p in collision_plans),
+        "skipped_existing_session_ids": skipped_existing_sessions,
         "sessions": sessions,
     }
 

@@ -169,6 +169,7 @@ def cmd_backfill_claude(args):
         origin=args.origin,
         dry_run=args.dry_run,
         manifest_path=Path(args.manifest) if args.manifest else None,
+        existing_root=DEFAULT_CLAUDE_ROOT,
     )
     if args.json:
         print(json.dumps(manifest, indent=2))

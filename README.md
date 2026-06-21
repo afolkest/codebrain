@@ -51,6 +51,7 @@ subtree keeps sessions labeled with their **origin** machine (from the
 **Old Claude backups are backfilled, not restored into live `~/.claude`.**
 `sessdb backfill-claude <zip-or-dir>` scans historical Claude `.zip` snapshots
 read-only, selects one best main transcript per structured Claude `sessionId`,
+skips sessions already present in live `~/.claude`,
 retargets old top-level `agent-*.jsonl` sidechain files into the modern
 `<session>/subagents/` sidecar layout, skips `file-history/`, and writes a
 manifest into `~/codebrain-pool/raw/claude-backfill/claude/`. Then ingest that

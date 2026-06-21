@@ -132,6 +132,32 @@ class TestClaudeBackfill(unittest.TestCase):
         self.assertTrue((dest / "projects" / "-new" / "filename-b.jsonl").is_file())
         self.assertFalse((dest / "projects" / "-old" / "filename-a.jsonl").exists())
 
+    def test_existing_live_session_is_skipped_by_structured_session_id(self):
+        live = self.root / "live-claude"
+        live_main = live / "projects" / "-live" / "unrelated-filename.jsonl"
+        live_main.parent.mkdir(parents=True)
+        live_main.write_text(_jsonl([
+            _user("u-live", "REAL", "live already exists", "2026-01-02T00:01:00.000Z"),
+        ]), encoding="utf-8")
+
+        base = "Macintosh HD/Users/example/.claude"
+        _zip(self.restore / "backup.zip", {
+            f"{base}/projects/-old/backup-name.jsonl": _jsonl([
+                _user("u1", "REAL", "old backup", "2026-01-01T00:01:00.000Z"),
+            ]),
+            f"{base}/projects/-old/backup-name/tool-results/r1.txt": "backup sidecar",
+        })
+
+        manifest = backfill([self.restore], pool_root=self.pool, origin="restore", existing_root=live)
+
+        self.assertEqual(manifest["stats"]["existing_root_sessions"], 1)
+        self.assertEqual(manifest["stats"]["skipped_existing_sessions"], 1)
+        self.assertEqual(manifest["stats"]["selected_sessions"], 0)
+        self.assertEqual(manifest["skipped_existing_session_ids"], ["REAL"])
+        dest = self.pool / "raw" / "restore" / "claude"
+        self.assertFalse((dest / "projects" / "-old" / "backup-name.jsonl").exists())
+        self.assertFalse((dest / "projects" / "-old" / "backup-name").exists())
+
     def test_legacy_top_level_agent_jsonl_is_retargeted_as_subagent_sidecar(self):
         base = "Macintosh HD/Users/example/.claude"
         _zip(self.restore / "one.zip", {
