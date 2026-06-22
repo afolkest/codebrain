@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codebrain import collect, ingest
 from tests._helpers import memory_db, write_jsonl
@@ -73,6 +74,21 @@ class TestSweep(CollectBase):
         self.sweep()
         stats = self.sweep()
         self.assertEqual((stats["new"], stats["updated"], stats["unchanged"]), (0, 0, 2))
+
+    def test_collect_machine_env_alias(self):
+        self.pi_home()
+        with mock.patch.dict(os.environ, {"CODEBRAIN_MACHINE": "alias"}, clear=False):
+            collect.collect_source("pi", raw_root=self.home, pool_root=self.pool)
+        self.assertTrue((self.pool / "raw" / "alias" / "pi").is_dir())
+
+    def test_collect_rejects_path_machine_names(self):
+        self.pi_home()
+        with self.assertRaises(ValueError):
+            collect.collect_source("pi", raw_root=self.home, pool_root=self.pool,
+                                   machine="../bad")
+        with mock.patch.dict(os.environ, {"CODEBRAIN_MACHINE": "bad/name"}, clear=False):
+            with self.assertRaises(ValueError):
+                collect.collect_source("pi", raw_root=self.home, pool_root=self.pool)
 
     def test_grown_file_recopied(self):
         f = self.pi_home()
@@ -218,19 +234,32 @@ class TestPoolAsIngestRoot(CollectBase):
 
 class TestMachineForRoot(unittest.TestCase):
     def test_derivation_precedence(self):
-        pool_pi = Path("/x/codebrain-pool/raw/mini/pi")
-        self.assertEqual(ingest._machine_for_root("pi", pool_pi, None), "mini")
-        self.assertEqual(ingest._machine_for_root("pi", pool_pi, "forced"), "forced")
-        # a live tool home (or any non-pool-shaped root) is this machine
-        self.assertEqual(ingest._machine_for_root("pi", Path("/home/u/.pi"), None),
-                         socket.gethostname())
-        self.assertEqual(ingest._machine_for_root("pi", None, None), socket.gethostname())
-        # the trailing component must name the SAME source for path derivation
-        self.assertEqual(ingest._machine_for_root("claude", pool_pi, None),
-                         socket.gethostname())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            pool_pi = Path("/x/codebrain-pool/raw/mini/pi")
+            self.assertEqual(ingest._machine_for_root("pi", pool_pi, None), "mini")
+            self.assertEqual(ingest._machine_for_root("pi", pool_pi, "forced"), "forced")
+            # a live tool home (or any non-pool-shaped root) is this machine
+            self.assertEqual(ingest._machine_for_root("pi", Path("/home/u/.pi"), None),
+                             socket.gethostname())
+            self.assertEqual(ingest._machine_for_root("pi", None, None), socket.gethostname())
+            # the trailing component must name the SAME source for path derivation
+            self.assertEqual(ingest._machine_for_root("claude", pool_pi, None),
+                             socket.gethostname())
+
+    def test_live_home_uses_machine_env_alias(self):
+        with mock.patch.dict(os.environ, {"CODEBRAIN_MACHINE": "alias"}, clear=True):
+            self.assertEqual(ingest._machine_for_root("pi", Path("/home/u/.pi"), None),
+                             "alias")
 
 
 class TestLaunchdPlist(unittest.TestCase):
+    def test_plist_rejects_path_machine_names(self):
+        with self.assertRaises(ValueError):
+            collect._plist_dict(machine="bad/name")
+        with mock.patch.dict(os.environ, {"CODEBRAIN_MACHINE": "../bad"}, clear=False):
+            with self.assertRaises(ValueError):
+                collect._plist_dict()
+
     def test_plist_round_trips_weird_paths_and_flags(self):
         """plistlib must escape what an f-string template would not — a pool path
         with '&' or '<' previously produced unparseable XML and a hard

@@ -1,5 +1,8 @@
 # Pool Sync Refresh Plan
 
+Status: implemented as the cross-machine pool refresh slice; retained as design
+record and future hardening checklist.
+
 ## Goal
 
 Make cross-machine history usable with normal `sessdb` read commands after the user

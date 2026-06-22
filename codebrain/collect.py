@@ -43,6 +43,17 @@ DEFAULT_ROOTS = {
     "pi": DEFAULT_PI_ROOT,
 }
 
+
+def _valid_machine_name(name: str) -> bool:
+    return bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name
+
+
+def _machine_name(machine: Optional[str]) -> str:
+    name = machine or os.environ.get("CODEBRAIN_MACHINE") or socket.gethostname()
+    if not _valid_machine_name(name):
+        raise ValueError(f"invalid machine {name!r}: must be a single path component")
+    return name
+
 # What may leave a tool home, per source (globs relative to the home).
 # Everything else — auth.json, config/settings, the tools' own sqlite, and
 # anything snapshotting the environment (claude session-env/, shell-snapshots/:
@@ -100,7 +111,7 @@ def _prune_stale_parts(dest_root: Path, max_age_s: int = 3600) -> None:
 
 def collect_source(source: str, raw_root: Optional[Path] = None,
                    pool_root: Path = DEFAULT_POOL, machine: Optional[str] = None) -> dict:
-    machine = machine or socket.gethostname()
+    machine = _machine_name(machine)
     root = Path(raw_root or DEFAULT_ROOTS[source])
     dest_root = Path(pool_root) / "raw" / machine / source
     stats = {"files": 0, "new": 0, "updated": 0, "unchanged": 0, "shrunk": 0, "errors": 0}
@@ -171,8 +182,9 @@ def _plist_dict(interval: int = 1800, pool_root: Path = DEFAULT_POOL,
     argv = [sys.executable, "-m", "codebrain", "collect", "--pool", str(pool_root)]
     if source != "all":
         argv += ["--source", source]
+    machine = machine or os.environ.get("CODEBRAIN_MACHINE")
     if machine:
-        argv += ["--machine", machine]
+        argv += ["--machine", _machine_name(machine)]
     return {
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": argv,

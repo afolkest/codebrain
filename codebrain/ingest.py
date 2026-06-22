@@ -9,8 +9,10 @@ three sources share one deduped `events` table.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -22,6 +24,18 @@ DEFAULT_CODEX_ROOT = Path.home() / ".codex"
 DEFAULT_PI_ROOT = Path.home() / ".pi"
 
 SOURCES = ("claude", "codex", "pi")
+STATS_KEYS = ("files", "sessions", "events", "placements", "skipped", "conflicts", "errors")
+
+
+def _empty_stats(**extra) -> dict:
+    out = {k: 0 for k in STATS_KEYS}
+    out.update(extra)
+    return out
+
+
+def _add_stats(total: dict, stats: dict) -> None:
+    for k in STATS_KEYS:
+        total[k] += stats.get(k, 0)
 
 
 # ---- discovery (top-level transcripts only; sub-agent files live deeper) ----
@@ -142,7 +156,127 @@ def _machine_for_root(source: str, raw_root: Optional[Path], machine: Optional[s
         root = Path(raw_root)
         if root.name == source and root.parent.parent.name == "raw":
             return root.parent.name
-    return socket.gethostname()
+    return os.environ.get("CODEBRAIN_MACHINE") or socket.gethostname()
+
+
+def _valid_pool_component(name: str) -> bool:
+    return bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name
+
+
+def _require_pool_component(name: str, label: str) -> str:
+    if not _valid_pool_component(name):
+        raise ValueError(f"invalid {label} {name!r}: must be a single path component")
+    return name
+
+
+def local_machine_names(explicit: Optional[str] = None) -> set[str]:
+    """Machine labels that should be treated as local pool subtrees.
+
+    The default collector uses socket.gethostname(); CODEBRAIN_MACHINE is a simple
+    alias hook for users who choose a stable explicit machine name, and
+    CODEBRAIN_LOCAL_MACHINES can list old/alternate aliases after a rename.
+    """
+    names = {socket.gethostname()}
+    if explicit:
+        names.add(explicit)
+    env_one = os.environ.get("CODEBRAIN_MACHINE")
+    if env_one:
+        names.add(env_one)
+    for name in os.environ.get("CODEBRAIN_LOCAL_MACHINES", "").split(","):
+        if name.strip():
+            names.add(name.strip())
+    return {n for n in names if _valid_pool_component(n)}
+
+
+def discover_pool_roots(pool_root: Path, sources=SOURCES, machines=None,
+                        include_local: bool = False,
+                        local_machines: Optional[set[str]] = None):
+    """Return [(machine, source, root)] for pool raw/<machine>/<source> roots.
+
+    By default local machine subtrees are skipped because live-home refresh is
+    fresher; remote pool subtrees are the cross-machine sync input.
+    """
+    srcs = (sources,) if isinstance(sources, str) else tuple(sources)
+    for src in srcs:
+        if src not in SOURCES:
+            raise ValueError(f"unknown source {src!r}")
+    raw = Path(pool_root) / "raw"
+    if machines is None:
+        machine_names = None
+    else:
+        ms = (machines,) if isinstance(machines, str) else tuple(machines)
+        machine_names = sorted(_require_pool_component(m, "machine") for m in ms)
+    if not raw.is_dir():
+        return []
+    if machine_names is None:
+        machine_names = sorted(p.name for p in raw.iterdir()
+                               if p.is_dir() and _valid_pool_component(p.name))
+    local = local_machines if local_machines is not None else local_machine_names()
+    roots = []
+    for machine in machine_names:
+        if not include_local and machine in local:
+            continue
+        for src in srcs:
+            root = raw / machine / src
+            if root.is_dir():
+                roots.append((machine, src, root))
+    return roots
+
+
+def refresh_pool(conn: sqlite3.Connection, pool_root: Path, sources=SOURCES, machines=None,
+                 include_local: bool = False,
+                 local_machines: Optional[set[str]] = None) -> dict:
+    """Delta-ingest synced pool roots. Origin machine is derived from raw/<machine>/<source>."""
+    srcs = (sources,) if isinstance(sources, str) else tuple(sources)
+    roots = discover_pool_roots(pool_root, sources=srcs, machines=machines,
+                                include_local=include_local,
+                                local_machines=local_machines)
+    skipped_local = 0
+    if not include_local:
+        local = local_machines if local_machines is not None else local_machine_names()
+        raw = Path(pool_root) / "raw"
+        if machines is None:
+            count_machines = sorted(local)
+        else:
+            ms = (machines,) if isinstance(machines, str) else tuple(machines)
+            count_machines = [m for m in ms if m in local]
+        for machine in count_machines:
+            if not _valid_pool_component(machine):
+                continue
+            for src in srcs:
+                if (raw / machine / src).is_dir():
+                    skipped_local += 1
+    total = _empty_stats(pool_roots=len(roots), skipped_local_roots=skipped_local)
+    seen_sessions: dict[str, tuple[str, str]] = {}
+    duplicate_sessions = set()
+    for machine, src, root in roots:
+        root_prefix = str(root).rstrip("/") + "/%"
+        before = {
+            r["session_id"] for r in conn.execute(
+                "SELECT session_id FROM ingest_state WHERE path LIKE ? AND session_id IS NOT NULL",
+                (root_prefix,),
+            )
+        }
+        stats = refresh(conn, sources=(src,), machine=None, roots={src: root})
+        _add_stats(total, stats)
+        after = {
+            r["session_id"] for r in conn.execute(
+                "SELECT session_id FROM ingest_state WHERE path LIKE ? AND session_id IS NOT NULL",
+                (root_prefix,),
+            )
+        }
+        for sid in before | after:
+            prior = seen_sessions.get(sid)
+            here = (machine, src)
+            if prior is not None and prior != here:
+                duplicate_sessions.add(sid)
+            else:
+                seen_sessions[sid] = here
+    total["duplicate_sessions"] = len(duplicate_sessions)
+    if duplicate_sessions:
+        print(f"  ~ pool duplicate session ids across machine roots: {len(duplicate_sessions)}",
+              file=sys.stderr)
+    return total
 
 
 def _source_jobs(source: str, machine: Optional[str], raw_root: Optional[Path] = None):

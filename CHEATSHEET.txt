@@ -1,5 +1,14 @@
 # codebrain CLI cheatsheet
 
+python3 -m codebrain collect --pool ~/codebrain-pool
+# Copy local raw session/history files into the syncable pool.
+
+python3 -m codebrain collect --install-launchd --pool ~/codebrain-pool --interval 300
+# Keep the pool fresh every five minutes on this Mac.
+
+python3 -m codebrain ingest-pool --machine macbook --source pi
+# Explicit/debug ingest of one synced remote pool subtree; normal reads refresh remote pool too.
+
 python3 -m codebrain recent
 # Sessions sorted by latest user message.
 

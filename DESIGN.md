@@ -20,7 +20,7 @@ Syncthing  replicate pool across machines         ← P2P, encrypted, offline-to
    │
 Adapters   per-source parsers → canonical events  ← the only agent-specific code
    │
-Ingester   build local SQLite from pool           ← incremental, idempotent
+Ingester   build local SQLite from live homes + synced pool ← incremental, idempotent
    │
 Index      FTS + vectors + files-touched + summaries
    │
@@ -38,7 +38,8 @@ Access     CLI + raw SQL + grep                   ← agents write scripts
 **Multi-machine: sync the inputs, not the index.**
 - Sync cheap append-only text (raw logs + derivation cache); regenerate the heavy binary DB locally.
 - Each machine queries its own local DB → fast, works offline (laptop away from home with the mini asleep).
-- Tradeoff accepted: eventual consistency between machines.
+- Normal reads refresh local live tool homes directly for immediate current-session freshness, then refresh synced remote pool subtrees for cross-machine history.
+- Tradeoff accepted: remote sessions are eventually consistent (collector interval + Syncthing latency + next local read command).
 
 **Sync transport: Syncthing.**
 - Peer-to-peer, encrypted, continuous, no cloud (keeps secret-laden transcripts on our own devices).
@@ -56,7 +57,9 @@ codebrain-pool/
 ```
 Each `<source>` subtree preserves the tool home's internal layout (allowlisted
 files only — credentials and tool-internal databases never enter the pool), so
-ingest can use a pool subtree as a raw root exactly like a live home.
+ingest can use a pool subtree as a raw root exactly like a live home. Automatic
+read-time refresh skips this machine's own pool subtree by default because live homes
+are fresher and should remain authoritative.
 
 **Format: sync raw, normalize on ingest.**
 - Pool holds original tool format (truest source of truth); every machine runs every adapter as code.

@@ -2,6 +2,7 @@
 
   sessdb ingest [--source all]         full build/rebuild of the local DB
   sessdb collect [--install-launchd]   mirror raw logs into the append-only pool
+  sessdb ingest-pool                   debug/repair ingest of synced pool subtrees
   sessdb backfill-claude <path>        import historical Claude backups into pool
   sessdb list [--limit N]              recent sessions
   sessdb recent [--limit N]            sessions by latest user activity
@@ -14,9 +15,9 @@
   sessdb touched <path>                sessions/events with structured file refs
   sessdb grep <pattern> [paths...]     ripgrep over the raw logs
 
-Read commands refresh first: changed/new raw files are delta-ingested before the
-query runs (ms when nothing changed), so results are always current for this
-machine — including sessions that are live right now. --no-refresh skips it.
+Read commands refresh first: changed/new local live-home files and synced remote
+pool files are delta-ingested before the query runs. Results stay current for this
+machine and include synced remote history after Syncthing arrives. --no-refresh skips it.
 
 Raw SQL escape hatch: just open the DB with any sqlite3 client (see --schema).
 """
@@ -38,18 +39,30 @@ from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_
 from codebrain.db import DEFAULT_DB, connect, has_fts5
 from codebrain.ingest import (
     DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES,
-    ingest_all, ingest_source, refresh,
+    ingest_all, ingest_source, local_machine_names, refresh, refresh_pool,
 )
+
+
+def _refresh_notice(local_stats, pool_stats):
+    parts = []
+    if local_stats.get("files"):
+        parts.append(f"local {local_stats['files']} file(s), +{local_stats['events']} events")
+    if pool_stats.get("files"):
+        parts.append(f"pool {pool_stats['files']} file(s), +{pool_stats['events']} events")
+    if parts:
+        print(f"(refreshed {'; '.join(parts)})", file=sys.stderr)
 
 
 def _open(args):
     """Connect and (unless --no-refresh) delta-ingest whatever changed on disk."""
     conn = connect(args.db)
     if not getattr(args, "no_refresh", False):
-        stats = refresh(conn)
-        if stats["files"]:
-            print(f"(refreshed {stats['files']} changed file(s), +{stats['events']} events)",
-                  file=sys.stderr)
+        local_stats = refresh(conn)
+        pool_stats = {"files": 0, "events": 0}
+        if (Path(DEFAULT_POOL) / "raw").is_dir():
+            pool_stats = refresh_pool(conn, Path(DEFAULT_POOL), include_local=False,
+                                      local_machines=local_machine_names())
+        _refresh_notice(local_stats, pool_stats)
     return conn
 
 
@@ -149,18 +162,56 @@ def cmd_ingest(args):
 
 
 def cmd_collect(args):
-    if args.install_launchd:
-        path = install_launchd(interval=args.interval, pool_root=Path(args.pool),
-                               source=args.source, machine=args.machine)
-        print(f"LaunchAgent loaded: {path}")
-        print(f"  sweeps every {args.interval}s → {args.pool}  "
-              f"(log: ~/.codebrain/logs/collect.log)")
-        print(f"  remove with: launchctl bootout gui/$(id -u)/{LAUNCHD_LABEL} && rm {path}")
-        return
-    sources = SOURCES if args.source == "all" else (args.source,)
-    print(f"collecting [{', '.join(sources)}] → {args.pool}")
-    total = collect_all(sources=sources, machine=args.machine, pool_root=Path(args.pool))
+    try:
+        if args.install_launchd:
+            path = install_launchd(interval=args.interval, pool_root=Path(args.pool),
+                                   source=args.source, machine=args.machine)
+            print(f"LaunchAgent loaded: {path}")
+            print(f"  sweeps every {args.interval}s → {args.pool}  "
+                  f"(log: ~/.codebrain/logs/collect.log)")
+            print(f"  remove with: launchctl bootout gui/$(id -u)/{LAUNCHD_LABEL} && rm {path}")
+            return
+        sources = SOURCES if args.source == "all" else (args.source,)
+        print(f"collecting [{', '.join(sources)}] → {args.pool}")
+        total = collect_all(sources=sources, machine=args.machine, pool_root=Path(args.pool))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
     print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
+
+
+def cmd_ingest_pool(args):
+    sources = SOURCES if args.source == "all" else (args.source,)
+    machines = (args.machine,) if args.machine else None
+    conn = connect(args.db)
+    local_names = local_machine_names()
+    print(f"ingesting pool [{', '.join(sources)}] from {args.pool}")
+    try:
+        total = refresh_pool(
+            conn, Path(args.pool), sources=sources, machines=machines,
+            include_local=args.include_local, local_machines=local_names,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        conn.close()
+        sys.exit(2)
+    print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
+    if total.get("pool_roots") == 0:
+        print(f"no matching pool roots under {Path(args.pool) / 'raw'}")
+    if total.get("skipped_local_roots") and not args.include_local:
+        print(f"skipped local pool root(s): {total['skipped_local_roots']} "
+              "(--include-local to ingest explicitly)")
+    if args.include_local:
+        print("reparsing local live homes after --include-local to keep live logs authoritative")
+        live_total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
+                      "skipped": 0, "conflicts": 0, "errors": 0}
+        for src in sources:
+            stats = ingest_source(conn, src)
+            for k in live_total:
+                live_total[k] += stats.get(k, 0)
+        conn.commit()
+        print("live: " + ", ".join(f"{k}={v}" for k, v in live_total.items()))
+    conn.close()
 
 
 def cmd_backfill_claude(args):
@@ -1279,6 +1330,15 @@ def main(argv=None):
     sp.add_argument("--interval", type=int, default=1800,
                     help="LaunchAgent sweep period in seconds (default 1800)")
     sp.set_defaults(func=cmd_collect)
+
+    sp = sub.add_parser("ingest-pool", help="debug/repair ingest of synced pool subtrees")
+    sp.add_argument("--pool", default=str(DEFAULT_POOL), help=f"pool root (default {DEFAULT_POOL})")
+    sp.add_argument("--source", choices=("all",) + SOURCES, default="all",
+                    help="which source(s) to ingest from the pool (default all)")
+    sp.add_argument("--machine", help="only ingest one pool raw/<machine> subtree")
+    sp.add_argument("--include-local", action="store_true",
+                    help="also ingest local pool subtree, then reparse local live homes")
+    sp.set_defaults(func=cmd_ingest_pool)
 
     sp = sub.add_parser("backfill-claude",
                         help="one-shot import of historical Claude backup zips into the pool")

@@ -31,11 +31,11 @@ sessdb schema               # print the DDL
 ```
 
 **Reads are always current.** Read commands (`list`/`recent`/`userlog`/`turns`/
-`show`/`search`/`lineage`/`refs`/`touched`) first delta-ingest whatever changed on disk (`refresh()`:
-stat-scan + re-parse only new/grown files — tens of
-ms when idle), so query results include sessions that are live *right now*; ask
-about another session's last message seconds after it happened. `--no-refresh`
-skips it; `sessdb ingest` is only for the first build or a full rebuild.
+`show`/`search`/`lineage`/`refs`/`touched`) first delta-ingest whatever changed on disk:
+local live tool homes plus synced remote pool subtrees when `~/codebrain-pool/raw`
+exists. The refresh is a stat-scan + re-parse only new/grown files, so it is usually
+ms when idle. `--no-refresh` skips both live-home and pool refresh; `sessdb ingest`
+is only for the first build or a full rebuild.
 
 **Raw is archived.** `sessdb collect` mirrors the tool homes into an append-only
 pool (`~/codebrain-pool/raw/<machine>/<source>/…`) so upstream cleanup can never
@@ -44,10 +44,11 @@ stat-compare sweeps (ms when idle), shrink-guarded, never deletes. Session-data
 dirs are taken whole, so it also captures what ingest doesn't parse yet — subagent
 transcripts + metadata, tool-result sidecars, session indexes, project memory,
 task state. `sessdb collect --install-launchd` makes it a
-periodic LaunchAgent (default every 30 min). Cross-machine sync later = point
-Syncthing at the pool; per-machine subtrees can't conflict, and ingesting a synced
-subtree keeps sessions labeled with their **origin** machine (from the
-`raw/<machine>/` path, per SCHEMA.md).
+periodic LaunchAgent (default every 30 min; use `--interval 300` for a five-minute
+collection interval). Cross-machine sync = point Syncthing at the pool; per-machine
+subtrees can't conflict, and ingesting a synced subtree keeps sessions labeled with
+their **origin** machine (from the `raw/<machine>/` path, per SCHEMA.md). See
+[SYNCING.md](SYNCING.md) for setup and latency details.
 
 **Old Claude backups are backfilled, not restored into live `~/.claude`.**
 `sessdb backfill-claude <zip-or-dir>` scans historical Claude `.zip` snapshots
@@ -55,8 +56,8 @@ read-only, selects one best main transcript per structured Claude `sessionId`,
 skips sessions already present in live `~/.claude`,
 retargets old top-level `agent-*.jsonl` sidechain files into the modern
 `<session>/subagents/` sidecar layout, skips `file-history/`, and writes a
-manifest into `~/codebrain-pool/raw/claude-backfill/claude/`. Then ingest that
-pool-shaped root:
+manifest into `~/codebrain-pool/raw/claude-backfill/claude/`. Normal read commands
+will ingest that pool-shaped root on demand; explicit ingest is also possible:
 
 ```bash
 sessdb backfill-claude ~/claude-restore
@@ -96,8 +97,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
   (inline `isSidechain` copies are ignored), pi `<session>/<runId>/run-<i>/`. Codex
   sub-agent rollouts *are* ingested (they're standalone files) with a parent-session
   link; the spawn-event link (`spawn_event_id`) is a later cross-file slice.
-- Refresh covers **this machine's** tool homes; the pool is collected locally,
-  but cross-machine replication (point Syncthing at the pool) and
+- Refresh covers this machine's live tool homes plus synced remote pool subtrees;
   embeddings/sqlite-vec are later slices.
 - `bash`-side file mutations aren't tracked in `refs`/`touched` (known gap across
   all sources); Codex reasoning is encrypted (≥2026-04) and excluded everywhere.
@@ -107,7 +107,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 86 tests, a second or two
+python3 -m unittest discover        # 98 tests, a second or two
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a

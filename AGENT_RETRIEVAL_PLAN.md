@@ -354,5 +354,5 @@ Once the composable browsing layer feels good, revisit:
 - semantic/vector search
 - chunking strategy
 - session summaries
-- cross-machine pool-ingest UX
+- cross-machine pool-ingest UX (implemented: read-time remote pool refresh + `ingest-pool`)
 - sub-agent ingestion if it becomes important
