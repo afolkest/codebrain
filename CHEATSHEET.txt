@@ -127,10 +127,10 @@ python3 -m codebrain list
 # Session metadata by start time. Usually recent is better for intent archaeology.
 
 python3 -m codebrain grep "some literal string"
-# Grep local live raw logs directly.
+# Grep local live raw logs plus synced remote pool roots.
 
 python3 -m codebrain grep "some literal string" ~/codebrain-pool/raw
-# Grep synced/archive raw logs directly.
+# Grep an explicit raw-log scope directly.
 
 python3 -m codebrain schema
 # Print SQLite schema.

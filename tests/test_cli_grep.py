@@ -1,9 +1,86 @@
 import unittest
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from codebrain import cli
 
 
 class TestGrepCli(unittest.TestCase):
+    def test_default_roots_include_live_and_remote_pool_but_skip_local_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live_claude = root / "live-claude"
+            live_pi = root / "live-pi"
+            live_claude.mkdir()
+            live_pi.mkdir()
+            pool = root / "pool"
+            remote_pi = pool / "raw" / "mini" / "pi"
+            local_claude = pool / "raw" / "local" / "claude"
+            alias_codex = pool / "raw" / "alias" / "codex"
+            remote_pi.mkdir(parents=True)
+            local_claude.mkdir(parents=True)
+            alias_codex.mkdir(parents=True)
+
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", live_claude), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", live_pi), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", pool), \
+                 mock.patch("codebrain.ingest.socket.gethostname", return_value="host-under-test"), \
+                 mock.patch.dict(
+                     "os.environ",
+                     {"CODEBRAIN_MACHINE": "local", "CODEBRAIN_LOCAL_MACHINES": "alias"},
+                     clear=False,
+                 ):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [str(live_claude), str(live_pi), str(remote_pi)])
+        self.assertNotIn(str(local_claude), roots)
+        self.assertNotIn(str(alias_codex), roots)
+
+    def test_default_roots_handle_missing_pool_and_empty_live_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", root / "missing-claude"), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", root / "missing-pool"):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [])
+
+    def test_default_roots_deduplicate_exact_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool"
+            remote_pi = pool / "raw" / "remote" / "pi"
+            remote_pi.mkdir(parents=True)
+
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", remote_pi), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", pool), \
+                 mock.patch("codebrain.ingest.socket.gethostname", return_value="host-under-test"):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [str(remote_pi)])
+
+    def test_explicit_paths_override_default_roots(self):
+        args = SimpleNamespace(pattern="needle", paths=["/tmp/custom"])
+
+        with mock.patch("codebrain.cli._default_grep_roots") as default_roots, \
+             mock.patch("codebrain.cli.shutil.which", return_value="rg"), \
+             mock.patch("codebrain.cli.subprocess.call", return_value=0) as call:
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_grep(args)
+
+        self.assertEqual(cm.exception.code, 0)
+        default_roots.assert_not_called()
+        call.assert_called_once_with(
+            ["rg", "--glob", "!**/file-history/**", "--", "needle", "/tmp/custom"]
+        )
+
     def test_ripgrep_excludes_file_history_dirs(self):
         cmd = cli._grep_command("needle", ["/tmp/.claude"], "rg")
 

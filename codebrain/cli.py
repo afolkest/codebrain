@@ -18,7 +18,7 @@ Setup / repair:
 Escape hatches:
   sessdb show <session> [--all]         raw transcript view
   sessdb list [--limit N]               session metadata by start time
-  sessdb grep <pattern> [paths...]      ripgrep raw logs (local homes by default)
+  sessdb grep <pattern> [paths...]      ripgrep raw logs (live + remote pool by default)
   sessdb schema                         print the DDL
 
 Read commands refresh first: changed/new local live-home files and synced remote
@@ -45,7 +45,8 @@ from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_
 from codebrain.db import DEFAULT_DB, connect, has_fts5
 from codebrain.ingest import (
     DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES,
-    ingest_all, ingest_source, local_machine_names, refresh, refresh_pool,
+    discover_pool_roots, ingest_all, ingest_source, local_machine_names, refresh,
+    refresh_pool,
 )
 
 
@@ -1290,12 +1291,34 @@ def cmd_lineage(args):
 
 def cmd_grep(args):
     rg = shutil.which("rg")
-    default_roots = [str(DEFAULT_CLAUDE_ROOT), str(DEFAULT_CODEX_ROOT), str(DEFAULT_PI_ROOT)]
-    paths = args.paths or [p for p in default_roots if Path(p).exists()]
+    paths = args.paths if args.paths else _default_grep_roots()
     cmd = _grep_command(args.pattern, paths, rg)
     if cmd is None:
         sys.exit(1)
     sys.exit(subprocess.call(cmd))
+
+
+def _default_grep_roots():
+    roots = [DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT]
+    roots.extend(
+        root for _, _, root in discover_pool_roots(
+            Path(DEFAULT_POOL),
+            include_local=False,
+            local_machines=local_machine_names(),
+        )
+    )
+    seen = set()
+    existing = []
+    for root in roots:
+        path = Path(root)
+        if not path.exists():
+            continue
+        value = str(path)
+        if value in seen:
+            continue
+        seen.add(value)
+        existing.append(value)
+    return existing
 
 
 def _grep_command(pattern: str, paths: list[str], rg: str | None):
@@ -1495,9 +1518,16 @@ def main(argv=None):
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_touched)
 
-    sp = sub.add_parser("grep", help="ripgrep over raw logs (all sources by default)")
+    sp = sub.add_parser(
+        "grep",
+        help="ripgrep over live local logs and synced remote pool logs by default",
+    )
     sp.add_argument("pattern")
-    sp.add_argument("paths", nargs="*")
+    sp.add_argument(
+        "paths",
+        nargs="*",
+        help="optional raw-log paths; when provided, replace the default search scope",
+    )
     sp.set_defaults(func=cmd_grep)
 
     sp = sub.add_parser("schema", help="print the DDL")

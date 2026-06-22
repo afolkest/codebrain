@@ -150,24 +150,15 @@ Do not remove now; scripts may use it.
 
 ### 4. Clarify `grep` scope after pool sync
 
-Status: recommended docs/help clarification.
+Status: implemented after `GREP_SCOPE_PLAN.md`.
 
-Problem:
+Resolution:
 
-`grep` defaults to local live tool homes (`~/.claude`, `~/.codex`, `~/.pi`). After
-cross-machine pool refresh, users may expect `grep` to search synced remote pool raw
-logs too. It currently does not unless paths are supplied.
+`grep` now defaults to local live tool homes (`~/.claude`, `~/.codex`, `~/.pi`) plus
+remote synced pool roots. Configured local pool aliases are skipped so local live
+homes remain authoritative for this machine.
 
-Options:
-
-1. Document it clearly: default grep is local live homes; pass `~/codebrain-pool/raw`
-   for synced archive forensics.
-2. Or change default grep roots to include `~/codebrain-pool/raw` when it exists.
-
-Recommendation:
-
-Start with documentation. Changing default grep may duplicate local+pool hits and
-make output noisier.
+Explicit paths still override the default grep roots.
 
 ### 5. Archive or status-tag old plan documents
 

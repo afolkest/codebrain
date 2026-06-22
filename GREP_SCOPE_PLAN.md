@@ -1,6 +1,6 @@
 # Grep Scope Plan
 
-Status: proposed.
+Status: implemented.
 
 ## Goal
 
@@ -13,7 +13,7 @@ local live tool homes + remote synced pool subtrees
 This keeps raw grep as a forensic escape hatch without making it a confusing
 second model of what codebrain can see.
 
-## Current Problem
+## Original Problem
 
 Read commands refresh and query:
 
@@ -22,10 +22,10 @@ Read commands refresh and query:
 + ~/codebrain-pool/raw/<remote-machine>/<source>
 ```
 
-But `sessdb grep <pattern>` currently searches only default local live homes unless
-the user passes explicit paths. After Syncthing, this is surprising: `search`,
-`recent`, `userlog`, `refs`, and `touched` can see synced remote history, while
-`grep` cannot.
+Before this change, `sessdb grep <pattern>` searched only default local live
+homes unless the user passed explicit paths. After Syncthing, that was
+surprising: `search`, `recent`, `userlog`, `refs`, and `touched` could see synced
+remote history, while `grep` could not.
 
 Including all of `~/codebrain-pool/raw` by default is also wrong, because this
 would duplicate this machine's sessions from both live homes and the local pool
@@ -134,4 +134,3 @@ Also mention that explicit paths override the default search universe.
 - Do not add text classifiers or infer file/session semantics from free text.
 - Do not sync or grep `file-history` bodies.
 - Do not make local pool roots authoritative over local live homes.
-

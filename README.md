@@ -54,11 +54,13 @@ Ops / escape hatches:
 ```bash
 sessdb list                 # session metadata by start time; recent is usually better
 sessdb show <session>       # raw transcript view (--all includes rolled-back)
-sessdb grep <pattern>       # grep local live raw logs; pass ~/codebrain-pool/raw for synced archive
+sessdb grep <pattern>       # grep local live logs + synced remote pool roots
 sessdb schema               # print the DDL for direct sqlite3 queries
 sessdb ingest-pool          # debug/repair explicit pool ingest; normal reads do this on demand
 sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
 ```
+
+Passing explicit paths to `sessdb grep` replaces the default live+remote scope.
 
 **Old Claude backups are backfilled, not restored into live `~/.claude`.**
 `sessdb backfill-claude <zip-or-dir>` scans historical Claude `.zip` snapshots
