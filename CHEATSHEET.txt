@@ -1,5 +1,7 @@
 # codebrain CLI cheatsheet
 
+## Setup / sync
+
 python3 -m codebrain collect --pool ~/codebrain-pool
 # Copy local raw session/history files into the syncable pool.
 
@@ -7,7 +9,10 @@ python3 -m codebrain collect --install-launchd --pool ~/codebrain-pool --interva
 # Keep the pool fresh every five minutes on this Mac.
 
 python3 -m codebrain ingest-pool --machine macbook --source pi
-# Explicit/debug ingest of one synced remote pool subtree; normal reads refresh remote pool too.
+# Debug/repair: explicitly ingest one synced remote pool subtree.
+# Normal read commands refresh remote pool subtrees on demand.
+
+## Daily archaeology loop
 
 python3 -m codebrain recent
 # Sessions sorted by latest user message.
@@ -45,30 +50,6 @@ python3 -m codebrain userlog --since 30d --source codex
 python3 -m codebrain userlog --json --limit 10
 # Userlog as JSON for scripts/agents.
 
-python3 -m codebrain turns <session_id>
-# Show a session as user-centered turns.
-
-python3 -m codebrain turns <session_id> --around-seq <seq>
-# Expand around a seq from recent/userlog.
-
-python3 -m codebrain turns <session_id> --around-seq <seq> --context-turns 1
-# One turn before and after the target seq.
-
-python3 -m codebrain turns <session_id> --agent-chars 120
-# Shorter assistant previews.
-
-python3 -m codebrain turns <session_id> --show-tools --tool-chars 80
-# Include truncated tool calls/results.
-
-python3 -m codebrain turns <session_id> --all
-# Include rolled-back turns/events too.
-
-python3 -m codebrain show <session_id>
-# Raw live transcript view.
-
-python3 -m codebrain show <session_id> --all
-# Raw transcript including rolled-back events.
-
 python3 -m codebrain search "sqlite refresh"
 # FTS search over live, authored event text.
 
@@ -87,11 +68,31 @@ python3 -m codebrain search "ExamplePriority" --exclude-recent 1h --json
 python3 -m codebrain search "ExamplePriority" --actor user --around 2
 # Search and inline nearby user-centered turns, with tools hidden by default.
 
+python3 -m codebrain turns <session_id>
+# Show a session as user-centered turns.
+
+python3 -m codebrain turns <session_id> --around-seq <seq>
+# Expand around a seq from recent/userlog/search.
+
+python3 -m codebrain turns <session_id> --around-seq <seq> --context-turns 1
+# One turn before and after the target seq.
+
+python3 -m codebrain turns <session_id> --agent-chars 120
+# Shorter assistant previews.
+
+python3 -m codebrain turns <session_id> --show-tools --tool-chars 80
+# Include truncated tool calls/results.
+
+python3 -m codebrain turns <session_id> --all
+# Include rolled-back turns/events too.
+
 python3 -m codebrain lineage <session_id>
 # Show factual parent/root/children/sibling lineage for a session.
 
 python3 -m codebrain lineage <session_id> --json
 # Lineage as JSON for scripts/agents.
+
+## Artifact handoff
 
 python3 -m codebrain refs <session_id>
 # Files, commands, and commit hashes referenced by a session.
@@ -114,8 +115,22 @@ python3 -m codebrain touched docs/wip/ --prefix --cwd example-project
 python3 -m codebrain touched docs/wip/pipeline-redesign.md --json
 # File-first archaeology as JSON for scripts/agents.
 
+## Escape hatches
+
+python3 -m codebrain show <session_id>
+# Raw live transcript view. Usually start with turns instead.
+
+python3 -m codebrain show <session_id> --all
+# Raw transcript including rolled-back events.
+
+python3 -m codebrain list
+# Session metadata by start time. Usually recent is better for intent archaeology.
+
 python3 -m codebrain grep "some literal string"
-# Grep raw logs directly.
+# Grep local live raw logs directly.
+
+python3 -m codebrain grep "some literal string" ~/codebrain-pool/raw
+# Grep synced/archive raw logs directly.
 
 python3 -m codebrain schema
 # Print SQLite schema.

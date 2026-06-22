@@ -11,53 +11,63 @@ ingested with zero errors (claude 90% live, codex 98%, pi 94%).
 
 ## Quickstart
 
+Install and build the local SQLite cache:
+
 ```bash
 pip install -e .            # or run as: python3 -m codebrain <cmd>
-
 sessdb ingest               # first build from ~/.claude + ~/.codex + ~/.pi (read-only)
-sessdb collect              # mirror raw logs → ~/codebrain-pool (append-only archive)
-sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
-sessdb list                 # recent sessions (any source)
-sessdb recent               # sessions by latest live user message
-sessdb userlog              # recent live user messages (intent-first)
-sessdb turns <session>      # user-centered turns with truncated agent context
-sessdb show <session>       # a session's live transcript (--all includes rolled-back)
-sessdb search <query>       # FTS5 over event text; filters + optional turn context
-sessdb lineage <session>    # factual parent/child session lineage
-sessdb refs <session>       # files/commands/commits referenced by a session
-sessdb touched <path>       # sessions/events with structured file refs
-sessdb grep <pattern>       # ripgrep over the raw logs (all sources)
-sessdb schema               # print the DDL
 ```
 
-**Reads are always current.** Read commands (`list`/`recent`/`userlog`/`turns`/
-`show`/`search`/`lineage`/`refs`/`touched`) first delta-ingest whatever changed on disk:
-local live tool homes plus synced remote pool subtrees when `~/codebrain-pool/raw`
-exists. The refresh is a stat-scan + re-parse only new/grown files, so it is usually
-ms when idle. `--no-refresh` skips both live-home and pool refresh; `sessdb ingest`
-is only for the first build or a full rebuild.
+Daily intent archaeology loop:
 
-**Raw is archived.** `sessdb collect` mirrors the tool homes into an append-only
-pool (`~/codebrain-pool/raw/<machine>/<source>/…`) so upstream cleanup can never
-take sessions with it: allowlisted files only (credentials stay home), incremental
-stat-compare sweeps (ms when idle), shrink-guarded, never deletes. Session-data
-dirs are taken whole, so it also captures what ingest doesn't parse yet — subagent
-transcripts + metadata, tool-result sidecars, session indexes, project memory,
-task state. `sessdb collect --install-launchd` makes it a
-periodic LaunchAgent (default every 30 min; use `--interval 300` for a five-minute
-collection interval). Cross-machine sync = point Syncthing at the pool; per-machine
-subtrees can't conflict, and ingesting a synced subtree keeps sessions labeled with
-their **origin** machine (from the `raw/<machine>/` path, per SCHEMA.md). See
-[SYNCING.md](SYNCING.md) for setup and latency details.
+```bash
+sessdb recent               # sessions by latest live user message
+sessdb userlog              # newest live user messages across sessions
+sessdb search <query>       # FTS5 over event text; add --around N for turn context
+sessdb turns <session>      # expand user-centered turns around a seq/session
+sessdb lineage <session>    # factual parent/child session lineage
+sessdb refs <session>       # conversation -> files/commands/commits
+sessdb touched <path>       # file/artifact -> sessions/events
+```
+
+**Reads are always current.** Read commands first delta-ingest changed local live
+logs plus synced remote pool subtrees when `~/codebrain-pool/raw` exists. The
+refresh is a stat-scan + re-parse only new/grown files, so it is usually ms when
+idle. `--no-refresh` skips both live-home and pool refresh; `sessdb ingest` is only
+for the first build or a full rebuild.
+
+Sync / archive setup is separate from daily retrieval:
+
+```bash
+sessdb collect --pool ~/codebrain-pool
+sessdb collect --install-launchd --pool ~/codebrain-pool --interval 300
+```
+
+`collect` mirrors allowlisted raw session/history files into
+`~/codebrain-pool/raw/<machine>/<source>/…` so upstream cleanup cannot take them
+with it. Point Syncthing at `~/codebrain-pool`; do **not** sync the SQLite DB or
+live tool homes. See [SYNCING.md](SYNCING.md) for setup, machine-name aliases, and
+latency details.
+
+Ops / escape hatches:
+
+```bash
+sessdb list                 # session metadata by start time; recent is usually better
+sessdb show <session>       # raw transcript view (--all includes rolled-back)
+sessdb grep <pattern>       # grep local live raw logs; pass ~/codebrain-pool/raw for synced archive
+sessdb schema               # print the DDL for direct sqlite3 queries
+sessdb ingest-pool          # debug/repair explicit pool ingest; normal reads do this on demand
+sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
+```
 
 **Old Claude backups are backfilled, not restored into live `~/.claude`.**
 `sessdb backfill-claude <zip-or-dir>` scans historical Claude `.zip` snapshots
 read-only, selects one best main transcript per structured Claude `sessionId`,
-skips sessions already present in live `~/.claude`,
-retargets old top-level `agent-*.jsonl` sidechain files into the modern
-`<session>/subagents/` sidecar layout, skips `file-history/`, and writes a
-manifest into `~/codebrain-pool/raw/claude-backfill/claude/`. Normal read commands
-will ingest that pool-shaped root on demand; explicit ingest is also possible:
+skips sessions already present in live `~/.claude`, retargets old top-level
+`agent-*.jsonl` sidechain files into the modern `<session>/subagents/` sidecar
+layout, skips `file-history/`, and writes a manifest into
+`~/codebrain-pool/raw/claude-backfill/claude/`. Normal read commands ingest that
+pool-shaped root on demand; explicit ingest remains available:
 
 ```bash
 sessdb backfill-claude ~/claude-restore
@@ -107,7 +117,7 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 Stdlib `unittest`, no dependencies — run from the repo root:
 
 ```bash
-python3 -m unittest discover        # 98 tests, a second or two
+python3 -m unittest discover        # full test suite, a second or two
 ```
 
 Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a

@@ -286,6 +286,8 @@ These are not simplifications, but they are good regression targets if touched:
 
 ## Recommended next slice
 
+Status: implemented in the docs pass following this audit.
+
 Small docs-only simplification:
 
 1. Rewrite README Quickstart into grouped sections.

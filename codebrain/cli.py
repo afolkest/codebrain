@@ -1,19 +1,25 @@
 """sessdb — thin CLI over the codebrain SQLite cache.
 
-  sessdb ingest [--source all]         full build/rebuild of the local DB
-  sessdb collect [--install-launchd]   mirror raw logs into the append-only pool
-  sessdb ingest-pool                   debug/repair ingest of synced pool subtrees
-  sessdb backfill-claude <path>        import historical Claude backups into pool
-  sessdb list [--limit N]              recent sessions
-  sessdb recent [--limit N]            sessions by latest user activity
-  sessdb userlog [--limit N]           recent user messages (intent-first)
-  sessdb turns <session>               user-centered turns with truncated agent context
-  sessdb show <session> [--all]        a session's transcript (live by default)
-  sessdb search <query> [--around N]   FTS over filtered event text
-  sessdb lineage <session>             factual parent/child session lineage
-  sessdb refs <session>                files/commands/commits referenced by a session
-  sessdb touched <path>                sessions/events with structured file refs
-  sessdb grep <pattern> [paths...]     ripgrep over the raw logs
+Daily archaeology:
+  sessdb recent                         sessions by latest user activity
+  sessdb userlog                        recent user messages (intent-first)
+  sessdb search <query> [--around N]    FTS over filtered event text
+  sessdb turns <session>                user-centered turn expansion
+  sessdb lineage <session>              factual parent/child session lineage
+  sessdb refs <session>                 conversation -> files/commands/commits
+  sessdb touched <path>                 file/artifact -> sessions/events
+
+Setup / repair:
+  sessdb ingest                         full build/rebuild of the local DB
+  sessdb collect [--install-launchd]    mirror raw logs into the append-only pool
+  sessdb ingest-pool                    debug/repair ingest of synced pool subtrees
+  sessdb backfill-claude <path>         import historical Claude backups into pool
+
+Escape hatches:
+  sessdb show <session> [--all]         raw transcript view
+  sessdb list [--limit N]               session metadata by start time
+  sessdb grep <pattern> [paths...]      ripgrep raw logs (local homes by default)
+  sessdb schema                         print the DDL
 
 Read commands refresh first: changed/new local live-home files and synced remote
 pool files are delta-ingested before the query runs. Results stay current for this
