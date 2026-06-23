@@ -70,6 +70,13 @@ WHERE se.session_id = ? AND se.live = 1 ORDER BY se.seq;
 | `branch_point_event_id` | TEXT NULL | For pi `resume`/`branch`: the last inherited event on the live branch — the **highest-`seq` inherited placement**, not max-`ts` (multi-block events share timestamps and source ts ≠ transcript order). |
 | `tip_event_id` | TEXT NULL | This session's final live leaf — the entry point for reconstruction and the live-branch root for `live`. |
 | `title` | TEXT NULL | Human title when available (Claude `ai-title` final value), else NULL/derived. |
+| `hidden_at` | TEXT NULL | Retrieval visibility marker. NULL means visible in default discovery/search commands; non-NULL means hidden unless the command explicitly includes hidden sessions. Raw logs are not deleted. |
+| `hidden_reason` | TEXT NULL | Human reason for hiding a session from default retrieval. |
+
+Visibility is manual and reversible (`sessdb hide`, `sessdb unhide`). It is a
+structured DB policy over sessions, not a prompt-text classifier and not raw-log
+scrubbing. Because the DB is a rebuildable cache, these manual markers are lost
+if the DB is deleted and rebuilt from raw logs.
 
 ## ID scheme
 

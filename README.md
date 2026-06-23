@@ -30,6 +30,13 @@ sessdb refs <session>       # conversation -> files/commands/commits
 sessdb touched <path>       # file/artifact -> sessions/events
 ```
 
+Default retrieval hides sessions with `sessions.hidden_at` set. Use
+`sessdb hide <session> --reason <why>` for noisy/eval sessions, `sessdb unhide`
+to restore them, `sessdb hidden` to audit them, and `--include-hidden` /
+`--only-hidden` on discovery commands when needed. This is DB visibility only:
+raw logs and pool files are not deleted, and deleting/rebuilding the DB loses
+manual hidden markers.
+
 **Reads are always current.** Read commands first delta-ingest changed local live
 logs plus synced remote pool subtrees when `~/codebrain-pool/raw` exists. The
 refresh is a stat-scan + re-parse only new/grown files, so it is usually ms when
@@ -58,6 +65,8 @@ sessdb grep <pattern>       # grep local live logs + synced remote pool roots
 sessdb schema               # print the DDL for direct sqlite3 queries
 sessdb ingest-pool          # debug/repair explicit pool ingest; normal reads do this on demand
 sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
+sessdb hidden               # audit sessions hidden from default retrieval
+sessdb unhide <session>     # restore a hidden session to default retrieval
 ```
 
 Passing explicit paths to `sessdb grep` replaces the default live+remote scope.

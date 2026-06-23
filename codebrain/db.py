@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   spawn_event_id        TEXT,
   branch_point_event_id TEXT,
   tip_event_id          TEXT,
-  title                 TEXT
+  title                 TEXT,
+  hidden_at             TEXT,
+  hidden_reason         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -87,9 +89,24 @@ def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    _ensure_visibility_columns(conn)
     _ensure_fts(conn)
     conn.commit()
     return conn
+
+
+def _ensure_visibility_columns(conn: sqlite3.Connection) -> None:
+    """Migrate existing caches to the session visibility schema.
+
+    The raw logs remain authoritative; visibility is a reversible retrieval
+    policy stored in the rebuildable SQLite cache.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "hidden_at" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN hidden_at TEXT")
+    if "hidden_reason" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN hidden_reason TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_sessions_hidden ON sessions(hidden_at)")
 
 
 def has_fts5(conn: sqlite3.Connection) -> bool:

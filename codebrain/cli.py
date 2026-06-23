@@ -14,6 +14,9 @@ Setup / repair:
   sessdb collect [--install-launchd]    mirror raw logs into the append-only pool
   sessdb ingest-pool                    debug/repair ingest of synced pool subtrees
   sessdb backfill-claude <path>         import historical Claude backups into pool
+  sessdb hide <session> --reason <why>  hide noisy sessions from default retrieval
+  sessdb unhide <session>               restore sessions to default retrieval
+  sessdb hidden                         audit hidden sessions
 
 Escape hatches:
   sessdb show <session> [--all]         raw transcript view
@@ -146,6 +149,53 @@ def _resolve_session(conn, ident: str):
     return row["session_id"] if row else None
 
 
+def _session_match_patterns(ident: str) -> list[str]:
+    return [f"{ident}%", *(f"{source}:{ident}%" for source in SOURCES)]
+
+
+def _resolve_unique_session(conn, ident: str):
+    ident = (ident or "").strip()
+    if not ident:
+        return None, []
+    row = conn.execute("SELECT session_id FROM sessions WHERE session_id = ?", (ident,)).fetchone()
+    if row:
+        return row["session_id"], [row["session_id"]]
+    patterns = _session_match_patterns(ident)
+    rows = conn.execute(
+        f"""
+        SELECT session_id FROM sessions
+        WHERE {' OR '.join('session_id LIKE ?' for _ in patterns)}
+        ORDER BY session_id
+        LIMIT 21
+        """,
+        patterns,
+    ).fetchall()
+    matches = [r["session_id"] for r in rows]
+    return (matches[0] if len(matches) == 1 else None), matches
+
+
+def _visibility_where(args, alias: str = "s"):
+    if getattr(args, "include_hidden", False):
+        return None
+    if getattr(args, "only_hidden", False):
+        return f"{alias}.hidden_at IS NOT NULL"
+    return f"{alias}.hidden_at IS NULL"
+
+
+def _append_visibility(where: list[str], args, alias: str = "s") -> None:
+    clause = _visibility_where(args, alias)
+    if clause:
+        where.append(clause)
+
+
+def _add_visibility_args(parser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--include-hidden", action="store_true",
+                       help="include sessions hidden from default retrieval")
+    group.add_argument("--only-hidden", action="store_true",
+                       help="only show sessions hidden from default retrieval")
+
+
 def _timestamp_where(column: str, op: str) -> str:
     return f"julianday({column}) {op} julianday(?)"
 
@@ -243,14 +293,111 @@ def cmd_backfill_claude(args):
         print(f"  sessdb ingest --source claude --raw-root {shlex.quote(manifest['dest_root'])}")
 
 
+def _utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_unique_or_die(conn, ident: str):
+    sid, matches = _resolve_unique_session(conn, ident)
+    if sid:
+        return sid
+    if not matches:
+        print(f"no session matching {ident!r}", file=sys.stderr)
+    else:
+        n = "20+" if len(matches) > 20 else str(len(matches))
+        print(f"ambiguous session prefix {ident!r}; {n} matches, first few:", file=sys.stderr)
+        for match in matches[:10]:
+            print(f"  {match}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_hide(args):
+    conn = _open(args)
+    try:
+        sids = [_resolve_unique_or_die(conn, ident) for ident in args.sessions]
+    except SystemExit:
+        conn.close()
+        raise
+    hidden_at = _utc_now()
+    for sid in sids:
+        conn.execute(
+            "UPDATE sessions SET hidden_at=?, hidden_reason=? WHERE session_id=?",
+            (hidden_at, args.reason, sid),
+        )
+    conn.commit()
+    conn.close()
+    for sid in sids:
+        print(f"hidden: {sid}")
+    print(f"done: hidden={len(sids)}")
+
+
+def cmd_unhide(args):
+    conn = _open(args)
+    try:
+        sids = [_resolve_unique_or_die(conn, ident) for ident in args.sessions]
+    except SystemExit:
+        conn.close()
+        raise
+    for sid in sids:
+        conn.execute(
+            "UPDATE sessions SET hidden_at=NULL, hidden_reason=NULL WHERE session_id=?",
+            (sid,),
+        )
+    conn.commit()
+    conn.close()
+    for sid in sids:
+        print(f"unhidden: {sid}")
+    print(f"done: unhidden={len(sids)}")
+
+
+def cmd_hidden(args):
+    conn = _open(args)
+    where = ["s.hidden_at IS NOT NULL"]
+    params: list = []
+    if args.source:
+        where.append("s.source = ?")
+        params.append(args.source)
+    if args.cwd:
+        where.append("COALESCE(s.cwd, '') LIKE ?")
+        params.append(f"%{args.cwd}%")
+    params.append(args.limit)
+    rows = conn.execute(
+        f"""
+        SELECT s.session_id, s.source, s.machine, s.cwd, s.started_at,
+               s.hidden_at, s.hidden_reason, s.title
+        FROM sessions s
+        WHERE {' AND '.join(where)}
+        ORDER BY s.hidden_at DESC, s.session_id
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    if args.json:
+        json.dump([dict(r) for r in rows], sys.stdout, ensure_ascii=False)
+        print()
+    else:
+        for r in rows:
+            hidden_at = (r["hidden_at"] or "")[:19]
+            started = (r["started_at"] or "")[:19]
+            print(f"{hidden_at:19}  {started:19}  {r['source']:6}  {r['session_id']}")
+            print(f"  reason: {r['hidden_reason']}")
+            print(f"  cwd: {_short_path(r['cwd'])}")
+    conn.close()
+
+
 def cmd_list(args):
     conn = _open(args)
+    where = []
+    _append_visibility(where, args)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT s.session_id, s.source, s.started_at, s.cwd, s.title,
+               s.hidden_at, s.hidden_reason,
                COUNT(se.event_id) AS n
         FROM sessions s
         LEFT JOIN session_events se ON se.session_id = s.session_id AND se.live = 1
+        {where_sql}
         GROUP BY s.session_id
         ORDER BY s.started_at DESC
         LIMIT ?
@@ -259,8 +406,9 @@ def cmd_list(args):
     ).fetchall()
     for r in rows:
         started = (r["started_at"] or "")[:19]
+        hidden = " hidden" if r["hidden_at"] else ""
         print(f"{started:19}  {r['n']:>5}  {r['source']:6}  {r['session_id']:<44}  "
-              f"{_oneline(r['cwd'], 40):<40}  {_oneline(r['title'], 50)}")
+              f"{_oneline(r['cwd'], 40):<40}  {_oneline(r['title'], 50)}{hidden}")
     conn.close()
 
 
@@ -308,6 +456,7 @@ def _user_message_where(args):
         "t.text NOT LIKE '<task-notification>%'",
     ]
     params: list = []
+    _append_visibility(where, args)
     if not getattr(args, "include_subagents", False):
         where.append(_not_subagent_session_sql())
     if not getattr(args, "include_inherited", False):
@@ -341,6 +490,7 @@ def _userlog_rows(conn, args):
     return conn.execute(
         f"""
         SELECT t.ts, s.source, t.session_id, t.seq, t.event_id, s.cwd, s.title,
+               s.hidden_at, s.hidden_reason,
                t.text, length(COALESCE(t.text, '')) AS chars
         FROM transcript t
         JOIN sessions s ON s.session_id = t.session_id
@@ -380,6 +530,7 @@ def _recent_rows(conn, args):
         SELECT r.ts AS last_user_ts, s.source, r.session_id,
                r.seq AS last_user_seq, r.event_id AS last_user_event_id,
                s.cwd, s.title, r.text AS last_user_text,
+               s.hidden_at, s.hidden_reason,
                r.chars AS last_user_chars, r.user_msg_count,
                COALESCE(l.live_event_count, 0) AS live_event_count
         FROM ranked r
@@ -411,6 +562,8 @@ def cmd_recent(args):
             print(f"seq: {seq}  users: {r['user_msg_count']}  events: {r['live_event_count']}")
             if r["title"]:
                 print(_wrapped("title: ", r["title"], 120))
+            if r["hidden_at"]:
+                print(f"hidden: {r['hidden_reason'] or r['hidden_at']}")
             print(_wrapped("user: ", r["last_user_text"], 0 if args.full else 260))
             print(f"expand: sessdb turns {sid} --around-seq {seq}")
     conn.close()
@@ -432,6 +585,8 @@ def cmd_userlog(args):
             print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
             print(f"session: {sid}")
             print(f"seq: {seq}  chars: {r['chars']}")
+            if r["hidden_at"]:
+                print(f"hidden: {r['hidden_reason'] or r['hidden_at']}")
             print(_wrapped("user: ", r["text"], 0 if args.full else 320))
             print(f"expand: sessdb turns {sid} --around-seq {seq}")
     conn.close()
@@ -613,6 +768,7 @@ def cmd_show(args):
 def _search_rows(conn, args):
     where = ["events_fts MATCH ?", "se.live = 1", "COALESCE(e.text, '') <> ''"]
     params: list = [args.query]
+    _append_visibility(where, args)
 
     only_session = getattr(args, "only_session", None)
     if not getattr(args, "include_subagents", False):
@@ -661,6 +817,7 @@ def _search_rows(conn, args):
         f"""
         SELECT e.event_id, e.actor, e.type, e.text, se.session_id, se.seq,
                se.inherited, e.ts, s.source, s.cwd, s.title,
+               s.hidden_at, s.hidden_reason,
                snippet(events_fts, 0, '[', ']', '…', 12) AS snip
         FROM events_fts
         JOIN events e ON e.rowid = events_fts.rowid
@@ -679,7 +836,8 @@ def _search_row_json(r):
         "ts": r["ts"], "source": r["source"], "session_id": r["session_id"],
         "seq": r["seq"], "event_id": r["event_id"], "cwd": r["cwd"],
         "title": r["title"], "actor": r["actor"], "type": r["type"],
-        "inherited": r["inherited"], "snippet": r["snip"], "text": r["text"],
+        "inherited": r["inherited"], "hidden_at": r["hidden_at"],
+        "hidden_reason": r["hidden_reason"], "snippet": r["snip"], "text": r["text"],
         "expand_command": f"sessdb turns {r['session_id']} --around-seq {r['seq']}",
     }
 
@@ -716,6 +874,8 @@ def cmd_search(args):
             print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
             print(f"session: {r['session_id']}")
             print(f"seq: {r['seq']}  event: {r['event_id']}  {r['actor']}/{r['type']}")
+            if r["hidden_at"]:
+                print(f"hidden: {r['hidden_reason'] or r['hidden_at']}")
             print(_wrapped("match: ", r["snip"], width=100))
             print(f"expand: sessdb turns {r['session_id']} --around-seq {r['seq']}")
             if args.around is not None:
@@ -991,7 +1151,9 @@ def _touched_row_json(conn, r, file_value, args):
         "ts": r["ts"], "source": r["source"], "session_id": r["session_id"],
         "seq": r["seq"], "event_id": r["event_id"], "cwd": r["cwd"],
         "title": r["title"], "actor": r["actor"], "type": r["type"],
-        "live": r["live"], "inherited": r["inherited"], "file": file_value,
+        "live": r["live"], "inherited": r["inherited"],
+        "hidden_at": r["hidden_at"], "hidden_reason": r["hidden_reason"],
+        "file": file_value,
         "preview": _oneline(r["text"], 240),
         "nearest_user": _nearest_user(conn, r["session_id"], r["seq"], args.all),
         "expand_command": _touched_expand_command(r),
@@ -1002,6 +1164,7 @@ def _touched_row_json(conn, r, file_value, args):
 def _touched_candidates(conn, args):
     where = ["json_valid(t.refs)", "COALESCE(json_array_length(t.refs, '$.files'), 0) > 0"]
     params: list = []
+    _append_visibility(where, args)
     if not args.all:
         where.append("t.live = 1")
     only_session = getattr(args, "only_session", None)
@@ -1040,6 +1203,7 @@ def _touched_candidates(conn, args):
     return conn.execute(
         f"""
         SELECT t.ts, s.source, t.session_id, t.seq, t.event_id, s.cwd, s.title,
+               s.hidden_at, s.hidden_reason,
                t.actor, t.type, t.text, t.refs, t.live, t.inherited
         FROM transcript t
         JOIN sessions s ON s.session_id = t.session_id
@@ -1072,6 +1236,8 @@ def _touched_query_json(args):
         "only_session": args.only_session, "exclude_recent": args.exclude_recent,
         "all": bool(args.all), "include_inherited": bool(args.include_inherited),
         "include_subagents": bool(args.include_subagents),
+        "include_hidden": bool(args.include_hidden),
+        "only_hidden": bool(args.only_hidden),
     }
 
 
@@ -1091,6 +1257,8 @@ def cmd_touched(args):
             print(f"session: {r['session_id']}")
             suffix = _placement_suffix(r["live"], r["inherited"])
             print(f"seq: {r['seq']}  event: {r['event_id']}  {r['actor']}/{r['type']}{suffix}")
+            if r["hidden_at"]:
+                print(f"hidden: {r['hidden_reason'] or r['hidden_at']}")
             print(_wrapped("file: ", r["file"], 180))
             if r["nearest_user"]:
                 u = r["nearest_user"]
@@ -1382,8 +1550,28 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit the manifest JSON to stdout")
     sp.set_defaults(func=cmd_backfill_claude)
 
+    sp = sub.add_parser("hide", help="hide sessions from default retrieval")
+    sp.add_argument("sessions", nargs="+", help="session id or unique prefix")
+    sp.add_argument("--reason", required=True, help="why this session is hidden")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_hide)
+
+    sp = sub.add_parser("unhide", help="restore sessions to default retrieval")
+    sp.add_argument("sessions", nargs="+", help="session id or unique prefix")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_unhide)
+
+    sp = sub.add_parser("hidden", help="list sessions hidden from default retrieval")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--source", choices=SOURCES, help="filter by source")
+    sp.add_argument("--cwd", help="substring filter on session cwd")
+    sp.add_argument("--json", action="store_true", help="emit a JSON array")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_hidden)
+
     sp = sub.add_parser("list", help="recent sessions")
     sp.add_argument("--limit", type=int, default=30)
+    _add_visibility_args(sp)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_list)
 
@@ -1400,6 +1588,7 @@ def main(argv=None):
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--full", action="store_true", help="do not truncate last user preview")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
+    _add_visibility_args(sp)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_recent)
 
@@ -1417,6 +1606,7 @@ def main(argv=None):
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--full", action="store_true", help="do not truncate message text")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
+    _add_visibility_args(sp)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_userlog)
 
@@ -1473,6 +1663,7 @@ def main(argv=None):
     sp.add_argument("--include-subagents", action="store_true",
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
+    _add_visibility_args(sp)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_search)
 
@@ -1515,6 +1706,7 @@ def main(argv=None):
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--all", action="store_true", help="include rolled-back events")
     sp.add_argument("--json", action="store_true", help="emit a JSON object")
+    _add_visibility_args(sp)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_touched)
 

@@ -115,6 +115,23 @@ python3 -m codebrain touched docs/wip/ --prefix --cwd example-project
 python3 -m codebrain touched docs/wip/pipeline-redesign.md --json
 # File-first archaeology as JSON for scripts/agents.
 
+## Visibility
+
+python3 -m codebrain hide <session_id> --reason "benchmark leakage"
+# Hide a session from default DB retrieval without deleting raw logs.
+
+python3 -m codebrain hidden
+# List hidden sessions and their reasons.
+
+python3 -m codebrain unhide <session_id>
+# Restore a hidden session to default retrieval.
+
+python3 -m codebrain recent --include-hidden
+# Include hidden sessions in discovery commands.
+
+python3 -m codebrain search "needle" --only-hidden
+# Search only hidden sessions.
+
 ## Escape hatches
 
 python3 -m codebrain show <session_id>
