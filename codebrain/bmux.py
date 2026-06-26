@@ -1,4 +1,4 @@
-"""bmux provenance overlay (BMUX_PROVENANCE_PLAN.md).
+"""bmux provenance overlay.
 
 codebrain indexes native transcripts; bmux can submit prompts into worker panes
 on behalf of a master agent, and those land in the transcript as ordinary native
@@ -65,7 +65,7 @@ def _read_jsonl(path: Path) -> list:
 
 def extract_launch_id(data, by_id: dict):
     """launch-id-first extraction across current + historical bmux shapes
-    (BMUX_PROVENANCE_PLAN.md "Resolution Decision"). Returns (launch_id, via)."""
+    (see README bmux provenance notes). Returns (launch_id, via)."""
     if not isinstance(data, dict):
         return None, None
     if data.get("launch_id"):

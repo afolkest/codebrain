@@ -217,7 +217,7 @@ _ORIGIN_DB = {"master-control": "master_control", "unknown": "unknown"}
 
 
 def _origin_where(args, session_col="t.session_id", event_col="t.event_id"):
-    """Filter native user messages by bmux provenance (BMUX_PROVENANCE_PLAN.md).
+    """Filter native user messages by bmux provenance.
 
     The default `human` protects the clean-intent bucket: absence of an
     `event_origins` row == human, so unmatched native user messages always pass.
@@ -858,7 +858,7 @@ def _search_rows(conn, args):
         where.append("e.actor = ?")
         params.append(args.actor)
         # Origin only means anything for user messages; --actor user defaults to
-        # clean human intent (BMUX_PROVENANCE_PLAN.md Query Behavior).
+        # clean human intent.
         if args.actor == "user":
             _append_origin(where, args, "se.session_id", "e.event_id")
     if getattr(args, "type", None):

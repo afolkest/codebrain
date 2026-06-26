@@ -1,4 +1,4 @@
-"""bmux provenance overlay (BMUX_PROVENANCE_PLAN.md / codebrain/bmux.py).
+"""bmux provenance overlay (codebrain/bmux.py).
 
 Structured provenance only: matches native user messages to bmux control
 submissions by resolved session + exact UTF-8 SHA-256, fail-closed on ambiguity.

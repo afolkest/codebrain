@@ -15,7 +15,7 @@ python3 -m codebrain ingest-pool --machine macbook --source pi
 ## Daily archaeology loop
 
 python3 -m codebrain recent
-# Sessions sorted by latest user message.
+# Sessions sorted by latest clean human user message.
 
 python3 -m codebrain recent --limit 10
 # Top 10 recent intent-bearing sessions.
@@ -33,7 +33,7 @@ python3 -m codebrain recent --json --limit 5
 # Same as recent, but scriptable JSON.
 
 python3 -m codebrain userlog
-# Newest user messages across all sessions.
+# Newest clean human messages across all sessions.
 
 python3 -m codebrain userlog --limit 20 --min-chars 80 --max-chars 700
 # Recent medium-sized user messages; often highest signal.
@@ -54,7 +54,7 @@ python3 -m codebrain search "sqlite refresh"
 # FTS search over live, authored event text.
 
 python3 -m codebrain search "ExamplePriority" --actor user --before 2026-06-11
-# Search user messages before a date; useful for decision archaeology without current-session echoes.
+# Search clean human user messages before a date; useful for decision archaeology without current-session echoes.
 
 python3 -m codebrain search "ExamplePriority" --exclude-session <session_id>
 # Explicitly remove a noisy/current session from results.
@@ -70,6 +70,23 @@ python3 -m codebrain search "ExamplePriority" --actor user --around 2
 
 python3 -m codebrain turns <session_id>
 # Show a session as user-centered turns.
+
+## bmux provenance / origins
+
+python3 -m codebrain userlog --origin all
+# Include human, bmux master-control, and unknown user-role messages.
+
+python3 -m codebrain userlog --origin master-control
+# Show prompts that bmux sent into worker sessions.
+
+python3 -m codebrain userlog --origin unknown
+# Show user-role messages that could not be safely classified as human or bmux control.
+
+python3 -m codebrain search "continue" --actor user --origin all
+# Search all native user-role messages, including bmux control messages.
+
+python3 -m codebrain bmux-sync
+# Explicitly rebuild bmux provenance labels from ~/.bmux/events/bmux.jsonl.
 
 python3 -m codebrain turns <session_id> --around-seq <seq>
 # Expand around a seq from recent/userlog/search.
@@ -135,7 +152,7 @@ python3 -m codebrain search "needle" --only-hidden
 ## Escape hatches
 
 python3 -m codebrain show <session_id>
-# Raw live transcript view. Usually start with turns instead.
+# Raw live transcript view. Usually start with turns instead. Non-human user-message origins are labeled.
 
 python3 -m codebrain show <session_id> --all
 # Raw transcript including rolled-back events.

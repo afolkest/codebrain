@@ -5,7 +5,8 @@ A searchable store of my coding-agent sessions (Claude, Codex, pi). See
 schema, and [`formats/`](formats/) for the reverse-engineered log formats.
 
 **Status:** all three sources land on one schema —
-`raw logs → per-source adapter → SQLite (3 tables) → CLI + FTS + grep + raw SQL`.
+`raw logs → per-source adapter → SQLite (canonical 3-table transcript model +
+small rebuildable overlays) → CLI + FTS + grep + raw SQL`.
 Proven on real logs: **~1,970 sessions / ~380k events** from Claude, Codex, and pi,
 ingested with zero errors (claude 90% live, codex 98%, pi 94%).
 
@@ -21,8 +22,8 @@ sessdb ingest               # first build from ~/.claude + ~/.codex + ~/.pi (rea
 Daily intent archaeology loop:
 
 ```bash
-sessdb recent               # sessions by latest live user message
-sessdb userlog              # newest live user messages across sessions
+sessdb recent               # sessions by latest clean human user message
+sessdb userlog              # newest clean human messages across sessions
 sessdb search <query>       # FTS5 over event text; add --around N for turn context
 sessdb turns <session>      # expand user-centered turns around a seq/session
 sessdb lineage <session>    # factual parent/child session lineage
@@ -40,8 +41,39 @@ manual hidden markers.
 **Reads are always current.** Read commands first delta-ingest changed local live
 logs plus synced remote pool subtrees when `~/codebrain-pool/raw` exists. The
 refresh is a stat-scan + re-parse only new/grown files, so it is usually ms when
-idle. `--no-refresh` skips both live-home and pool refresh; `sessdb ingest` is only
-for the first build or a full rebuild.
+idle. `--no-refresh` skips both live-home and pool refresh; lightweight bmux
+provenance still syncs when its event log changed so human-intent defaults stay
+clean. `sessdb ingest` is only for the first build or a full rebuild.
+
+**bmux provenance keeps master-control prompts out of user-intent retrieval.**
+When bmux sends text into a worker pane, the native agent transcript still records
+that text as a `user` message. codebrain reads `~/.bmux/events/bmux.jsonl` and
+labels matching transcript messages with an origin:
+
+```text
+human | master_control | unknown
+```
+
+Intent commands default to clean human input:
+
+```bash
+sessdb recent
+sessdb userlog
+sessdb search "query" --actor user
+```
+
+Use `--origin` when you need to inspect control messages too:
+
+```bash
+sessdb userlog --origin all
+sessdb userlog --origin master-control
+sessdb userlog --origin unknown
+sessdb search "query" --actor user --origin all
+sessdb bmux-sync             # explicitly rebuild the bmux provenance overlay
+```
+
+`sessdb turns <session>` and `sessdb show <session>` keep the transcript complete
+and label non-human user-message origins instead of hiding them.
 
 Sync / archive setup is separate from daily retrieval:
 
@@ -62,6 +94,7 @@ Ops / escape hatches:
 sessdb list                 # session metadata by start time; recent is usually better
 sessdb show <session>       # raw transcript view (--all includes rolled-back)
 sessdb grep <pattern>       # grep local live logs + synced remote pool roots
+sessdb bmux-sync            # rebuild bmux provenance labels from ~/.bmux/events/bmux.jsonl
 sessdb schema               # print the DDL for direct sqlite3 queries
 sessdb ingest-pool          # debug/repair explicit pool ingest; normal reads do this on demand
 sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
@@ -96,6 +129,8 @@ arbitrary joins — the schema is the interface (`sessdb schema`).
   `inherited`); the forest lives here, so an event can be live in one session and
   rolled-back in another.
 - **`sessions`** — metadata + lineage/sub-agent links + tip.
+- **bmux overlay tables** — rebuildable provenance labels derived from bmux's
+  event log, used to distinguish clean human input from master-control prompts.
 
 Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER BY seq`.
 

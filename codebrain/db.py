@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS ingest_state (
   session_id TEXT
 );
 
--- bmux provenance overlay (BMUX_PROVENANCE_PLAN.md). NOT part of the canonical
+-- bmux provenance overlay. NOT part of the canonical
 -- transcript model: a rebuildable derivation of bmux's own event log, joined to
 -- transcripts by resolved session + exact payload SHA-256. Drop and rebuild from
 -- ~/.bmux/events/bmux.jsonl; never mutates events/session_events.
