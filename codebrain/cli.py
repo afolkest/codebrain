@@ -43,6 +43,7 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from codebrain import bmux
 from codebrain.backfill_claude import DEFAULT_ORIGIN, backfill as backfill_claude
 from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
 from codebrain.db import DEFAULT_DB, connect, has_fts5
@@ -63,9 +64,10 @@ def _refresh_notice(local_stats, pool_stats):
         print(f"(refreshed {'; '.join(parts)})", file=sys.stderr)
 
 
-def _open(args):
+def _open(args, sync_bmux=True):
     """Connect and (unless --no-refresh) delta-ingest whatever changed on disk."""
     conn = connect(args.db)
+    transcripts_changed = False
     if not getattr(args, "no_refresh", False):
         local_stats = refresh(conn)
         pool_stats = {"files": 0, "events": 0}
@@ -73,6 +75,18 @@ def _open(args):
             pool_stats = refresh_pool(conn, Path(DEFAULT_POOL), include_local=False,
                                       local_machines=local_machine_names())
         _refresh_notice(local_stats, pool_stats)
+        transcripts_changed = bool(local_stats.get("events") or pool_stats.get("events"))
+    # bmux provenance overlay runs even under --no-refresh: because "no
+    # event_origins row == human", a stale overlay would leak master-control into
+    # the human bucket. The sync is gated (a log stat check + early return when
+    # nothing changed), so under --no-refresh it's nearly free yet still reflects a
+    # freshly-appended bmux send. Atomic (self-rolls-back, retries next read) and
+    # best-effort — a bmux-side problem must never break a read.
+    if sync_bmux:
+        try:
+            bmux.sync(conn, changed_hint=transcripts_changed)
+        except Exception as exc:  # noqa: BLE001
+            print(f"(bmux provenance skipped: {exc})", file=sys.stderr)
     return conn
 
 
@@ -194,6 +208,49 @@ def _add_visibility_args(parser) -> None:
                        help="include sessions hidden from default retrieval")
     group.add_argument("--only-hidden", action="store_true",
                        help="only show sessions hidden from default retrieval")
+
+
+ORIGIN_CHOICES = ("human", "master-control", "unknown", "all")
+# CLI origin token -> stored event_origins.origin value. A strict whitelist so the
+# value interpolated into SQL below can never be attacker/caller controlled.
+_ORIGIN_DB = {"master-control": "master_control", "unknown": "unknown"}
+
+
+def _origin_where(args, session_col="t.session_id", event_col="t.event_id"):
+    """Filter native user messages by bmux provenance (BMUX_PROVENANCE_PLAN.md).
+
+    The default `human` protects the clean-intent bucket: absence of an
+    `event_origins` row == human, so unmatched native user messages always pass.
+    Returns a SQL clause (subquery against the rebuildable overlay) or None.
+    """
+    origin = getattr(args, "origin", None) or "human"
+    if origin == "all":
+        return None
+    sub = (f"SELECT 1 FROM event_origins eo "
+           f"WHERE eo.session_id = {session_col} AND eo.event_id = {event_col}")
+    if origin == "human":
+        return f"NOT EXISTS ({sub} AND eo.origin IN ('master_control', 'unknown'))"
+    db_origin = _ORIGIN_DB.get(origin)
+    if db_origin is None:
+        return None  # unknown token (shouldn't reach here: argparse-constrained)
+    return f"EXISTS ({sub} AND eo.origin = '{db_origin}')"
+
+
+def _append_origin(where: list[str], args, session_col="t.session_id",
+                   event_col="t.event_id") -> None:
+    clause = _origin_where(args, session_col, event_col)
+    if clause:
+        where.append(clause)
+
+
+def _add_origin_args(parser, default="human") -> None:
+    parser.add_argument("--origin", choices=ORIGIN_CHOICES, default=default,
+                        help="provenance of native user messages (default %(default)s; "
+                             "bmux master-control kept out of the human-intent bucket)")
+
+
+def _origin_label(origin) -> str:
+    return f" ({origin})" if origin and origin != "human" else ""
 
 
 def _timestamp_where(column: str, op: str) -> str:
@@ -457,6 +514,7 @@ def _user_message_where(args):
     ]
     params: list = []
     _append_visibility(where, args)
+    _append_origin(where, args)  # default: clean human intent only
     if not getattr(args, "include_subagents", False):
         where.append(_not_subagent_session_sql())
     if not getattr(args, "include_inherited", False):
@@ -490,10 +548,12 @@ def _userlog_rows(conn, args):
     return conn.execute(
         f"""
         SELECT t.ts, s.source, t.session_id, t.seq, t.event_id, s.cwd, s.title,
-               s.hidden_at, s.hidden_reason,
+               s.hidden_at, s.hidden_reason, eo.origin AS origin,
                t.text, length(COALESCE(t.text, '')) AS chars
         FROM transcript t
         JOIN sessions s ON s.session_id = t.session_id
+        LEFT JOIN event_origins eo
+               ON eo.session_id = t.session_id AND eo.event_id = t.event_id
         WHERE {' AND '.join(where)}
         ORDER BY t.ts DESC, t.session_id DESC, t.seq DESC
         LIMIT ?
@@ -510,9 +570,11 @@ def _recent_rows(conn, args):
         f"""
         WITH user_hits AS (
           SELECT t.session_id, t.ts, t.seq, t.event_id, t.text,
-                 length(COALESCE(t.text, '')) AS chars
+                 length(COALESCE(t.text, '')) AS chars, eo.origin AS origin
           FROM transcript t
           JOIN sessions s ON s.session_id = t.session_id
+          LEFT JOIN event_origins eo
+                 ON eo.session_id = t.session_id AND eo.event_id = t.event_id
           WHERE {' AND '.join(where)}
         ), ranked AS (
           SELECT user_hits.*,
@@ -529,7 +591,7 @@ def _recent_rows(conn, args):
         )
         SELECT r.ts AS last_user_ts, s.source, r.session_id,
                r.seq AS last_user_seq, r.event_id AS last_user_event_id,
-               s.cwd, s.title, r.text AS last_user_text,
+               s.cwd, s.title, r.text AS last_user_text, r.origin AS last_user_origin,
                s.hidden_at, s.hidden_reason,
                r.chars AS last_user_chars, r.user_msg_count,
                COALESCE(l.live_event_count, 0) AS live_event_count
@@ -559,7 +621,8 @@ def cmd_recent(args):
             seq = r["last_user_seq"]
             print(f"{(r['last_user_ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
             print(f"session: {sid}")
-            print(f"seq: {seq}  users: {r['user_msg_count']}  events: {r['live_event_count']}")
+            print(f"seq: {seq}  users: {r['user_msg_count']}  events: {r['live_event_count']}"
+                  f"{_origin_label(r['last_user_origin'])}")
             if r["title"]:
                 print(_wrapped("title: ", r["title"], 120))
             if r["hidden_at"]:
@@ -584,7 +647,7 @@ def cmd_userlog(args):
             seq = r["seq"]
             print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
             print(f"session: {sid}")
-            print(f"seq: {seq}  chars: {r['chars']}")
+            print(f"seq: {seq}  chars: {r['chars']}{_origin_label(r['origin'])}")
             if r["hidden_at"]:
                 print(f"hidden: {r['hidden_reason'] or r['hidden_at']}")
             print(_wrapped("user: ", r["text"], 0 if args.full else 320))
@@ -593,12 +656,16 @@ def cmd_userlog(args):
 
 
 def _turn_rows(conn, session_id: str, include_all: bool):
-    where = "WHERE session_id=?" + ("" if include_all else " AND live=1")
+    where = "WHERE t.session_id=?" + ("" if include_all else " AND t.live=1")
     return conn.execute(
         f"""
-        SELECT seq, event_id, ts, actor, type, text, refs, live, inherited
-        FROM transcript {where}
-        ORDER BY seq
+        SELECT t.seq, t.event_id, t.ts, t.actor, t.type, t.text, t.refs,
+               t.live, t.inherited, eo.origin AS origin
+        FROM transcript t
+        LEFT JOIN event_origins eo
+               ON eo.session_id = t.session_id AND eo.event_id = t.event_id
+        {where}
+        ORDER BY t.seq
         """,
         (session_id,),
     ).fetchall()
@@ -619,6 +686,7 @@ def _build_turns(rows):
             "user_text": user_row["text"] if user_row is not None else None,
             "user_live": user_row["live"] if user_row is not None else None,
             "user_inherited": user_row["inherited"] if user_row is not None else None,
+            "user_origin": user_row["origin"] if user_row is not None else None,
             "events": [],
         }
 
@@ -693,7 +761,8 @@ def _turn_json(t, args):
         "turn_index": t["turn_index"], "seq_start": t["seq_start"], "seq_end": t["seq_end"],
         "ts": t["ts"], "user_seq": t["user_seq"], "user_event_id": t["user_event_id"],
         "user_text": t["user_text"], "user_live": t["user_live"],
-        "user_inherited": t["user_inherited"], "hidden_tool_events": hidden,
+        "user_inherited": t["user_inherited"], "user_origin": t["user_origin"],
+        "hidden_tool_events": hidden,
         "events": events,
     }
 
@@ -706,7 +775,9 @@ def _print_turns(turns, args, indent=""):
             print(f"{indent}user: <none>")
         else:
             suffix = _placement_suffix(t["user_live"], t["user_inherited"])
-            print(_wrapped(f"{indent}user[{t['user_seq']}]{suffix}: ", t["user_text"], args.user_chars))
+            origin = _origin_label(t["user_origin"])
+            print(_wrapped(f"{indent}user[{t['user_seq']}]{suffix}{origin}: ",
+                           t["user_text"], args.user_chars))
         hidden = 0
         for e in t["events"]:
             is_tool = e["type"] in ("tool_call", "tool_result") or e["actor"] == "tool"
@@ -746,14 +817,22 @@ def cmd_show(args):
     s = conn.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
     print(f"session {sid}")
     print(f"  cwd={s['cwd']}  started={s['started_at']}  title={s['title']}")
-    where = "WHERE session_id=?" + ("" if args.all else " AND live=1")
+    where = "WHERE t.session_id=?" + ("" if args.all else " AND t.live=1")
     rows = conn.execute(
-        f"SELECT seq, ts, actor, type, text, refs, live FROM transcript {where} ORDER BY seq",
+        f"""
+        SELECT t.seq, t.ts, t.actor, t.type, t.text, t.refs, t.live, eo.origin AS origin
+        FROM transcript t
+        LEFT JOIN event_origins eo
+               ON eo.session_id = t.session_id AND eo.event_id = t.event_id
+        {where}
+        ORDER BY t.seq
+        """,
         (sid,),
     ).fetchall()
     glyph = {"message": " ", "tool_call": "⚙", "tool_result": "↩"}
     for r in rows:
         dead = "" if r["live"] else " (rolled-back)"
+        origin = _origin_label(r["origin"])
         refs = json.loads(r["refs"] or "{}")
         extra = ""
         if refs.get("commands"):
@@ -761,7 +840,7 @@ def cmd_show(args):
         elif refs.get("files"):
             extra = f"  → {', '.join(refs['files'][:3])}"
         print(f"[{r['seq']:>4}] {r['actor']:9} {glyph.get(r['type'],' ')} "
-              f"{_oneline(r['text'], 160)}{extra}{dead}")
+              f"{_oneline(r['text'], 160)}{extra}{origin}{dead}")
     conn.close()
 
 
@@ -778,6 +857,10 @@ def _search_rows(conn, args):
     if getattr(args, "actor", None):
         where.append("e.actor = ?")
         params.append(args.actor)
+        # Origin only means anything for user messages; --actor user defaults to
+        # clean human intent (BMUX_PROVENANCE_PLAN.md Query Behavior).
+        if args.actor == "user":
+            _append_origin(where, args, "se.session_id", "e.event_id")
     if getattr(args, "type", None):
         where.append("e.type = ?")
         params.append(args.type)
@@ -817,12 +900,14 @@ def _search_rows(conn, args):
         f"""
         SELECT e.event_id, e.actor, e.type, e.text, se.session_id, se.seq,
                se.inherited, e.ts, s.source, s.cwd, s.title,
-               s.hidden_at, s.hidden_reason,
+               s.hidden_at, s.hidden_reason, eo.origin AS origin,
                snippet(events_fts, 0, '[', ']', '…', 12) AS snip
         FROM events_fts
         JOIN events e ON e.rowid = events_fts.rowid
         JOIN session_events se ON se.event_id = e.event_id
         JOIN sessions s ON s.session_id = se.session_id
+        LEFT JOIN event_origins eo
+               ON eo.session_id = se.session_id AND eo.event_id = e.event_id
         WHERE {' AND '.join(where)}
         ORDER BY rank, e.ts DESC, se.session_id DESC, se.seq DESC
         LIMIT ?
@@ -836,7 +921,7 @@ def _search_row_json(r):
         "ts": r["ts"], "source": r["source"], "session_id": r["session_id"],
         "seq": r["seq"], "event_id": r["event_id"], "cwd": r["cwd"],
         "title": r["title"], "actor": r["actor"], "type": r["type"],
-        "inherited": r["inherited"], "hidden_at": r["hidden_at"],
+        "inherited": r["inherited"], "origin": r["origin"], "hidden_at": r["hidden_at"],
         "hidden_reason": r["hidden_reason"], "snippet": r["snip"], "text": r["text"],
         "expand_command": f"sessdb turns {r['session_id']} --around-seq {r['seq']}",
     }
@@ -873,7 +958,8 @@ def cmd_search(args):
         for r in rows:
             print(f"{(r['ts'] or '')[:19]}  {r['source']}  {_short_path(r['cwd'])}")
             print(f"session: {r['session_id']}")
-            print(f"seq: {r['seq']}  event: {r['event_id']}  {r['actor']}/{r['type']}")
+            print(f"seq: {r['seq']}  event: {r['event_id']}  "
+                  f"{r['actor']}/{r['type']}{_origin_label(r['origin'])}")
             if r["hidden_at"]:
                 print(f"hidden: {r['hidden_reason'] or r['hidden_at']}")
             print(_wrapped("match: ", r["snip"], width=100))
@@ -1498,6 +1584,19 @@ def _grep_command(pattern: str, paths: list[str], rg: str | None):
     return ["grep", "-rn", "--exclude-dir=file-history", "--", pattern, *paths]
 
 
+def cmd_bmux_sync(args):
+    # Skip the automatic default-log hook in _open: this command rebuilds the
+    # overlay explicitly (and possibly against a custom --log), so the hook would
+    # be redundant or fight a non-default path.
+    conn = _open(args, sync_bmux=False)
+    path = Path(args.log) if args.log else bmux._default_log()
+    stats = bmux.sync(conn, path, force=True)
+    print("bmux provenance: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    if not path.exists():
+        print(f"(no bmux event log at {path})", file=sys.stderr)
+    conn.close()
+
+
 def cmd_schema(args):
     from codebrain.db import SCHEMA
     print(SCHEMA)
@@ -1589,6 +1688,7 @@ def main(argv=None):
     sp.add_argument("--full", action="store_true", help="do not truncate last user preview")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     _add_visibility_args(sp)
+    _add_origin_args(sp)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_recent)
 
@@ -1607,6 +1707,7 @@ def main(argv=None):
     sp.add_argument("--full", action="store_true", help="do not truncate message text")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     _add_visibility_args(sp)
+    _add_origin_args(sp)
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_userlog)
 
@@ -1664,6 +1765,7 @@ def main(argv=None):
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     _add_visibility_args(sp)
+    _add_origin_args(sp)  # applied only with --actor user
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_search)
 
@@ -1721,6 +1823,12 @@ def main(argv=None):
         help="optional raw-log paths; when provided, replace the default search scope",
     )
     sp.set_defaults(func=cmd_grep)
+
+    sp = sub.add_parser("bmux-sync",
+                        help="rebuild the bmux provenance overlay from the bmux event log")
+    sp.add_argument("--log", help=f"bmux event log path (default {bmux.DEFAULT_BMUX_LOG})")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_bmux_sync)
 
     sp = sub.add_parser("schema", help="print the DDL")
     sp.set_defaults(func=cmd_schema)

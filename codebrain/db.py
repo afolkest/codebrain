@@ -71,6 +71,45 @@ CREATE TABLE IF NOT EXISTS ingest_state (
   session_id TEXT
 );
 
+-- bmux provenance overlay (BMUX_PROVENANCE_PLAN.md). NOT part of the canonical
+-- transcript model: a rebuildable derivation of bmux's own event log, joined to
+-- transcripts by resolved session + exact payload SHA-256. Drop and rebuild from
+-- ~/.bmux/events/bmux.jsonl; never mutates events/session_events.
+CREATE TABLE IF NOT EXISTS bmux_control_submissions (
+  send_id              TEXT,
+  launch_id            TEXT,
+  kind                 TEXT NOT NULL,   -- bmux.send_submitted | bmux.launch_prompt_submitted
+  submitted_at         TEXT NOT NULL,
+  codebrain_session_id TEXT,            -- resolved (NULL if launch_id unresolved)
+  payload_sha256       TEXT NOT NULL,
+  payload_byte_count   INTEGER,
+  payload_line_count   INTEGER,
+  master_id            TEXT,
+  resolved_via         TEXT,            -- which field produced the launch_id/session
+  raw_event            TEXT NOT NULL,
+  PRIMARY KEY (kind, send_id, launch_id, submitted_at)
+);
+
+-- Per (session, event) provenance verdict — single verdict per placement (PK is
+-- (session_id, event_id)). Absence of a row == clean human input (the default
+-- bucket); a row records a non-human classification, with evidence_kind naming
+-- the deriver that produced it. Today only the bmux deriver writes here, and it
+-- rebuilds its own rows wholesale (DELETE WHERE evidence_kind='bmux'); a second
+-- deriver would need a verdict-precedence policy, not just this column.
+CREATE TABLE IF NOT EXISTS event_origins (
+  session_id    TEXT NOT NULL,
+  event_id      TEXT NOT NULL,
+  origin        TEXT NOT NULL,          -- master_control | unknown | human
+  evidence_kind TEXT,                   -- 'bmux' for this overlay
+  evidence_id   TEXT,                   -- send_id / launch_id of the matched event
+  reason        TEXT,
+  PRIMARY KEY (session_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_bcs_session_sha
+  ON bmux_control_submissions(codebrain_session_id, payload_sha256);
+CREATE INDEX IF NOT EXISTS ix_eo_origin ON event_origins(origin);
+
 CREATE VIEW IF NOT EXISTS transcript AS
   SELECT se.session_id, se.seq, e.event_id, e.ts, e.actor, e.type,
          e.text, e.refs, e.tool_call_event_id, se.parent_event_id,
