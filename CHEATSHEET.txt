@@ -71,6 +71,10 @@ python3 -m codebrain search "ExamplePriority" --actor user --around 2
 python3 -m codebrain turns <session_id>
 # Show a session as user-centered turns.
 
+python3 -m codebrain turns <session_id> --turn -1
+# Show a single turn: the most recent live user/master prompt and its response.
+# N>=0 selects by turn_index; N<0 counts back from the end (-2 = previous turn).
+
 ## bmux provenance / origins
 
 python3 -m codebrain userlog --origin all

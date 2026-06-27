@@ -731,6 +731,14 @@ def _turn_window(turns, args):
     return turns[lo:hi]
 
 
+def _select_turn(turns, n):
+    """Pick a single turn by index. n>=0 is turn_index; n<0 counts back from
+    the end of the (live unless --all) turn list. Returns None if out of range."""
+    if -len(turns) <= n < len(turns):
+        return turns[n]
+    return None
+
+
 def _event_preview(e, chars):
     return (e["text"] or "") if chars == 0 else _oneline(e["text"], chars)
 
@@ -798,7 +806,17 @@ def cmd_turns(args):
         print(f"no session matching {args.session!r}", file=sys.stderr)
         sys.exit(1)
     rows = _turn_rows(conn, sid, args.all)
-    turns = _turn_window(_build_turns(rows), args)
+    all_turns = _build_turns(rows)
+    if getattr(args, "turn", None) is not None:
+        t = _select_turn(all_turns, args.turn)
+        if t is None and not args.json:
+            print(f"turn {args.turn} out of range "
+                  f"(session has {len(all_turns)} turn(s))", file=sys.stderr)
+            conn.close()
+            sys.exit(1)
+        turns = [t] if t is not None else []
+    else:
+        turns = _turn_window(all_turns, args)
     if args.json:
         json.dump([_turn_json(t, args) for t in turns], sys.stdout, ensure_ascii=False)
         print()
@@ -1713,7 +1731,11 @@ def main(argv=None):
 
     sp = sub.add_parser("turns", help="display a session as user-centered turns")
     sp.add_argument("session")
-    sp.add_argument("--around-seq", type=int, help="show turns around this transcript seq")
+    grp = sp.add_mutually_exclusive_group()
+    grp.add_argument("--around-seq", type=int, help="show turns around this transcript seq")
+    grp.add_argument("--turn", type=int, metavar="N",
+                     help="show a single turn; N>=0 by turn_index, N<0 from the end "
+                          "(-1 = most recent live turn)")
     sp.add_argument("--context-turns", type=int, default=2,
                     help="turns before/after --around-seq (default 2)")
     sp.add_argument("--limit", type=int, default=50,

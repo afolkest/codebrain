@@ -26,6 +26,7 @@ sessdb recent               # sessions by latest clean human user message
 sessdb userlog              # newest clean human messages across sessions
 sessdb search <query>       # FTS5 over event text; add --around N for turn context
 sessdb turns <session>      # expand user-centered turns around a seq/session
+sessdb turns <session> --turn -1   # latest live turn for worker inspection
 sessdb lineage <session>    # factual parent/child session lineage
 sessdb refs <session>       # conversation -> files/commands/commits
 sessdb touched <path>       # file/artifact -> sessions/events

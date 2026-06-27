@@ -40,6 +40,18 @@ class TestTurnsCli(unittest.TestCase):
             cli.main(["--db", str(self.db_path), *args])
         return out.getvalue()
 
+    def run_cli_capture(self, *args):
+        """Run the CLI capturing stdout, stderr, and the exit code (None if no
+        SystemExit was raised)."""
+        self.conn.commit()
+        out, err, code = io.StringIO(), io.StringIO(), None
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                cli.main(["--db", str(self.db_path), *args])
+            except SystemExit as e:
+                code = e.code
+        return out.getvalue(), err.getvalue(), code
+
     def seed(self):
         _add(self.conn, eid="pi:u0", seq=0, ts="2026-01-01T00:01:00Z",
              text="first user request")
@@ -94,6 +106,66 @@ class TestTurnsCli(unittest.TestCase):
         self.seed()
         out = self.run_cli("turns", "pi:S", "--no-refresh", "--all", "--limit", "10")
         self.assertIn("user[8] (rolled-back): dead user request", out)
+
+    def test_turn_negative_one_returns_latest_live_turn(self):
+        self.seed()
+        out = self.run_cli("turns", "pi:S", "--no-refresh", "--turn", "-1")
+        self.assertIn("turn 2  seq 6..7", out)
+        self.assertIn("user[6]: third user request", out)
+        self.assertNotIn("second user request", out)
+        self.assertNotIn("first user request", out)
+        # default excludes rolled-back, so the dead turn is never "latest"
+        self.assertNotIn("dead user request", out)
+
+    def test_turn_negative_two_returns_previous_turn(self):
+        self.seed()
+        out = self.run_cli("turns", "pi:S", "--no-refresh", "--turn", "-2")
+        self.assertIn("turn 1  seq 4..5", out)
+        self.assertIn("user[4]: second user request", out)
+        self.assertNotIn("third user request", out)
+        self.assertNotIn("first user request", out)
+
+    def test_turn_zero_returns_first_turn(self):
+        self.seed()
+        out = self.run_cli("turns", "pi:S", "--no-refresh", "--turn", "0")
+        self.assertIn("turn 0  seq 0..3", out)
+        self.assertIn("user[0]: first user request", out)
+        self.assertNotIn("second user request", out)
+        self.assertNotIn("third user request", out)
+
+    def test_turn_out_of_range_positive_text_errors(self):
+        self.seed()
+        out, err, code = self.run_cli_capture("turns", "pi:S", "--no-refresh", "--turn", "3")
+        self.assertEqual(code, 1)
+        self.assertIn("out of range", err)
+        self.assertNotIn("turn ", out)
+
+    def test_turn_out_of_range_negative_text_errors(self):
+        self.seed()
+        out, err, code = self.run_cli_capture("turns", "pi:S", "--no-refresh", "--turn", "-4")
+        self.assertEqual(code, 1)
+        self.assertIn("out of range", err)
+        self.assertNotIn("turn ", out)
+
+    def test_turn_json_returns_single_turn(self):
+        self.seed()
+        out = self.run_cli("turns", "pi:S", "--no-refresh", "--turn", "-1", "--json")
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["turn_index"], 2)
+        self.assertEqual(rows[0]["user_seq"], 6)
+
+    def test_turn_json_out_of_range_is_empty_array(self):
+        self.seed()
+        out = self.run_cli("turns", "pi:S", "--no-refresh", "--turn", "9", "--json")
+        self.assertEqual(json.loads(out), [])
+
+    def test_turn_rejects_around_seq(self):
+        self.seed()
+        _, err, code = self.run_cli_capture(
+            "turns", "pi:S", "--no-refresh", "--turn", "0", "--around-seq", "4")
+        self.assertEqual(code, 2)
+        self.assertIn("not allowed with", err)
 
 
 if __name__ == "__main__":
