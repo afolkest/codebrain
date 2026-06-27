@@ -184,7 +184,9 @@ Per source (mechanics in the format docs):
 If `A` later rolls back past `E`, only `A`'s row flips to `live=0`; `B`'s stays `live=1`.
 
 ## Derived layers (out of scope, for orientation)
-- **FTS5** over `events.text`; **sqlite-vec** over chunked `events.text`; a **files index** unrolling `refs.files` → `(file, event_id, session_id)`; **grep** runs over the raw pool directly.
+- **FTS5** over `events.text`; **sqlite-vec** over chunked `events.text` (later); **grep** runs over the raw pool directly.
+- **`file_refs`** (built) — `events.refs.files` unrolled to `(event_id, file, basename)`, indexed on `basename`, so `touched` is an indexed lookup instead of a `json_array_length` scan over every event. Keyed on `event_id` (content); placement/visibility come from the `session_events` join. A rebuildable derivation: populated on first event insert and one-time-backfilled for older caches. `basename` is normalized by `codebrain.paths` (the same code the query side uses) so an indexed basename lookup never misses a real match.
+- The intent-browsing commands are index-served at corpus scale: `ix_ev_actor_type_ts` on `events(actor, type, ts)` backs `userlog`/`recent`; a one-time bounded `ANALYZE` (`sqlite_stat1`) keeps the planner from mis-choosing it.
 
 ## Intentionally excluded
 - **Reasoning / thinking** — not normalized (kept in raw only); makes "redact thinking" the default, not a filter.

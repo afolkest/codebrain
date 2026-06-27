@@ -121,6 +121,18 @@ class TestTouchedCli(unittest.TestCase):
         ))
         self.assertEqual([m["file"] for m in model["matches"]], ["docs/wip/foo.md"])
 
+    def test_touched_prefix_reconciles_relative_ref_against_session_cwd(self):
+        # An ABSOLUTE prefix query must still match a RELATIVE ref via the session's
+        # cwd. The files-index candidate cannot see that reconciliation, so prefix
+        # mode uses the full file-bearing superset and lets the Python matcher decide.
+        # (Regression guard: a basename/raw-file prefilter silently dropped this.)
+        _event(self.conn, sid="pi:R", cwd="/repo/example-project", eid="pi:r1", seq=0,
+               ts="2026-01-05T00:00:00Z", text="edit", typ="tool_call",
+               refs={"files": ["src/app.py"], "commands": []})
+        model = json.loads(self.run_cli(
+            "touched", "/repo/example-project/src", "--prefix", "--no-refresh", "--json"))
+        self.assertEqual([m["file"] for m in model["matches"]], ["src/app.py"])
+
     def test_touched_live_inherited_and_all_scoping(self):
         _event(self.conn, eid="pi:live", seq=0, ts="2026-01-01T00:00:00Z",
                text="live file", refs={"files": ["live.md"], "commands": []})

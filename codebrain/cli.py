@@ -47,6 +47,7 @@ from codebrain import bmux
 from codebrain.backfill_claude import DEFAULT_ORIGIN, backfill as backfill_claude
 from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
 from codebrain.db import DEFAULT_DB, connect, has_fts5
+from codebrain.paths import path_basename as _path_basename, path_norm as _path_norm
 from codebrain.ingest import (
     DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES,
     discover_pool_roots, ingest_all, ingest_source, local_machine_names, refresh,
@@ -501,8 +502,13 @@ def _not_subagent_session_sql() -> str:
     """
 
 
-def _user_message_where(args):
-    """Shared filters for user-intent browsing commands."""
+def _user_message_where(args, skip_subagent_guard=False):
+    """Shared filters for user-intent browsing commands.
+
+    skip_subagent_guard drops the session-level not-subagent json_each clause for
+    callers that have already vetted the session (e.g. the per-session count) — it
+    is a session property, and keeping it per message would force a full-index scan.
+    """
     where = [
         "t.live = 1",
         "t.actor = 'user'",
@@ -515,7 +521,7 @@ def _user_message_where(args):
     params: list = []
     _append_visibility(where, args)
     _append_origin(where, args)  # default: clean human intent only
-    if not getattr(args, "include_subagents", False):
+    if not skip_subagent_guard and not getattr(args, "include_subagents", False):
         where.append(_not_subagent_session_sql())
     if not getattr(args, "include_inherited", False):
         where.append("t.inherited = 0")  # pi resume copies are context, not new user intent
@@ -563,47 +569,78 @@ def _userlog_rows(conn, args):
 
 
 def _recent_rows(conn, args):
-    """Sessions ranked by latest matching user message, not latest agent event."""
+    """Sessions ranked by latest clean user message, not latest agent event.
+
+    Streams user messages newest-first off ix_ev_actor_type_ts and keeps each
+    session's first (= latest) clean message, stopping once the page is full — so
+    `events.text` is read for ~limit sessions, not for all ~80k user messages. The
+    old window-function scan read every one (to apply the clean-intent text filters)
+    and a GROUP BY over the whole forest for the live counts; both were ~17s."""
     where, params = _user_message_where(args)
-    params.append(args.limit)
-    return conn.execute(
+    limit = args.limit
+    if limit == 0:
+        return []  # match the old SQL LIMIT 0 (no rows); negative stays unlimited
+    cur = conn.execute(
         f"""
-        WITH user_hits AS (
-          SELECT t.session_id, t.ts, t.seq, t.event_id, t.text,
-                 length(COALESCE(t.text, '')) AS chars, eo.origin AS origin
-          FROM transcript t
-          JOIN sessions s ON s.session_id = t.session_id
-          LEFT JOIN event_origins eo
-                 ON eo.session_id = t.session_id AND eo.event_id = t.event_id
-          WHERE {' AND '.join(where)}
-        ), ranked AS (
-          SELECT user_hits.*,
-                 COUNT(*) OVER (PARTITION BY session_id) AS user_msg_count,
-                 ROW_NUMBER() OVER (
-                   PARTITION BY session_id ORDER BY ts DESC, seq DESC
-                 ) AS rn
-          FROM user_hits
-        ), live_counts AS (
-          SELECT session_id, COUNT(*) AS live_event_count
-          FROM session_events
-          WHERE live = 1
-          GROUP BY session_id
-        )
-        SELECT r.ts AS last_user_ts, s.source, r.session_id,
-               r.seq AS last_user_seq, r.event_id AS last_user_event_id,
-               s.cwd, s.title, r.text AS last_user_text, r.origin AS last_user_origin,
-               s.hidden_at, s.hidden_reason,
-               r.chars AS last_user_chars, r.user_msg_count,
-               COALESCE(l.live_event_count, 0) AS live_event_count
-        FROM ranked r
-        JOIN sessions s ON s.session_id = r.session_id
-        LEFT JOIN live_counts l ON l.session_id = r.session_id
-        WHERE r.rn = 1
-        ORDER BY r.ts DESC, r.session_id DESC
-        LIMIT ?
+        SELECT t.session_id, t.ts, t.seq, t.event_id, t.text,
+               length(COALESCE(t.text, '')) AS chars, eo.origin AS origin,
+               s.source, s.cwd, s.title, s.hidden_at, s.hidden_reason
+        FROM transcript t
+        JOIN sessions s ON s.session_id = t.session_id
+        LEFT JOIN event_origins eo
+               ON eo.session_id = t.session_id AND eo.event_id = t.event_id
+        WHERE {' AND '.join(where)}
+        ORDER BY t.ts DESC, t.session_id DESC, t.seq DESC
         """,
         params,
-    ).fetchall()
+    )
+    chosen: dict = {}
+    for r in cur:  # streamed in ts-desc order; first hit per session is its latest
+        sid = r["session_id"]
+        if sid not in chosen:
+            chosen[sid] = r
+            if limit > 0 and len(chosen) >= limit:  # limit<0 => unlimited (old LIMIT -1)
+                break
+    cur.close()  # we broke early on purpose; release the read cursor before the counts
+    # The stream gives ts-desc order with index/rowid tie-breaks; sort the page
+    # explicitly so display order is deterministic (ts desc, then session_id desc),
+    # matching the old ORDER BY. Cheap — it is at most `limit` rows.
+    page = sorted(chosen.values(),
+                  key=lambda r: (r["ts"] or "", r["session_id"]), reverse=True)
+    rows = []
+    for r in page:
+        sid = r["session_id"]
+        rows.append({
+            "last_user_ts": r["ts"], "source": r["source"], "session_id": sid,
+            "last_user_seq": r["seq"], "last_user_event_id": r["event_id"],
+            "cwd": r["cwd"], "title": r["title"], "last_user_text": r["text"],
+            "last_user_origin": r["origin"], "hidden_at": r["hidden_at"],
+            "hidden_reason": r["hidden_reason"], "last_user_chars": r["chars"],
+            "user_msg_count": _session_user_msg_count(conn, sid, args),
+            # one indexed COUNT per displayed session (ix_se_session_live_seq), not a
+            # GROUP BY over the whole 1M-row forest as the old live_counts CTE did.
+            "live_event_count": conn.execute(
+                "SELECT COUNT(*) FROM session_events WHERE session_id=? AND live=1",
+                (sid,),
+            ).fetchone()[0],
+        })
+    return rows
+
+
+def _session_user_msg_count(conn, sid, args):
+    """Clean user-message count for one session, under the same intent filters that
+    drive the listing — read for only the handful of sessions actually displayed.
+    Skips the not-subagent json_each guard: this session was already vetted by it
+    during selection (a session property), and re-running it per message would make
+    the count drive off the wrong index."""
+    where, params = _user_message_where(args, skip_subagent_guard=True)
+    where.append("t.session_id = ?")
+    params.append(sid)
+    return conn.execute(
+        f"SELECT COUNT(*) FROM transcript t JOIN sessions s ON s.session_id = t.session_id "
+        f"WHERE {' AND '.join(where)}",
+        params,
+    ).fetchone()[0]
 
 
 def cmd_recent(args):
@@ -1144,22 +1181,8 @@ def cmd_refs(args):
     conn.close()
 
 
-def _path_norm(value):
-    s = str(value or "").strip().replace("\\", "/")
-    if s == "~" or s.startswith("~/"):
-        s = str(Path.home()).replace("\\", "/") + s[1:]
-    while s.startswith("./"):
-        s = s[2:]
-    return s
-
-
 def _path_is_absolute_or_home(value):
     return _path_norm(value).startswith("/")
-
-
-def _path_basename(value):
-    value = _path_norm(value).rstrip("/")
-    return value.rsplit("/", 1)[-1] if value else ""
 
 
 def _path_with_cwd(value, cwd):
@@ -1266,8 +1289,24 @@ def _touched_row_json(conn, r, file_value, args):
 
 
 def _touched_candidates(conn, args):
-    where = ["json_valid(t.refs)", "COALESCE(json_array_length(t.refs, '$.files'), 0) > 0"]
-    params: list = []
+    # Narrow to events whose file refs can match BEFORE joining placements, via the
+    # files index (db.file_refs) instead of a json_array_length scan over every
+    # event. The Python matcher (_touched_file_matches) stays the final arbiter, so
+    # the SQL candidate only needs to be a SUPERSET of what it accepts.
+    if _touched_mode(args) == "prefix":
+        # A prefix match reconciles a relative ref against the session's cwd (e.g. an
+        # absolute query matching a relative ref), which a per-event index can't see —
+        # so narrowing on file_refs would DROP real matches. Fall back to the exact
+        # old candidate (every file-bearing event); Python reconciles. Prefix is rare.
+        where = ["json_valid(t.refs)",
+                 "COALESCE(json_array_length(t.refs, '$.files'), 0) > 0"]
+        params: list = []
+    else:
+        # basename is a NECESSARY condition for basename/path modes (every branch of
+        # _path_exact_or_suffix_match preserves it), so an indexed basename lookup is
+        # an exact candidate superset — the fast path.
+        where = ["t.event_id IN (SELECT fr.event_id FROM file_refs fr WHERE fr.basename = ?)"]
+        params = [_path_basename(args.path)]
     _append_visibility(where, args)
     if not args.all:
         where.append("t.live = 1")
@@ -1564,7 +1603,9 @@ def cmd_lineage(args):
 def cmd_grep(args):
     rg = shutil.which("rg")
     paths = args.paths if args.paths else _default_grep_roots()
-    cmd = _grep_command(args.pattern, paths, rg)
+    cmd = _grep_command(args.pattern, paths, rg,
+                        count=getattr(args, "count", False),
+                        files_only=getattr(args, "files_only", False))
     if cmd is None:
         sys.exit(1)
     sys.exit(subprocess.call(cmd))
@@ -1593,13 +1634,18 @@ def _default_grep_roots():
     return existing
 
 
-def _grep_command(pattern: str, paths: list[str], rg: str | None):
+def _grep_command(pattern: str, paths: list[str], rg: str | None,
+                  count: bool = False, files_only: bool = False):
     paths = [p for p in paths if "file-history" not in Path(p).parts]
     if not paths:
         return None
+    # -l (files-with-matches) and -c (count per file) let an agent locate a string
+    # without ingesting the raw-JSONL firehose, then pivot to `turns`. Same flags in
+    # ripgrep and grep; argparse keeps the two mutually exclusive, -l winning if not.
+    mode = ["-l"] if files_only else (["-c"] if count else [])
     if rg:
-        return [rg, "--glob", "!**/file-history/**", "--", pattern, *paths]
-    return ["grep", "-rn", "--exclude-dir=file-history", "--", pattern, *paths]
+        return [rg, *mode, "--glob", "!**/file-history/**", "--", pattern, *paths]
+    return ["grep", "-rn", *mode, "--exclude-dir=file-history", "--", pattern, *paths]
 
 
 def cmd_bmux_sync(args):
@@ -1844,6 +1890,11 @@ def main(argv=None):
         nargs="*",
         help="optional raw-log paths; when provided, replace the default search scope",
     )
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("-l", "--files-with-matches", dest="files_only", action="store_true",
+                   help="print only the raw-log file paths that contain a match")
+    g.add_argument("-c", "--count", action="store_true",
+                   help="print a match count per file instead of matching lines")
     sp.set_defaults(func=cmd_grep)
 
     sp = sub.add_parser("bmux-sync",

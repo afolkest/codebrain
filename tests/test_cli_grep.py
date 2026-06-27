@@ -110,6 +110,36 @@ class TestGrepCli(unittest.TestCase):
 
         self.assertIsNone(cmd)
 
+    def test_files_with_matches_flag_passes_through(self):
+        rg = cli._grep_command("needle", ["/tmp/.claude"], "rg", files_only=True)
+        self.assertEqual(rg, ["rg", "-l", "--glob", "!**/file-history/**", "--",
+                              "needle", "/tmp/.claude"])
+        grep = cli._grep_command("needle", ["/tmp/.claude"], None, files_only=True)
+        self.assertEqual(grep, ["grep", "-rn", "-l", "--exclude-dir=file-history", "--",
+                                "needle", "/tmp/.claude"])
+
+    def test_count_flag_passes_through(self):
+        rg = cli._grep_command("needle", ["/tmp/.claude"], "rg", count=True)
+        self.assertEqual(rg, ["rg", "-c", "--glob", "!**/file-history/**", "--",
+                              "needle", "/tmp/.claude"])
+
+    def test_files_only_wins_over_count(self):
+        cmd = cli._grep_command("needle", ["/tmp/.claude"], "rg", count=True, files_only=True)
+        self.assertIn("-l", cmd)
+        self.assertNotIn("-c", cmd)
+
+    def test_grep_l_flag_wires_through_main_to_command(self):
+        with mock.patch("codebrain.cli._default_grep_roots", return_value=["/tmp/.claude"]), \
+             mock.patch("codebrain.cli.shutil.which", return_value="rg"), \
+             mock.patch("codebrain.cli.subprocess.call", return_value=0) as call:
+            with self.assertRaises(SystemExit) as cm:
+                cli.main(["grep", "-l", "needle"])
+
+        self.assertEqual(cm.exception.code, 0)
+        call.assert_called_once_with(
+            ["rg", "-l", "--glob", "!**/file-history/**", "--", "needle", "/tmp/.claude"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

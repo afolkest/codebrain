@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from codebrain.adapters.base import EventRow, PlacementRow, SessionRow
+from codebrain.paths import path_basename
 
 DEFAULT_DB = Path(os.environ.get("CODEBRAIN_DB", Path.home() / ".codebrain" / "codebrain.db"))
 
@@ -60,6 +61,27 @@ CREATE INDEX IF NOT EXISTS ix_se_session_live_seq ON session_events(session_id, 
 CREATE INDEX IF NOT EXISTS ix_se_event           ON session_events(event_id);
 CREATE INDEX IF NOT EXISTS ix_se_parent          ON session_events(parent_event_id);
 CREATE INDEX IF NOT EXISTS ix_ev_origin          ON events(origin_session_id);
+-- The intent-browsing commands (userlog/recent) filter user messages and sort by
+-- time; without this they full-scan ~1M events. (actor, type, ts) lets the planner
+-- read just the user/message slice in time order.
+CREATE INDEX IF NOT EXISTS ix_ev_actor_type_ts   ON events(actor, type, ts);
+
+-- Files index (a rebuildable derivation, NOT part of the canonical model in
+-- SCHEMA.md): events.refs.files unrolled to one row per (event, file) so `touched`
+-- is an indexed lookup instead of a json_array_length scan over every event. Keyed
+-- on event_id (content, like events) — placement/visibility filters come from the
+-- session_events join. basename is normalized identically to the query side
+-- (codebrain.paths) so an indexed basename lookup never misses a real match.
+CREATE TABLE IF NOT EXISTS file_refs (
+  event_id  TEXT NOT NULL,
+  file      TEXT NOT NULL,
+  basename  TEXT NOT NULL,
+  PRIMARY KEY (event_id, file)
+);
+-- (basename, event_id) covers the touched IN-subquery: the candidate event_ids
+-- are read straight from the index without touching the table.
+CREATE INDEX IF NOT EXISTS ix_file_refs_basename ON file_refs(basename, event_id);
+CREATE INDEX IF NOT EXISTS ix_file_refs_file     ON file_refs(file);
 
 -- Internal bookkeeping, NOT part of the canonical model (SCHEMA.md): the
 -- (mtime, size) each raw file had when last parsed, so refresh() re-parses only
@@ -130,8 +152,35 @@ def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     _ensure_visibility_columns(conn)
     _ensure_fts(conn)
+    _ensure_file_refs(conn)
+    _ensure_stats(conn)
     conn.commit()
     return conn
+
+
+def _ensure_stats(conn: sqlite3.Connection) -> None:
+    """Compute table statistics once on a large cache that lacks them.
+
+    Without sqlite_stat1 the planner over-prefers the new (actor,type,ts) and
+    file_refs indexes and full-scans where a session/event seek is far cheaper
+    (it made `recent`/`touched` ~20-40x slower in testing). A bounded one-time
+    ANALYZE fixes selectivity; it persists, so later opens just probe and skip.
+    Skipped on small/test caches, where the planner is fine without stats."""
+    have = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+    ).fetchone()
+    if have and conn.execute("SELECT 1 FROM sqlite_stat1 LIMIT 1").fetchone():
+        return
+    if conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] < 5000:
+        return
+    print("codebrain: analyzing indexes (one-time)…", file=sys.stderr)
+    try:
+        conn.execute("PRAGMA analysis_limit=1000")  # sample per index — seconds, not minutes
+        conn.execute("ANALYZE")
+    except sqlite3.OperationalError:
+        # stats are an optimization, not correctness; if a concurrent writer holds the
+        # lock (busy_timeout elapsed), skip — the next read retries the one-time build.
+        pass
 
 
 def _ensure_visibility_columns(conn: sqlite3.Connection) -> None:
@@ -146,6 +195,62 @@ def _ensure_visibility_columns(conn: sqlite3.Connection) -> None:
     if "hidden_reason" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN hidden_reason TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_sessions_hidden ON sessions(hidden_at)")
+
+
+def _ensure_file_refs(conn: sqlite3.Connection) -> None:
+    """Backfill the files index once for caches built before it existed.
+
+    The table is created by SCHEMA; new events populate it via upsert_event. An
+    existing cache has events but no file_refs rows, so derive them one time from
+    events.refs (a one-time scan, like the FTS rebuild). Guarded on emptiness, so
+    every later open is a cheap probe. basename is computed in Python with the same
+    normalizer the query side uses (so the index can't silently miss a match)."""
+    if conn.execute("SELECT 1 FROM file_refs LIMIT 1").fetchone() is not None:
+        return
+    rows = conn.execute(
+        "SELECT event_id, refs FROM events "
+        "WHERE json_valid(refs) AND json_array_length(refs, '$.files') > 0"
+    ).fetchall()
+    if not rows:
+        return
+    print(f"codebrain: building file index over {len(rows)} events (one-time)…",
+          file=sys.stderr)
+    conn.executemany(
+        "INSERT OR IGNORE INTO file_refs (event_id, file, basename) VALUES (?,?,?)",
+        _file_ref_tuples((r["event_id"], r["refs"]) for r in rows),
+    )
+
+
+def _file_ref_tuples(items):
+    """(event_id, refs_json) -> (event_id, file, basename) rows, deduped per event."""
+    for event_id, refs in items:
+        try:
+            files = (json.loads(refs) or {}).get("files") or []
+        except (json.JSONDecodeError, TypeError):
+            continue
+        seen = set()
+        for f in files:
+            if not isinstance(f, str) or not f or f in seen:
+                continue
+            seen.add(f)
+            yield (event_id, f, path_basename(f))
+
+
+def _record_file_refs(conn: sqlite3.Connection, e: EventRow) -> None:
+    """(Re)build one event's rows in the files index to match its current refs.
+    Called on first insert and whenever refs change (see upsert_event); the leading
+    delete makes it a replace, so a resync can also drop a ref, not only add one."""
+    conn.execute("DELETE FROM file_refs WHERE event_id=?", (e.event_id,))
+    files = (e.refs or {}).get("files") or []
+    seen = set()
+    for f in files:
+        if not isinstance(f, str) or not f or f in seen:
+            continue
+        seen.add(f)
+        conn.execute(
+            "INSERT OR IGNORE INTO file_refs (event_id, file, basename) VALUES (?,?,?)",
+            (e.event_id, f, path_basename(f)),
+        )
 
 
 def has_fts5(conn: sqlite3.Connection) -> bool:
@@ -230,10 +335,11 @@ def upsert_event(conn: sqlite3.Connection, e: EventRow) -> bool:
     than aborting the whole file, and conflicts are near-impossible (ids are globally
     unique for claude/codex, copy-invariant for pi)."""
     row = conn.execute(
-        "SELECT actor, type, text FROM events WHERE event_id=?", (e.event_id,)
+        "SELECT actor, type, text, refs FROM events WHERE event_id=?", (e.event_id,)
     ).fetchone()
     if row is not None and (row["actor"], row["type"], row["text"]) != (e.actor, e.type, e.text):
         return False
+    refs_json = json.dumps(e.refs)
     conn.execute(
         """
         INSERT INTO events (event_id, origin_session_id, ts, actor, type, text,
@@ -248,8 +354,19 @@ def upsert_event(conn: sqlite3.Connection, e: EventRow) -> bool:
             tool_call_event_id=excluded.tool_call_event_id, raw=excluded.raw
         """,
         (e.event_id, e.origin_session_id, e.ts, e.actor, e.type, e.text,
-         json.dumps(e.refs), e.tool_call_event_id, json.dumps(e.raw)),
+         refs_json, e.tool_call_event_id, json.dumps(e.raw)),
     )
+    if row is None:
+        # Fresh insert: only touch the index if there are files (the ~80% no-file
+        # events skip it entirely, so a full ingest doesn't eat 1M no-op deletes).
+        if (e.refs or {}).get("files"):
+            _record_file_refs(conn, e)
+    elif row["refs"] != refs_json:
+        # refs changed for an existing event — happens when a later refresh re-parses
+        # a grown log: e.g. the Codex adapter enriches a tool_call's refs.files with
+        # paths from a `patch_apply_end` record that only appears later. Resync (which
+        # also clears, in case a ref was dropped) so `touched` can't go stale.
+        _record_file_refs(conn, e)
     return True
 
 

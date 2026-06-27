@@ -2,6 +2,7 @@
 (F4) hardening, the pi cross-file dedup the schema exists for, and FTS."""
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 
@@ -49,6 +50,123 @@ class TestIdempotency(unittest.TestCase):
         first = _counts(conn)
         ingest._ingest(conn, [f], parse)          # ingest the exact same file again
         self.assertEqual(_counts(conn), first)    # no new rows, no duplicates
+
+
+class TestFileRefsIndex(unittest.TestCase):
+    """The files index (db.file_refs) is the structured signal `touched` reads
+    instead of scanning events.refs JSON. Prove ingest/backfill populate it with
+    the same basename normalization the query side uses."""
+
+    def _event_with_files(self, conn, eid, files):
+        return db.upsert_event(conn, EventRow(
+            event_id=eid, origin_session_id="pi:S", ts="2026-01-01T00:00:00Z",
+            actor="assistant", type="tool_call", text="edit",
+            refs={"files": files, "commands": []}, raw={}))
+
+    def test_upsert_event_unrolls_files_with_normalized_basename(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        self._event_with_files(conn, "pi:e1",
+                               ["docs/wip/plan.md", "/abs/repo/plan.md", "~/notes.md"])
+        got = {r["file"]: r["basename"] for r in conn.execute(
+            "SELECT file, basename FROM file_refs WHERE event_id='pi:e1'")}
+        self.assertEqual(got["docs/wip/plan.md"], "plan.md")
+        self.assertEqual(got["/abs/repo/plan.md"], "plan.md")
+        self.assertEqual(got["~/notes.md"], "notes.md")  # ~ expands, basename stable
+
+    def test_no_rows_for_events_without_files_and_dedup_is_idempotent(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        db.upsert_event(conn, EventRow(
+            event_id="pi:msg", origin_session_id="pi:S", ts="2026-01-01T00:00:00Z",
+            actor="user", type="message", text="hi",
+            refs={"files": [], "commands": []}, raw={}))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM file_refs").fetchone()[0], 0)
+        self._event_with_files(conn, "pi:e1", ["a.md", "a.md"])  # dup within the event
+        self._event_with_files(conn, "pi:e1", ["a.md"])          # re-upsert same event
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM file_refs WHERE event_id='pi:e1'").fetchone()[0],
+            1)
+
+    def test_file_refs_resync_when_an_existing_events_refs_change(self):
+        # Codex enriches a tool_call's refs.files from a later patch_apply_end record;
+        # on a refresh that re-parses the grown log, the same event_id is upserted with
+        # MORE (or fewer) files. The files index must track that, not freeze on insert.
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        files_now = lambda: {r["file"] for r in conn.execute(
+            "SELECT file FROM file_refs WHERE event_id='codex:e1'")}
+        self._event_with_files(conn, "codex:e1", ["a.py"])
+        self.assertEqual(files_now(), {"a.py"})
+        self._event_with_files(conn, "codex:e1", ["a.py", "/abs/b.py"])  # enriched later
+        self.assertEqual(files_now(), {"a.py", "/abs/b.py"})
+        self._event_with_files(conn, "codex:e1", ["/abs/b.py"])          # and a drop
+        self.assertEqual(files_now(), {"/abs/b.py"})
+
+    def test_ensure_file_refs_backfills_a_preindex_cache(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        # an event written the way a pre-files-index cache holds it (no file_refs row)
+        conn.execute(
+            "INSERT INTO events (event_id, ts, actor, type, text, refs, raw) "
+            "VALUES (?,?,?,?,?,?,?)",
+            ("pi:old", "2026-01-01T00:00:00Z", "assistant", "tool_call", "edit",
+             json.dumps({"files": ["legacy/file.py"], "commands": []}), "{}"))
+        conn.execute("DELETE FROM file_refs")
+        db._ensure_file_refs(conn)                       # the one-time migration
+        row = conn.execute(
+            "SELECT file, basename FROM file_refs WHERE event_id='pi:old'").fetchone()
+        self.assertEqual((row["file"], row["basename"]), ("legacy/file.py", "file.py"))
+
+    def test_file_refs_keyed_on_event_not_placement(self):
+        # pi cross-file dedup: one events row, N placements. file_refs is keyed on
+        # event_id (content), so an inherited copy must NOT duplicate the file rows.
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        db.upsert_event(conn, EventRow(
+            event_id="pi:shared", origin_session_id="pi:A", ts="2026-01-01T00:00:00Z",
+            actor="assistant", type="tool_call", text="edit",
+            refs={"files": ["shared.py"], "commands": []}, raw={}))
+        db.upsert_placement(conn, PlacementRow(session_id="pi:A", event_id="pi:shared",
+            seq=5, parent_event_id=None, live=1, inherited=0))
+        db.upsert_placement(conn, PlacementRow(session_id="pi:B", event_id="pi:shared",
+            seq=5, parent_event_id=None, live=1, inherited=1))  # resumed verbatim copy
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM file_refs WHERE event_id='pi:shared'").fetchone()[0], 1)
+
+    def test_ensure_file_refs_backfill_dedups_multiple_files_and_skips_no_file_events(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        conn.execute(
+            "INSERT INTO events (event_id, ts, actor, type, text, refs, raw) "
+            "VALUES (?,?,?,?,?,?,?)",
+            ("pi:old", "2026-01-01T00:00:00Z", "assistant", "tool_call", "edit",
+             json.dumps({"files": ["legacy/a.py", "/abs/b.py", "legacy/a.py"],
+                         "commands": []}), "{}"))
+        conn.execute(
+            "INSERT INTO events (event_id, ts, actor, type, text, refs, raw) "
+            "VALUES (?,?,?,?,?,?,?)",
+            ("pi:msg", "2026-01-01T00:00:01Z", "user", "message", "hi",
+             json.dumps({"files": [], "commands": []}), "{}"))
+        conn.execute("DELETE FROM file_refs")
+        db._ensure_file_refs(conn)
+        got = {(r["event_id"], r["file"], r["basename"]) for r in conn.execute(
+            "SELECT event_id, file, basename FROM file_refs")}
+        self.assertEqual(got, {
+            ("pi:old", "legacy/a.py", "a.py"),
+            ("pi:old", "/abs/b.py", "b.py"),
+        })
+
+    def test_ensure_stats_skips_small_caches(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        db.upsert_event(conn, EventRow(
+            event_id="x:1", origin_session_id="x:S", ts="2026-01-01T00:00:00Z",
+            actor="user", type="message", text="hi",
+            refs={"files": [], "commands": []}, raw={}))
+        db._ensure_stats(conn)  # below the 5000-event threshold: must not ANALYZE
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'").fetchone())
 
 
 class TestConflictSkip(unittest.TestCase):

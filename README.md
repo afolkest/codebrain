@@ -7,8 +7,9 @@ schema, and [`formats/`](formats/) for the reverse-engineered log formats.
 **Status:** all three sources land on one schema —
 `raw logs → per-source adapter → SQLite (canonical 3-table transcript model +
 small rebuildable overlays) → CLI + FTS + grep + raw SQL`.
-Proven on real logs: **~1,970 sessions / ~380k events** from Claude, Codex, and pi,
-ingested with zero errors (claude 90% live, codex 98%, pi 94%).
+Proven on real logs: **~4,700 sessions / ~980k events** from Claude, Codex, and pi,
+ingested with zero errors (claude 90% live, codex 98%, pi 94%). Intent retrieval
+(`recent`/`userlog`/`touched`) is indexed for this scale — see [SCHEMA.md](SCHEMA.md).
 
 ## Quickstart
 

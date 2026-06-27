@@ -191,6 +191,45 @@ class TestRecentCli(unittest.TestCase):
         ))
         self.assertEqual([r["session_id"] for r in rows], ["pi:SUB", "pi:HUMAN"])
 
+    def test_recent_picks_latest_clean_message_and_counts_only_clean(self):
+        # newest message in the session is synthetic: recent must rank/show the
+        # latest CLEAN human message and count only clean ones (the per-session
+        # count runs with the not-subagent guard skipped, but same intent filters).
+        _add(self.conn, sid="pi:S1", eid="pi:s1-a", seq=0,
+             ts="2026-01-01T00:01:00Z", text="real intent one")
+        _add(self.conn, sid="pi:S1", eid="pi:s1-b", seq=1,
+             ts="2026-01-01T00:02:00Z", text="real intent two")
+        _add(self.conn, sid="pi:S1", eid="pi:s1-syn", seq=2,
+             ts="2026-01-01T00:03:00Z",
+             text="<command-name>/exit</command-name> <command-message>exit</command-message>")
+
+        rows = json.loads(self.run_cli("recent", "--no-refresh", "--json", "--limit", "10"))
+        row = next(r for r in rows if r["session_id"] == "pi:S1")
+        self.assertEqual(row["last_user_text"], "real intent two")
+        self.assertEqual(row["last_user_seq"], 1)
+        self.assertEqual(row["user_msg_count"], 2)
+
+    def test_recent_breaks_same_ts_messages_by_seq(self):
+        # Two clean user messages share a ts (real: claude multi-block user records
+        # emit several user/message events at one timestamp). The latest by seq must
+        # win, and the expand seq must point at it — regression guard for the stream
+        # tie-break (ts DESC, session_id DESC, seq DESC), inserted out of seq order.
+        _add(self.conn, sid="pi:S1", eid="pi:s1-b", seq=1,
+             ts="2026-01-01T00:01:00Z", text="same ts block one")
+        _add(self.conn, sid="pi:S1", eid="pi:s1-a", seq=0,
+             ts="2026-01-01T00:01:00Z", text="same ts block zero")
+
+        rows = json.loads(self.run_cli("recent", "--no-refresh", "--json", "--limit", "10"))
+        row = next(r for r in rows if r["session_id"] == "pi:S1")
+        self.assertEqual(row["last_user_seq"], 1)
+        self.assertEqual(row["last_user_text"], "same ts block one")
+
+    def test_recent_limit_zero_returns_nothing(self):
+        _add(self.conn, sid="pi:S1", eid="pi:s1-u", seq=0,
+             ts="2026-01-01T00:01:00Z", text="some intent")
+        rows = json.loads(self.run_cli("recent", "--no-refresh", "--json", "--limit", "0"))
+        self.assertEqual(rows, [])
+
     def test_recent_filters_to_matching_user_activity(self):
         _add(self.conn, sid="pi:S1", source="pi", cwd="/repo/codebrain", eid="pi:s1-u", seq=0,
              ts="2026-01-01T00:01:00Z", text="target but too early")
