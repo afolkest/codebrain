@@ -170,6 +170,12 @@ python3 -m codebrain grep "some literal string"
 python3 -m codebrain grep "some literal string" ~/codebrain-pool/raw
 # Grep an explicit raw-log scope directly.
 
+python3 -m codebrain grep "some literal string" -l
+# List only the raw-log files that match (locate, then pivot to turns) instead of the JSONL firehose.
+
+python3 -m codebrain grep "some literal string" -c
+# Count matches per raw-log file.
+
 python3 -m codebrain schema
 # Print SQLite schema.
 
