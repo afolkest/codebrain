@@ -75,22 +75,25 @@ python3 -m codebrain turns <session_id> --turn -1
 # Show a single turn: the most recent live user/master prompt and its response.
 # N>=0 selects by turn_index; N<0 counts back from the end (-2 = previous turn).
 
-## bmux provenance / origins
+## Structured provenance / origins
 
 python3 -m codebrain userlog --origin all
-# Include human, bmux master-control, and unknown user-role messages.
+# Include human, control-plane, and unknown user-role messages.
 
 python3 -m codebrain userlog --origin master-control
-# Show prompts that bmux sent into worker sessions.
+# Show prompts sent by structured control surfaces into worker sessions.
 
 python3 -m codebrain userlog --origin unknown
-# Show user-role messages that could not be safely classified as human or bmux control.
+# Show user-role messages that could not be safely classified as human or control.
 
 python3 -m codebrain search "continue" --actor user --origin all
-# Search all native user-role messages, including bmux control messages.
+# Search all native user-role messages, including control messages.
 
 python3 -m codebrain bmux-sync
 # Explicitly rebuild bmux provenance labels from ~/.bmux/events/bmux.jsonl.
+
+python3 -m codebrain codex-control-sync
+# Explicitly rebuild Codex control-message provenance from indexed transcripts.
 
 python3 -m codebrain turns <session_id> --around-seq <seq>
 # Expand around a seq from recent/userlog/search.

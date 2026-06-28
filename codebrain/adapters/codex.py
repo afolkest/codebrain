@@ -6,6 +6,8 @@ Codex has no native parent tree; we **synthesize** one (SCHEMA.md "Linearization
     NOT anchor on ``task_started`` — the oldest logs (cli 0.39, 2025-09) have no
     ``task_started``/``task_complete`` at all, while every version has the clean
     user prompt. A turn = a user prompt + the emitted events that follow it.
+    Structured inter-agent messages can also start a userless turn when Codex
+    marks them trigger_turn; they are non-human input, never actor=user.
   - Within a turn, emitted events chain linearly (each parents the previous one).
   - ``thread_rolled_back{num_turns:n}`` pops the last ``n`` *live* user-turns; they
     survive as dead side branches (live=0) and the next turn parents to the reverted
@@ -15,7 +17,8 @@ Two parallel in-file views (formats/codex.md "Dedup"): the clean human prompt co
 from ``event_msg.user_message``; assistant text + tool calls/results come from the
 ``response_item`` backbone. Never both — no double count. Dropped (kept in raw only):
 reasoning (encrypted in current versions), injected ``developer``/bloated-``user``
-``response_item`` messages, and pure telemetry (``token_count``, ``agent_message``…).
+``response_item`` messages, and pure telemetry (``token_count``, streamed
+``event_msg.agent_message``…).
 
 Resume re-emits ``session_meta`` with the same id in the same file → one session,
 no dedup. Compaction appends a ``compacted`` marker and continues linearly → handled
@@ -140,6 +143,16 @@ def _mcp_result_text(result) -> str:
     return json.dumps(result, ensure_ascii=False) if result is not None else ""
 
 
+def _agent_message_text(pl: dict) -> str:
+    text = _join_text(pl.get("content"))
+    if text.strip():
+        return text
+    author = pl.get("author")
+    recipient = pl.get("recipient")
+    route = " -> ".join(x for x in (author, recipient) if isinstance(x, str) and x)
+    return f"[inter-agent message{': ' + route if route else ''}]"
+
+
 def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] = None) -> Optional[ParsedSession]:
     records = read_records(path)
     if not records:
@@ -194,7 +207,10 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
     stack: list[int] = []           # indices into `turns` (live turns, push order)
     state: dict[str, Optional[str]] = {"tip": None}   # current live tip eid
 
-    def emit(rec, actor, typ, text, refs, is_user, tool_call_event_id=None):
+    def emit(rec, actor, typ, text, refs, is_user, tool_call_event_id=None,
+             starts_turn=None):
+        if starts_turn is None:
+            starts_turn = is_user
         eid = f"{sid}:{rec['_line']}"
         e = EventRow(
             event_id=eid, ts=rec.get("timestamp", ""), actor=actor, type=typ,
@@ -205,7 +221,7 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
         by_eid[eid] = e
         meta[eid] = {"line": rec["_line"], "ts": rec.get("timestamp", "")}
         parent_of[eid] = state["tip"]
-        if is_user:
+        if starts_turn:
             turns.append({"events": [eid], "parent_tip": state["tip"], "live": True})
             stack.append(len(turns) - 1)
         else:
@@ -229,10 +245,14 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
             turns[ti]["live"] = False
         state["tip"] = revert
 
+    pending_inter_agent_metadata = None
     for rec in records:
         t = rec.get("type")
         pl = _payload(rec)
         pt = pl.get("type")
+        if t == "inter_agent_communication_metadata":
+            pending_inter_agent_metadata = pl
+            continue
         if t == "event_msg":
             if pt == "user_message":
                 emit(rec, "user", "message", pl.get("message") or "", {"files": [], "commands": []}, is_user=True)
@@ -263,6 +283,23 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
                     if text.strip():
                         emit(rec, "assistant", "message", text, {"files": [], "commands": []}, is_user=False)
                 # developer / user (bloated) messages: dropped
+            elif pt == "agent_message":
+                metadata = (
+                    pending_inter_agent_metadata
+                    if isinstance(pending_inter_agent_metadata, dict) else {}
+                )
+                refs = {
+                    "files": [],
+                    "commands": [],
+                    "inter_agent": {
+                        "author": pl.get("author"),
+                        "recipient": pl.get("recipient"),
+                        "trigger_turn": metadata.get("trigger_turn"),
+                    },
+                }
+                emit(rec, "assistant", "message", _agent_message_text(pl), refs,
+                     is_user=False, starts_turn=bool(metadata.get("trigger_turn")))
+                pending_inter_agent_metadata = None
             elif pt in ("function_call", "custom_tool_call"):
                 text, refs = _render_tool_call(pt, pl.get("name") or "?", pl)
                 eid = emit(rec, "assistant", "tool_call", text, refs, is_user=False)

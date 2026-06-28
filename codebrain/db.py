@@ -114,23 +114,54 @@ CREATE TABLE IF NOT EXISTS bmux_control_submissions (
 
 -- Per (session, event) provenance verdict — single verdict per placement (PK is
 -- (session_id, event_id)). Absence of a row == clean human input (the default
--- bucket); a row records a non-human classification, with evidence_kind naming
--- the deriver that produced it. Today only the bmux deriver writes here, and it
--- rebuilds its own rows wholesale (DELETE WHERE evidence_kind='bmux'); a second
--- deriver would need a verdict-precedence policy, not just this column.
+-- bucket); a row records the effective non-human classification selected from
+-- event_origin_evidence by the provenance coordinator.
 CREATE TABLE IF NOT EXISTS event_origins (
   session_id    TEXT NOT NULL,
   event_id      TEXT NOT NULL,
   origin        TEXT NOT NULL,          -- master_control | unknown | human
-  evidence_kind TEXT,                   -- 'bmux' for this overlay
+  evidence_kind TEXT,                   -- deriver that produced the winning row
   evidence_id   TEXT,                   -- send_id / launch_id of the matched event
   reason        TEXT,
   PRIMARY KEY (session_id, event_id)
 );
 
+-- Rebuildable provenance evidence. Multiple derivers can independently mark a
+-- placement; event_origins is then rebuilt as the single effective verdict so
+-- read-path joins never duplicate rows. Derivers own only their evidence_kind.
+CREATE TABLE IF NOT EXISTS event_origin_evidence (
+  session_id    TEXT NOT NULL,
+  event_id      TEXT NOT NULL,
+  origin        TEXT NOT NULL,          -- master_control | unknown
+  evidence_kind TEXT NOT NULL,
+  evidence_id   TEXT,
+  reason        TEXT,
+  PRIMARY KEY (session_id, event_id, evidence_kind)
+);
+
+-- Codex provenance overlay. Rebuildable mirror of structured Codex control
+-- submissions (MCP codex/codex-reply and older send_input tool calls), joined to
+-- receiver transcripts by target thread + exact payload SHA-256.
+CREATE TABLE IF NOT EXISTS codex_control_submissions (
+  evidence_id          TEXT PRIMARY KEY,
+  kind                 TEXT NOT NULL,
+  submitted_at         TEXT NOT NULL,
+  sender_session_id    TEXT,
+  target_session_id    TEXT,
+  payload_sha256       TEXT NOT NULL,
+  payload_byte_count   INTEGER,
+  payload_line_count   INTEGER,
+  resolved_via         TEXT,
+  raw_event            TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS ix_bcs_session_sha
   ON bmux_control_submissions(codebrain_session_id, payload_sha256);
 CREATE INDEX IF NOT EXISTS ix_eo_origin ON event_origins(origin);
+CREATE INDEX IF NOT EXISTS ix_eoe_event ON event_origin_evidence(session_id, event_id);
+CREATE INDEX IF NOT EXISTS ix_eoe_kind ON event_origin_evidence(evidence_kind);
+CREATE INDEX IF NOT EXISTS ix_ccs_target_sha
+  ON codex_control_submissions(target_session_id, payload_sha256);
 
 CREATE VIEW IF NOT EXISTS transcript AS
   SELECT se.session_id, se.seq, e.event_id, e.ts, e.actor, e.type,
@@ -153,6 +184,7 @@ def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
     _ensure_visibility_columns(conn)
     _ensure_fts(conn)
     _ensure_file_refs(conn)
+    _ensure_origin_evidence(conn)
     _ensure_stats(conn)
     conn.commit()
     return conn
@@ -218,6 +250,28 @@ def _ensure_file_refs(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO file_refs (event_id, file, basename) VALUES (?,?,?)",
         _file_ref_tuples((r["event_id"], r["refs"]) for r in rows),
+    )
+
+
+def _ensure_origin_evidence(conn: sqlite3.Connection) -> None:
+    """Seed the multi-deriver evidence table from legacy effective rows once."""
+    have_evidence = conn.execute(
+        "SELECT 1 FROM event_origin_evidence LIMIT 1"
+    ).fetchone()
+    if have_evidence is not None:
+        return
+    have_origins = conn.execute("SELECT 1 FROM event_origins LIMIT 1").fetchone()
+    if have_origins is None:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO event_origin_evidence
+          (session_id, event_id, origin, evidence_kind, evidence_id, reason)
+        SELECT session_id, event_id, origin, COALESCE(evidence_kind, 'legacy'),
+               evidence_id, reason
+        FROM event_origins
+        WHERE origin IN ('master_control', 'unknown')
+        """
     )
 
 

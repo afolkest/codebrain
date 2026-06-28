@@ -43,14 +43,17 @@ manual hidden markers.
 **Reads are always current.** Read commands first delta-ingest changed local live
 logs plus synced remote pool subtrees when `~/codebrain-pool/raw` exists. The
 refresh is a stat-scan + re-parse only new/grown files, so it is usually ms when
-idle. `--no-refresh` skips both live-home and pool refresh; lightweight bmux
-provenance still syncs when its event log changed so human-intent defaults stay
-clean. `sessdb ingest` is only for the first build or a full rebuild.
+idle. `--no-refresh` skips both live-home and pool refresh; lightweight
+provenance overlays still sync when their structured evidence changed so
+human-intent defaults stay clean. `sessdb ingest` is only for the first build or
+a full rebuild.
 
-**bmux provenance keeps master-control prompts out of user-intent retrieval.**
-When bmux sends text into a worker pane, the native agent transcript still records
-that text as a `user` message. codebrain reads `~/.bmux/events/bmux.jsonl` and
-labels matching transcript messages with an origin:
+**Structured provenance keeps non-human prompts out of user-intent retrieval.**
+When bmux or Codex control tools send text into another worker/thread, the native
+agent transcript can still record that text as a `user` message. codebrain reads
+structured evidence, such as `~/.bmux/events/bmux.jsonl` and indexed Codex
+`codex`/`codex-reply`/`send_input` tool calls, then labels matching transcript
+messages with an origin:
 
 ```text
 human | master_control | unknown
@@ -72,6 +75,7 @@ sessdb userlog --origin master-control
 sessdb userlog --origin unknown
 sessdb search "query" --actor user --origin all
 sessdb bmux-sync             # explicitly rebuild the bmux provenance overlay
+sessdb codex-control-sync    # explicitly rebuild Codex control provenance
 ```
 
 `sessdb turns <session>` and `sessdb show <session>` keep the transcript complete
@@ -97,6 +101,7 @@ sessdb list                 # session metadata by start time; recent is usually 
 sessdb show <session>       # raw transcript view (--all includes rolled-back)
 sessdb grep <pattern>       # grep local live logs + synced remote pool roots
 sessdb bmux-sync            # rebuild bmux provenance labels from ~/.bmux/events/bmux.jsonl
+sessdb codex-control-sync   # rebuild Codex control-message provenance
 sessdb schema               # print the DDL for direct sqlite3 queries
 sessdb ingest-pool          # debug/repair explicit pool ingest; normal reads do this on demand
 sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
@@ -131,8 +136,9 @@ arbitrary joins — the schema is the interface (`sessdb schema`).
   `inherited`); the forest lives here, so an event can be live in one session and
   rolled-back in another.
 - **`sessions`** — metadata + lineage/sub-agent links + tip.
-- **bmux overlay tables** — rebuildable provenance labels derived from bmux's
-  event log, used to distinguish clean human input from master-control prompts.
+- **provenance overlay tables** — rebuildable labels derived from structured
+  bmux and Codex control evidence, used to distinguish clean human input from
+  control-plane prompts.
 
 Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER BY seq`.
 

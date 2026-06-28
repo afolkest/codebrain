@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from codebrain import provenance
+
 SUBMIT_KINDS = ("bmux.send_submitted", "bmux.launch_prompt_submitted")
 LINK_KINDS = ("bmux.pane_discovered", "bmux.pane_linked")
 
@@ -247,9 +249,6 @@ def sync(conn: sqlite3.Connection, path=None, window_sec: int = DEFAULT_WINDOW_S
             )
             stats["stored"] += 1
 
-        # Rebuild only the bmux-evidenced verdicts.
-        conn.execute("DELETE FROM event_origins WHERE evidence_kind = 'bmux'")
-
         # Candidate pairs: (submission, authored user message) with same resolved
         # session + identical UTF-8 SHA-256, msg ts in [submitted_at - skew,
         # submitted_at + window]. Both timestamps must parse, or the pair is
@@ -308,6 +307,7 @@ def sync(conn: sqlite3.Connection, path=None, window_sec: int = DEFAULT_WINDOW_S
             verdicts[eid] = ("unknown", None,
                              "bmux payload hash match with unverifiable timestamp")
 
+        evidence_rows = []
         for eid, (origin, evidence_id, reason) in verdicts.items():
             stats["master_control" if origin == "master_control" else "unknown"] += 1
             # Propagate the verdict to EVERY placement of this (copy-invariant)
@@ -315,14 +315,16 @@ def sync(conn: sqlite3.Connection, path=None, window_sec: int = DEFAULT_WINDOW_S
             for p in conn.execute(
                 "SELECT session_id FROM session_events WHERE event_id = ?", (eid,)
             ).fetchall():
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO event_origins
-                      (session_id, event_id, origin, evidence_kind, evidence_id, reason)
-                    VALUES (?, ?, ?, 'bmux', ?, ?)
-                    """,
-                    (p["session_id"], eid, origin, evidence_id, reason),
-                )
+                evidence_rows.append({
+                    "session_id": p["session_id"],
+                    "event_id": eid,
+                    "origin": origin,
+                    "evidence_kind": "bmux",
+                    "evidence_id": evidence_id,
+                    "reason": reason,
+                })
+
+        provenance.replace_evidence_kind(conn, "bmux", evidence_rows)
 
         # Remember the log stat so an unchanged log short-circuits next time.
         conn.execute(

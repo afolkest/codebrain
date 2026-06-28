@@ -22,6 +22,7 @@ Escape hatches:
   sessdb show <session> [--all]         raw transcript view
   sessdb list [--limit N]               session metadata by start time
   sessdb grep <pattern> [paths...]      ripgrep raw logs (live + remote pool by default)
+  sessdb codex-control-sync             rebuild Codex control provenance
   sessdb schema                         print the DDL
 
 Read commands refresh first: changed/new local live-home files and synced remote
@@ -43,7 +44,7 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from codebrain import bmux
+from codebrain import bmux, codex_control
 from codebrain.backfill_claude import DEFAULT_ORIGIN, backfill as backfill_claude
 from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
 from codebrain.db import DEFAULT_DB, connect, has_fts5
@@ -65,7 +66,7 @@ def _refresh_notice(local_stats, pool_stats):
         print(f"(refreshed {'; '.join(parts)})", file=sys.stderr)
 
 
-def _open(args, sync_bmux=True):
+def _open(args, sync_bmux=True, sync_codex_control=True):
     """Connect and (unless --no-refresh) delta-ingest whatever changed on disk."""
     conn = connect(args.db)
     transcripts_changed = False
@@ -77,17 +78,19 @@ def _open(args, sync_bmux=True):
                                       local_machines=local_machine_names())
         _refresh_notice(local_stats, pool_stats)
         transcripts_changed = bool(local_stats.get("events") or pool_stats.get("events"))
-    # bmux provenance overlay runs even under --no-refresh: because "no
-    # event_origins row == human", a stale overlay would leak master-control into
-    # the human bucket. The sync is gated (a log stat check + early return when
-    # nothing changed), so under --no-refresh it's nearly free yet still reflects a
-    # freshly-appended bmux send. Atomic (self-rolls-back, retries next read) and
-    # best-effort — a bmux-side problem must never break a read.
+    # Provenance overlays run even under --no-refresh: because "no event_origins
+    # row == human", stale overlays would leak control-plane prompts into the
+    # human bucket. Each sync is gated and best-effort.
     if sync_bmux:
         try:
             bmux.sync(conn, changed_hint=transcripts_changed)
         except Exception as exc:  # noqa: BLE001
             print(f"(bmux provenance skipped: {exc})", file=sys.stderr)
+    if sync_codex_control:
+        try:
+            codex_control.sync(conn, changed_hint=transcripts_changed)
+        except Exception as exc:  # noqa: BLE001
+            print(f"(Codex control provenance skipped: {exc})", file=sys.stderr)
     return conn
 
 
@@ -218,7 +221,7 @@ _ORIGIN_DB = {"master-control": "master_control", "unknown": "unknown"}
 
 
 def _origin_where(args, session_col="t.session_id", event_col="t.event_id"):
-    """Filter native user messages by bmux provenance.
+    """Filter native user messages by structured provenance.
 
     The default `human` protects the clean-intent bucket: absence of an
     `event_origins` row == human, so unmatched native user messages always pass.
@@ -247,7 +250,7 @@ def _append_origin(where: list[str], args, session_col="t.session_id",
 def _add_origin_args(parser, default="human") -> None:
     parser.add_argument("--origin", choices=ORIGIN_CHOICES, default=default,
                         help="provenance of native user messages (default %(default)s; "
-                             "bmux master-control kept out of the human-intent bucket)")
+                             "control-plane input kept out of the human-intent bucket)")
 
 
 def _origin_label(origin) -> str:
@@ -905,17 +908,24 @@ def _search_rows(conn, args):
     _append_visibility(where, args)
 
     only_session = getattr(args, "only_session", None)
+    actor = getattr(args, "actor", None)
+    origin = getattr(args, "origin", None) or "human"
     if not getattr(args, "include_subagents", False):
         where.append(_not_subagent_session_sql())
     if not getattr(args, "include_inherited", False) and not only_session:
         where.append("se.inherited = 0")
-    if getattr(args, "actor", None):
+    if actor:
         where.append("e.actor = ?")
-        params.append(args.actor)
+        params.append(actor)
         # Origin only means anything for user messages; --actor user defaults to
         # clean human intent.
-        if args.actor == "user":
+        if actor == "user":
             _append_origin(where, args, "se.session_id", "e.event_id")
+        elif origin in ("master-control", "unknown"):
+            where.append("0")  # contradictory: non-user actors have no user origin
+    elif origin in ("master-control", "unknown"):
+        where.append("e.actor = 'user'")
+        _append_origin(where, args, "se.session_id", "e.event_id")
     if getattr(args, "type", None):
         where.append("e.type = ?")
         params.append(args.type)
@@ -1652,12 +1662,19 @@ def cmd_bmux_sync(args):
     # Skip the automatic default-log hook in _open: this command rebuilds the
     # overlay explicitly (and possibly against a custom --log), so the hook would
     # be redundant or fight a non-default path.
-    conn = _open(args, sync_bmux=False)
+    conn = _open(args, sync_bmux=False, sync_codex_control=False)
     path = Path(args.log) if args.log else bmux._default_log()
     stats = bmux.sync(conn, path, force=True)
     print("bmux provenance: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
     if not path.exists():
         print(f"(no bmux event log at {path})", file=sys.stderr)
+    conn.close()
+
+
+def cmd_codex_control_sync(args):
+    conn = _open(args, sync_bmux=False, sync_codex_control=False)
+    stats = codex_control.sync(conn, force=True)
+    print("Codex control provenance: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
     conn.close()
 
 
@@ -1833,7 +1850,7 @@ def main(argv=None):
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     _add_visibility_args(sp)
-    _add_origin_args(sp)  # applied only with --actor user
+    _add_origin_args(sp)  # defaults only under --actor user; explicit non-human implies user
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_search)
 
@@ -1902,6 +1919,11 @@ def main(argv=None):
     sp.add_argument("--log", help=f"bmux event log path (default {bmux.DEFAULT_BMUX_LOG})")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_bmux_sync)
+
+    sp = sub.add_parser("codex-control-sync",
+                        help="rebuild Codex control-message provenance from indexed transcripts")
+    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    sp.set_defaults(func=cmd_codex_control_sync)
 
     sp = sub.add_parser("schema", help="print the DDL")
     sp.set_defaults(func=cmd_schema)

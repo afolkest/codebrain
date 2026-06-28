@@ -40,6 +40,23 @@ def _rollback(n, ts):
             "payload": {"type": "thread_rolled_back", "num_turns": n}}
 
 
+def _inter_agent_meta(trigger_turn=True, ts="2026-01-01T00:00:02Z"):
+    return {"type": "inter_agent_communication_metadata", "timestamp": ts,
+            "payload": {"trigger_turn": trigger_turn}}
+
+
+def _inter_agent_message(text, ts):
+    return {"type": "response_item", "timestamp": ts,
+            "payload": {"type": "agent_message", "author": "/root/A",
+                        "recipient": "/root/B",
+                        "content": [{"type": "input_text", "text": text}]}}
+
+
+def _event_agent_message(text, ts):
+    return {"type": "event_msg", "timestamp": ts,
+            "payload": {"type": "agent_message", "message": text, "phase": "commentary"}}
+
+
 def eid(line):  # event_id = codex:<uuid>:<0-based line>
     return f"codex:{UUID}:{line}"
 
@@ -153,6 +170,47 @@ class TestCodex(unittest.TestCase):
         self.assertTrue(ev[eid(2)].text.startswith("apply_patch: foo.py"))
         # the marker path AND the patch_apply_end absolute path both land in refs
         self.assertEqual(ev[eid(2)].refs["files"], ["foo.py", "/abs/foo.py"])
+
+    def test_inter_agent_message_is_not_user_input(self):
+        parsed = self.parse([
+            _meta(),                                                  # 0
+            _user("human prompt", "2026-01-01T00:00:01Z"),            # 1
+            _inter_agent_meta(trigger_turn=True),                     # 2
+            _inter_agent_message("agent handoff", "2026-01-01T00:00:03Z"),  # 3
+        ])
+        assert_session_invariants(self, parsed, "codex")
+        ev = by_id(parsed)
+        self.assertEqual(ev[eid(3)].actor, "assistant")
+        self.assertEqual(ev[eid(3)].type, "message")
+        self.assertEqual(ev[eid(3)].text, "agent handoff")
+        self.assertEqual(ev[eid(3)].refs["inter_agent"]["author"], "/root/A")
+        self.assertEqual(sum(1 for e in parsed.events if e.actor == "user"), 1)
+        parent = {p.event_id: p.parent_event_id for p in parsed.placements}
+        self.assertEqual(parent[eid(3)], eid(1))
+
+    def test_inter_agent_trigger_turn_rolls_back_without_dropping_human_turn(self):
+        parsed = self.parse([
+            _meta(),                                               # 0
+            _user("human prompt", "2026-01-01T00:00:01Z"),         # 1
+            _assistant("ok", "2026-01-01T00:00:02Z"),              # 2
+            _inter_agent_meta(trigger_turn=True, ts="2026-01-01T00:00:03Z"),  # 3
+            _inter_agent_message("agent task", "2026-01-01T00:00:04Z"),      # 4
+            _assistant("agent answer", "2026-01-01T00:00:05Z"),    # 5
+            _rollback(1, "2026-01-01T00:00:06Z"),                  # 6
+        ])
+        assert_session_invariants(self, parsed, "codex")
+        self.assertEqual(live_ids(parsed), {eid(1), eid(2)})
+
+    def test_unstructured_event_agent_message_still_ignored(self):
+        parsed = self.parse([
+            _meta(),                                               # 0
+            _user("go", "2026-01-01T00:00:01Z"),                   # 1
+            _assistant("canonical assistant", "2026-01-01T00:00:02Z"),  # 2
+            _event_agent_message("streamed duplicate", "2026-01-01T00:00:03Z"),  # 3
+        ])
+        assert_session_invariants(self, parsed, "codex")
+        self.assertEqual([e.text for e in parsed.events],
+                         ["go", "canonical assistant"])
 
 
 if __name__ == "__main__":

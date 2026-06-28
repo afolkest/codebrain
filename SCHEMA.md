@@ -134,7 +134,7 @@ The adapter reconstructs each session's transcript at **ingest time** (reads don
 Per source (mechanics in the format docs):
 - **Claude** — group blocks by `requestId`, order within a response, pair tool_use↔tool_result by id, drop thinking. Forks: rollback losers → `live=0`; parallel tool calls are real siblings, both `live=1`.
 - **pi** — walk `parentId`, skipping control/reasoning nodes. Forks are rollback-only (loser subtree `live=0`). Inherited prefix is copied with its parent links intact.
-- **Codex** — **synthesize** the tree (no source parents): maintain a stack of live turns; each new turn parents to the current live tip; `thread_rolled_back{num_turns:N}` pops N *live* turns (not the last N physical lines); subsequent turns parent to the new stack top; popped turns stay as `live=0` side branches. `turn_id`/source line are preserved in `raw` for audit.
+- **Codex** — **synthesize** the tree (no source parents): maintain a stack of live turns; each clean human prompt, plus native inter-agent messages marked `trigger_turn`, starts a turn parented to the current live tip; `thread_rolled_back{num_turns:N}` pops N *live* turns (not the last N physical lines); subsequent turns parent to the new stack top; popped turns stay as `live=0` side branches. `turn_id`/source line are preserved in `raw` for audit.
 
 **Dangling predecessor → root:** if a placement's computed predecessor isn't an emitted event in this session — e.g. a pi child that inherited only a post-compaction *suffix*, whose first inherited event's source parent was summarized away — set `parent_event_id=NULL` (a root) rather than pointing at a missing event. (General rule; protects against any dropped/uncopied parent.)
 
