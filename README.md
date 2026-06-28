@@ -1,193 +1,218 @@
 # codebrain
 
-A searchable store of my coding-agent sessions (Claude, Codex, pi). See
-[DESIGN.md](DESIGN.md) for architecture, [SCHEMA.md](SCHEMA.md) for the canonical
-schema, and [`formats/`](formats/) for the reverse-engineered log formats.
+`codebrain` is a local, searchable store of coding-agent sessions from Claude,
+Codex, and pi. It is meant for future agents trying to reconstruct user intent:
+goals, constraints, preferences, decisions, corrections, and the context around
+files or repos.
 
-**Status:** all three sources land on one schema —
-`raw logs → per-source adapter → SQLite (canonical 3-table transcript model +
-small rebuildable overlays) → CLI + FTS + grep + raw SQL`.
-Proven on real logs: **~4,700 sessions / ~980k events** from Claude, Codex, and pi,
-ingested with zero errors (claude 90% live, codex 98%, pi 94%). Intent retrieval
-(`recent`/`userlog`/`touched`) is indexed for this scale — see [SCHEMA.md](SCHEMA.md).
+Raw logs are the source of truth. The SQLite DB is a rebuildable cache:
 
-## Quickstart
-
-Install and build the local SQLite cache:
-
-```bash
-pip install -e .            # or run as: python3 -m codebrain <cmd>
-sessdb ingest               # first build from ~/.claude + ~/.codex + ~/.pi (read-only)
+```text
+raw tool logs -> per-source adapters -> SQLite -> CLI / FTS / raw SQL
 ```
 
-Daily intent archaeology loop:
+See [DESIGN.md](DESIGN.md) for architecture, [SCHEMA.md](SCHEMA.md) for the DB
+contract, [SYNCING.md](SYNCING.md) for cross-machine sync, and
+[`formats/`](formats/) for reverse-engineered source formats.
+
+## Quick Start
 
 ```bash
-sessdb recent               # sessions by latest clean human user message
-sessdb userlog              # newest clean human messages across sessions
-sessdb search <query>       # FTS5 over event text; add --around N for turn context
-sessdb turns <session>      # expand user-centered turns around a seq/session
-sessdb turns <session> --turn -1   # latest live turn for worker inspection
-sessdb lineage <session>    # factual parent/child session lineage
-sessdb refs <session>       # conversation -> files/commands/commits
-sessdb touched <path>       # file/artifact -> sessions/events
+pip install -e .
+sessdb ingest
 ```
 
-Default retrieval hides sessions with `sessions.hidden_at` set. Use
-`sessdb hide <session> --reason <why>` for noisy/eval sessions, `sessdb unhide`
-to restore them, `sessdb hidden` to audit them, and `--include-hidden` /
-`--only-hidden` on discovery commands when needed. This is DB visibility only:
-raw logs and pool files are not deleted, and deleting/rebuilding the DB loses
-manual hidden markers.
+Daily read commands refresh first: changed local live logs and synced remote pool
+logs are delta-ingested before the query runs. Use `--no-refresh` only when you
+explicitly want to skip that.
 
-**Reads are always current.** Read commands first delta-ingest changed local live
-logs plus synced remote pool subtrees when `~/codebrain-pool/raw` exists. The
-refresh is a stat-scan + re-parse only new/grown files, so it is usually ms when
-idle. `--no-refresh` skips both live-home and pool refresh; lightweight
-provenance overlays still sync when their structured evidence changed so
-human-intent defaults stay clean. `sessdb ingest` is only for the first build or
-a full rebuild.
+## Agent Workflow
 
-**Structured provenance keeps non-human prompts out of user-intent retrieval.**
-When bmux or Codex control tools send text into another worker/thread, the native
-agent transcript can still record that text as a `user` message. codebrain reads
-structured evidence, such as `~/.bmux/events/bmux.jsonl` and indexed Codex
-`codex`/`codex-reply`/`send_input` tool calls, then labels matching transcript
-messages with an origin:
+Start broad, then pivot to evidence:
+
+```bash
+sessdb recent
+sessdb userlog --query "preference or topic"
+sessdb search "query terms" --around 1
+sessdb turns <session> --around-seq <seq>
+sessdb refs <session>
+sessdb touched <path>
+sessdb lineage <session>
+```
+
+Practical patterns:
+
+- "What was I working on recently?" -> `recent`, then `turns <session>`.
+- "What did I say about X?" -> `userlog --query X` or `search X --actor user`.
+- "Why did this file change?" -> `touched path/to/file`, then `turns`.
+- "What files/commands did that conversation touch?" -> `refs <session>`.
+- "Is this a worker/sub-agent thread?" -> `lineage <session>`.
+- "The DB view is not enough." -> `show <session> --all`, `grep`, or raw SQL.
+
+## Core Commands
+
+Intent browsing:
+
+```bash
+sessdb recent                 # sessions by latest clean human user activity
+sessdb userlog                # newest clean human user messages
+sessdb search <query>         # FTS over live authored event text
+sessdb search <query> --around 2
+sessdb turns <session>        # user-centered turn view
+sessdb turns <session> --turn -1
+```
+
+Evidence pivots:
+
+```bash
+sessdb refs <session>         # files, commands, commits referenced in session
+sessdb touched <path>         # sessions/events with structured file refs
+sessdb touched name.py --basename
+sessdb touched src/ --prefix
+sessdb lineage <session>      # root, parent, current, children, siblings
+```
+
+Visibility and repair:
+
+```bash
+sessdb hide <session> --reason "noisy eval"
+sessdb hidden
+sessdb unhide <session>
+sessdb collect --pool ~/codebrain-pool
+sessdb collect --install-launchd --pool ~/codebrain-pool --interval 300
+sessdb ingest                 # full local rebuild
+sessdb ingest-pool            # explicit synced-pool repair/debug ingest
+sessdb backfill-claude <zip-or-dir>
+```
+
+Escape hatches:
+
+```bash
+sessdb show <session> --all   # raw transcript view, including rolled-back events
+sessdb list                   # session metadata by start time
+sessdb grep <pattern>         # ripgrep raw live logs + remote pool roots
+sessdb schema                 # print DDL for sqlite3 clients
+```
+
+## Filters
+
+Common filters compose across the discovery commands:
+
+```bash
+--source claude|codex|pi
+--cwd <substring>
+--after 2026-01-01
+--before 7d
+--exclude-recent 1h
+--only-session <id-or-prefix>
+--exclude-session <id-or-prefix>
+--include-inherited
+--include-subagents
+--include-hidden | --only-hidden
+--json
+```
+
+`search` also supports:
+
+```bash
+--actor user|assistant|tool
+--type message|tool_call|tool_result
+--show-tools
+--user-chars 0 --agent-chars 0 --tool-chars 0
+```
+
+Default discovery excludes hidden sessions, sub-agent sessions, and inherited pi
+copies. Those are retrieval defaults, not data deletion.
+
+## Human Intent vs Control Input
+
+Some control surfaces send text into another worker/thread while the receiving
+agent records it as a native `user` message. `codebrain` uses structured evidence
+to keep those messages out of default human-intent retrieval:
+
+- bmux event logs: `~/.bmux/events/bmux.jsonl`
+- Codex MCP `codex` / `codex-reply` tool calls
+- Codex multi-agent `send_input`
+- Codex native inter-agent messages, which are parsed as non-user messages
+
+Native user-message origins:
 
 ```text
 human | master_control | unknown
 ```
 
-Intent commands default to clean human input:
-
-```bash
-sessdb recent
-sessdb userlog
-sessdb search "query" --actor user
-```
-
-Use `--origin` when you need to inspect control messages too:
+Defaults use `--origin human`. Inspect control-plane input explicitly:
 
 ```bash
 sessdb userlog --origin all
 sessdb userlog --origin master-control
 sessdb userlog --origin unknown
 sessdb search "query" --actor user --origin all
-sessdb bmux-sync             # explicitly rebuild the bmux provenance overlay
-sessdb codex-control-sync    # explicitly rebuild Codex control provenance
+sessdb codex-control-sync
+sessdb bmux-sync
 ```
 
-`sessdb turns <session>` and `sessdb show <session>` keep the transcript complete
-and label non-human user-message origins instead of hiding them.
+`turns` and `show` keep transcript content complete and label non-human
+user-message origins instead of hiding them.
 
-Sync / archive setup is separate from daily retrieval:
+## Sync Model
 
-```bash
-sessdb collect --pool ~/codebrain-pool
-sessdb collect --install-launchd --pool ~/codebrain-pool --interval 300
+`collect` mirrors allowlisted raw logs into an append-only pool:
+
+```text
+~/codebrain-pool/raw/<machine>/<source>/...
 ```
 
-`collect` mirrors allowlisted raw session/history files into
-`~/codebrain-pool/raw/<machine>/<source>/…` so upstream cleanup cannot take them
-with it. Point Syncthing at `~/codebrain-pool`; do **not** sync the SQLite DB or
-live tool homes. See [SYNCING.md](SYNCING.md) for setup, machine-name aliases, and
-latency details.
+Sync that pool with Syncthing. Do not sync the SQLite DB or live tool homes.
+Normal read commands use local live logs plus synced remote pool subtrees. See
+[SYNCING.md](SYNCING.md) for machine-name aliases and stale-local-pool behavior.
 
-Ops / escape hatches:
-
-```bash
-sessdb list                 # session metadata by start time; recent is usually better
-sessdb show <session>       # raw transcript view (--all includes rolled-back)
-sessdb grep <pattern>       # grep local live logs + synced remote pool roots
-sessdb bmux-sync            # rebuild bmux provenance labels from ~/.bmux/events/bmux.jsonl
-sessdb codex-control-sync   # rebuild Codex control-message provenance
-sessdb schema               # print the DDL for direct sqlite3 queries
-sessdb ingest-pool          # debug/repair explicit pool ingest; normal reads do this on demand
-sessdb backfill-claude ~/claude-restore --dry-run   # inspect old Claude backup zips
-sessdb hidden               # audit sessions hidden from default retrieval
-sessdb unhide <session>     # restore a hidden session to default retrieval
-```
-
-Passing explicit paths to `sessdb grep` replaces the default live+remote scope.
-
-**Old Claude backups are backfilled, not restored into live `~/.claude`.**
-`sessdb backfill-claude <zip-or-dir>` scans historical Claude `.zip` snapshots
-read-only, selects one best main transcript per structured Claude `sessionId`,
-skips sessions already present in live `~/.claude`, retargets old top-level
-`agent-*.jsonl` sidechain files into the modern `<session>/subagents/` sidecar
-layout, skips `file-history/`, and writes a manifest into
-`~/codebrain-pool/raw/claude-backfill/claude/`. Normal read commands ingest that
-pool-shaped root on demand; explicit ingest remains available:
+Old Claude backups are imported into the pool, not restored into live
+`~/.claude`:
 
 ```bash
+sessdb backfill-claude ~/claude-restore --dry-run
 sessdb backfill-claude ~/claude-restore
-sessdb ingest --source claude --raw-root ~/codebrain-pool/raw/claude-backfill/claude
 ```
 
-The DB is a **rebuildable cache** (DESIGN.md golden rule): delete `~/.codebrain/codebrain.db`
-and re-ingest anytime. It is never synced. Point any sqlite3 client at it for
-arbitrary joins — the schema is the interface (`sessdb schema`).
+## Model
 
-## Model (SCHEMA.md)
+The normalized DB has one content table and one placement table:
 
-- **`events`** — deduped content (`<source>:`-prefixed, copy-invariant ids).
-- **`session_events`** — per-session placement (`seq`, `parent_event_id`, `live`,
-  `inherited`); the forest lives here, so an event can be live in one session and
-  rolled-back in another.
-- **`sessions`** — metadata + lineage/sub-agent links + tip.
-- **provenance overlay tables** — rebuildable labels derived from structured
-  bmux and Codex control evidence, used to distinguish clean human input from
-  control-plane prompts.
+- `events`: deduped event content with source-prefixed IDs.
+- `session_events`: per-session order, parent, liveness, and inherited status.
+- `sessions`: metadata, lineage, relation, spawn links, and tip.
+- rebuildable overlays: FTS, file refs, provenance evidence/effective origins.
 
-Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER BY seq`.
+Read live transcript rows with:
 
-## What each adapter handles
+```sql
+SELECT * FROM transcript
+WHERE session_id = ? AND live = 1
+ORDER BY seq;
+```
 
-- **Claude** (`parentUuid` tree) — bridged-parent linearization, parallel-tool
-  results, compaction reconnection, resume re-emission dedup.
-- **Codex** (flat append-only log, no native tree) — **synthesized** turn forest:
-  turns anchored on the clean `user_message` (works on 0.39→0.137, incl. the old
-  logs that lack `task_started`); `thread_rolled_back{n}` pops live user-turns as
-  dead side branches; `apply_patch`/`patch_apply_end` files; sub-agent/fork lineage.
-- **pi** (`parentId` tree) — the cross-file case the schema exists for: resume/branch
-  copies the parent's live prefix **verbatim** into a new file, so a shared event is
-  **one `events` row** with N placements (origin `inherited=0` + copies `inherited=1`),
-  keyed on the copy-invariant `pi:<8hex>:<ts>`.
+Source adapters normalize different raw shapes into that model:
 
-## Current limitations
+- Claude: `parentUuid` tree, compaction reconnection, parallel tool results,
+  sidechain de-duplication.
+- Codex: flat append-only log, synthesized turn forest, rollback markers,
+  control-message provenance, apply-patch refs, sub-agent/fork lineage.
+- pi: `parentId` tree, resume/branch copied prefixes, cross-file dedup,
+  structured sub-agent lineage.
 
-- **Nested sub-agent transcript discovery is limited** — Claude `<sessionId>/subagents/`
-  and pi `<session>/<runId>/run-<i>/` files are collected/backfilled but not part of
-  normal top-level ingest discovery. Codex sub-agent rollouts are standalone files
-  and are ingested with parent-session lineage.
-- Refresh covers this machine's live tool homes plus synced remote pool subtrees;
-  embeddings/sqlite-vec are later slices.
-- `bash`-side file mutations aren't tracked in `refs`/`touched` (known gap across
-  all sources); Codex reasoning is encrypted (≥2026-04) and excluded everywhere.
+## Known Gaps
 
-## Tests
+- Nested Claude/pi sub-agent transcripts are collected/backfilled but not part of
+  normal top-level ingest discovery.
+- Shell-side file mutations are not tracked in `refs` / `touched`.
+- Codex reasoning is encrypted in current logs and excluded.
+- Embeddings / sqlite-vec are not a current retrieval path.
+- `title` and repo resolution are incomplete for some sources.
 
-Stdlib `unittest`, no dependencies — run from the repo root:
+## Verify
 
 ```bash
-python3 -m unittest discover        # full test suite, a second or two
+python3 -m unittest discover
+git diff --check
 ```
-
-Synthetic JSONL fixtures (inline, next to the assertions, so each doubles as a
-shape spec) pin every adapter and every bug we've fixed: the Codex full-rollback
-**null tip**, MCP capture/dedup, `apply_patch` refs, the **pi cross-file dedup**
-(one `events` row, N placements), and the conflict-skip + malformed-record
-hardening. A shared invariant check — source-prefixed unique ids, parents resolve
-in-session, **no live event hanging off a dead parent**, tip is live-or-null, no
-parent cycles — runs on every fixture *and* over a sample of the real logs
-(`test_smoke_real`, which skips cleanly on machines without them). `test_refresh`
-pins the delta path: only changed files re-parse, a grown file flips liveness,
-upstream deletion never deletes from the archive, and the FTS triggers keep the
-index current without rebuilds. `test_collect` pins the pool sweep: allowlists
-keep credentials out, symlinks are never followed, the shrink guard keeps a
-truncated source from clobbering the archive (without wedging recovery), stale
-tmp files are pruned without touching a concurrent sweep's, the LaunchAgent
-plist survives hostile path characters, and a pool subtree ingests exactly like
-a live home — **with sessions keeping their origin machine's label**, so a
-synced subtree from another machine is never mislabeled.
