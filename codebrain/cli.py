@@ -926,6 +926,10 @@ def _search_rows(conn, args):
     elif origin in ("master-control", "unknown"):
         where.append("e.actor = 'user'")
         _append_origin(where, args, "se.session_id", "e.event_id")
+    elif origin == "human":
+        clause = _origin_where(args, "se.session_id", "e.event_id")
+        if clause:
+            where.append(f"(e.actor != 'user' OR ({clause}))")
     if getattr(args, "type", None):
         where.append("e.type = ?")
         params.append(args.type)

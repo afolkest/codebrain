@@ -51,7 +51,7 @@ def _add_raw_event(conn, *, sid, eid, seq, ts, actor, typ, text, raw):
         live=1, inherited=0))
 
 
-def _mcp_reply_raw(*, ts, call_id, target, prompt, duration_secs=1):
+def _mcp_reply_raw(*, ts, call_id, target, prompt, duration_secs=1, server="codex"):
     return {
         "type": "event_msg",
         "timestamp": ts,
@@ -59,7 +59,7 @@ def _mcp_reply_raw(*, ts, call_id, target, prompt, duration_secs=1):
             "type": "mcp_tool_call_end",
             "call_id": call_id,
             "invocation": {
-                "server": "codex",
+                "server": server,
                 "tool": "codex-reply",
                 "arguments": {"threadId": target, "prompt": prompt},
             },
@@ -69,7 +69,7 @@ def _mcp_reply_raw(*, ts, call_id, target, prompt, duration_secs=1):
     }
 
 
-def _mcp_start_raw(*, ts, call_id, target, prompt, duration_secs=1):
+def _mcp_start_raw(*, ts, call_id, target, prompt, duration_secs=1, server="codex"):
     return {
         "type": "event_msg",
         "timestamp": ts,
@@ -77,7 +77,7 @@ def _mcp_start_raw(*, ts, call_id, target, prompt, duration_secs=1):
             "type": "mcp_tool_call_end",
             "call_id": call_id,
             "invocation": {
-                "server": "codex",
+                "server": server,
                 "tool": "codex",
                 "arguments": {"prompt": prompt},
             },
@@ -87,14 +87,21 @@ def _mcp_start_raw(*, ts, call_id, target, prompt, duration_secs=1):
     }
 
 
-def _send_input_raw(*, ts, call_id, target, message):
+def _send_input_raw(*, ts, call_id, target, message=None, items=None,
+                    namespace=codex_control.MULTI_AGENT_V1_NAMESPACE):
+    args = {"target": target}
+    if message is not None:
+        args["message"] = message
+    if items is not None:
+        args["items"] = items
     return {
         "type": "response_item",
         "timestamp": ts,
         "payload": {
             "type": "function_call",
             "name": "send_input",
-            "arguments": json.dumps({"target": target, "message": message}),
+            "namespace": namespace,
+            "arguments": json.dumps(args),
             "call_id": call_id,
         },
     }
@@ -156,6 +163,23 @@ class TestCodexControlProvenance(unittest.TestCase):
         self.assertEqual(self._origin("codex:NEW", "codex:NEW:1")["origin"],
                          "master_control")
 
+    def test_mcp_codex_tool_allows_configured_server_name(self):
+        _add_user(self.conn, sid="codex:T", eid="codex:T:1", seq=0,
+                  ts="2026-01-01T00:00:01Z", text="agent instruction")
+        _add_raw_event(self.conn, sid="codex:S", eid="codex:S:9", seq=0,
+                       ts="2026-01-01T00:00:02Z", actor="tool", typ="tool_result",
+                       text="[mcp codex-prod.codex-reply]",
+                       raw=_mcp_reply_raw(ts="2026-01-01T00:00:02Z",
+                                          call_id="call_reply", target="T",
+                                          prompt="agent instruction",
+                                          server="codex-prod"))
+
+        stats = self._sync()
+
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+        self.assertEqual(stats["master_control"], 1)
+
     def test_send_input_function_call_marks_receiver_user_message_non_human(self):
         _add_user(self.conn, sid="codex:AGENT", eid="codex:AGENT:1", seq=0,
                   ts="2026-01-01T00:00:03Z", text="please review")
@@ -165,6 +189,58 @@ class TestCodexControlProvenance(unittest.TestCase):
                        raw=_send_input_raw(ts="2026-01-01T00:00:02Z",
                                            call_id="call_send", target="AGENT",
                                            message="please review"))
+
+        self._sync()
+
+        self.assertEqual(self._origin("codex:AGENT", "codex:AGENT:1")["origin"],
+                         "master_control")
+
+    def test_send_input_items_match_codex_receiver_text_concatenation(self):
+        _add_user(self.conn, sid="codex:AGENT", eid="codex:AGENT:1", seq=0,
+                  ts="2026-01-01T00:00:03Z", text="part Apart B")
+        _add_raw_event(self.conn, sid="codex:S", eid="codex:S:9", seq=0,
+                       ts="2026-01-01T00:00:02Z", actor="assistant", typ="tool_call",
+                       text='send_input: {"target":"AGENT"}',
+                       raw=_send_input_raw(
+                           ts="2026-01-01T00:00:02Z",
+                           call_id="call_send", target="AGENT",
+                           items=[
+                               {"type": "text", "text": "part A"},
+                               {"type": "text", "text": "part B"},
+                               {"type": "image_url", "image_url": "https://example.test/i.png"},
+                           ]))
+
+        self._sync()
+
+        self.assertEqual(self._origin("codex:AGENT", "codex:AGENT:1")["origin"],
+                         "master_control")
+
+    def test_send_input_same_name_wrong_namespace_is_ignored(self):
+        _add_user(self.conn, sid="codex:AGENT", eid="codex:AGENT:1", seq=0,
+                  ts="2026-01-01T00:00:03Z", text="please review")
+        _add_raw_event(self.conn, sid="codex:S", eid="codex:S:9", seq=0,
+                       ts="2026-01-01T00:00:02Z", actor="assistant", typ="tool_call",
+                       text='send_input: {"target":"AGENT"}',
+                       raw=_send_input_raw(ts="2026-01-01T00:00:02Z",
+                                           call_id="call_send", target="AGENT",
+                                           message="please review",
+                                           namespace="other"))
+
+        stats = self._sync()
+
+        self.assertIsNone(self._origin("codex:AGENT", "codex:AGENT:1"))
+        self.assertEqual(stats["master_control"], 0)
+
+    def test_legacy_send_input_without_namespace_is_still_evidence(self):
+        _add_user(self.conn, sid="codex:AGENT", eid="codex:AGENT:1", seq=0,
+                  ts="2026-01-01T00:00:03Z", text="please review")
+        _add_raw_event(self.conn, sid="codex:S", eid="codex:S:9", seq=0,
+                       ts="2026-01-01T00:00:02Z", actor="assistant", typ="tool_call",
+                       text='send_input: {"target":"AGENT"}',
+                       raw=_send_input_raw(ts="2026-01-01T00:00:02Z",
+                                           call_id="call_send", target="AGENT",
+                                           message="please review",
+                                           namespace=None))
 
         self._sync()
 
@@ -297,6 +373,14 @@ class TestCodexControlCLI(unittest.TestCase):
         hits = json.loads(self.run_cli("search", "instruction", "--no-refresh",
                                        "--json", "--actor", "user"))
         self.assertEqual(hits, [])
+
+        hits_default = json.loads(self.run_cli("search", "instruction",
+                                               "--no-refresh", "--json"))
+        self.assertEqual(hits_default, [])
+
+        hits_human = json.loads(self.run_cli("search", "real",
+                                             "--no-refresh", "--json"))
+        self.assertEqual(self._texts(hits_human), {"my real question"})
 
         hits_mc = json.loads(self.run_cli("search", "instruction", "--no-refresh",
                                           "--json", "--origin", "master-control"))

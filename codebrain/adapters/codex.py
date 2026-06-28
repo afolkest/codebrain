@@ -6,8 +6,8 @@ Codex has no native parent tree; we **synthesize** one (SCHEMA.md "Linearization
     NOT anchor on ``task_started`` — the oldest logs (cli 0.39, 2025-09) have no
     ``task_started``/``task_complete`` at all, while every version has the clean
     user prompt. A turn = a user prompt + the emitted events that follow it.
-    Structured inter-agent messages can also start a userless turn when Codex
-    marks them trigger_turn; they are non-human input, never actor=user.
+    Structured inter-agent messages also start userless rollback turns; they are
+    non-human input, never actor=user.
   - Within a turn, emitted events chain linearly (each parents the previous one).
   - ``thread_rolled_back{num_turns:n}`` pops the last ``n`` *live* user-turns; they
     survive as dead side branches (live=0) and the next turn parents to the reverted
@@ -298,7 +298,7 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
                     },
                 }
                 emit(rec, "assistant", "message", _agent_message_text(pl), refs,
-                     is_user=False, starts_turn=bool(metadata.get("trigger_turn")))
+                     is_user=False, starts_turn=True)
                 pending_inter_agent_metadata = None
             elif pt in ("function_call", "custom_tool_call"):
                 text, refs = _render_tool_call(pt, pl.get("name") or "?", pl)
@@ -312,6 +312,25 @@ def parse_file(path: Path, machine: Optional[str] = None, title: Optional[str] =
                 emit(rec, "tool", "tool_result", _result_text(pl), {"files": [], "commands": []},
                      is_user=False, tool_call_event_id=paired)
             # reasoning / web_search_* / tool_search_*: dropped (kept in raw pool)
+        elif t == "inter_agent_communication":
+            refs = {
+                "files": [],
+                "commands": [],
+                "inter_agent": {
+                    "author": pl.get("author"),
+                    "recipient": pl.get("recipient"),
+                    "trigger_turn": pl.get("trigger_turn"),
+                },
+            }
+            text = pl.get("content") if isinstance(pl.get("content"), str) else ""
+            if not text.strip():
+                text = _agent_message_text({
+                    "author": pl.get("author"),
+                    "recipient": pl.get("recipient"),
+                    "content": [],
+                })
+            emit(rec, "assistant", "message", text, refs,
+                 is_user=False, starts_turn=True)
         # session_meta / turn_context / compacted: not events
 
     if not events:

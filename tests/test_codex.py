@@ -57,6 +57,13 @@ def _event_agent_message(text, ts):
             "payload": {"type": "agent_message", "message": text, "phase": "commentary"}}
 
 
+def _legacy_inter_agent_communication(text, ts, trigger_turn=False):
+    return {"type": "inter_agent_communication", "timestamp": ts,
+            "payload": {"author": "/root/A", "recipient": "/root/B",
+                        "other_recipients": [], "content": text,
+                        "trigger_turn": trigger_turn}}
+
+
 def eid(line):  # event_id = codex:<uuid>:<0-based line>
     return f"codex:{UUID}:{line}"
 
@@ -199,6 +206,36 @@ class TestCodex(unittest.TestCase):
             _rollback(1, "2026-01-01T00:00:06Z"),                  # 6
         ])
         assert_session_invariants(self, parsed, "codex")
+        self.assertEqual(live_ids(parsed), {eid(1), eid(2)})
+
+    def test_inter_agent_non_trigger_turn_rolls_back_without_dropping_human_turn(self):
+        parsed = self.parse([
+            _meta(),                                               # 0
+            _user("human prompt", "2026-01-01T00:00:01Z"),         # 1
+            _assistant("ok", "2026-01-01T00:00:02Z"),              # 2
+            _inter_agent_meta(trigger_turn=False, ts="2026-01-01T00:00:03Z"),  # 3
+            _inter_agent_message("agent note", "2026-01-01T00:00:04Z"),       # 4
+            _assistant("agent answer", "2026-01-01T00:00:05Z"),    # 5
+            _rollback(1, "2026-01-01T00:00:06Z"),                  # 6
+        ])
+        assert_session_invariants(self, parsed, "codex")
+        self.assertEqual(live_ids(parsed), {eid(1), eid(2)})
+
+    def test_legacy_inter_agent_communication_is_non_user_rollback_boundary(self):
+        parsed = self.parse([
+            _meta(),                                               # 0
+            _user("human prompt", "2026-01-01T00:00:01Z"),         # 1
+            _assistant("ok", "2026-01-01T00:00:02Z"),              # 2
+            _legacy_inter_agent_communication(
+                "legacy agent note", "2026-01-01T00:00:03Z"),      # 3
+            _assistant("agent answer", "2026-01-01T00:00:04Z"),    # 4
+            _rollback(1, "2026-01-01T00:00:05Z"),                  # 5
+        ])
+        assert_session_invariants(self, parsed, "codex")
+        ev = by_id(parsed)
+        self.assertEqual(ev[eid(3)].actor, "assistant")
+        self.assertEqual(ev[eid(3)].refs["inter_agent"]["trigger_turn"], False)
+        self.assertEqual(sum(1 for e in parsed.events if e.actor == "user"), 1)
         self.assertEqual(live_ids(parsed), {eid(1), eid(2)})
 
     def test_unstructured_event_agent_message_still_ignored(self):

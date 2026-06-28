@@ -64,7 +64,7 @@ Old (2025): thinner — `instructions` (not `base_instructions`), `id`, `cwd`, `
 | `custom_tool_call_output` | `{call_id, output (string)}`. |
 | `web_search_call` / `web_search_end` | native web search; `action:{type:"search", query, queries[]}`. |
 | `tool_search_call` / `tool_search_output` | dynamic/deferred tool discovery (loads tool namespaces on demand); metadata, not conversation. |
-| `agent_message` | Native inter-agent message: `{author, recipient, content, internal_chat_message_metadata_passthrough}`. Often preceded by top-level `inter_agent_communication_metadata {trigger_turn}`. This is non-human input and must not be mapped to `actor=user`. |
+| `agent_message` | Native inter-agent message: `{author, recipient, content, internal_chat_message_metadata_passthrough}`. Often preceded by top-level `inter_agent_communication_metadata {trigger_turn}`. This is non-human input and must not be mapped to `actor=user`; Codex treats it as a rollback turn boundary even when `trigger_turn=false`. |
 
 ### Inter-agent / control-message provenance
 
@@ -73,14 +73,21 @@ surfaces:
 
 - Native multi-agent v2 records `inter_agent_communication_metadata` followed by
   `response_item.agent_message` in the receiver transcript. codebrain emits this
-  as an assistant-side message, with `trigger_turn` starting a userless turn when
-  present.
+  as an assistant-side message and starts a non-human/userless rollback turn for
+  every `agent_message`; `trigger_turn` remains metadata, not the boundary test.
+- Legacy native delivery can also appear as a top-level
+  `inter_agent_communication` rollout item. It is the same non-human boundary and
+  should not be treated as a user prompt.
 - MCP `codex-reply` records a sender-side `event_msg.mcp_tool_call_end` with
   `invocation.tool="codex-reply"`, `arguments.threadId`, and `arguments.prompt`.
+  `invocation.server` is the configured server key, not a canonical identity.
 - MCP `codex` starts a new thread; the sender-side result carries
   `structuredContent.threadId`, and the arguments carry the initial `prompt`.
 - Older multi-agent `send_input` records a sender-side `response_item.function_call`
-  with structured `arguments.target` and `arguments.message` or text `items`.
+  with `name="send_input"` and structured `arguments.target` plus
+  `arguments.message` or text `items`; current Codex also carries
+  `namespace="multi_agent_v1"`, while older logs may omit `namespace`.
+  Receiver-side `user_message.message` concatenates text items without separators.
 
 For the MCP/function-call cases, the receiver transcript still looks like an
 ordinary `event_msg.user_message`. The provenance overlay classifies it only by
@@ -108,7 +115,7 @@ Tool pairing is by **`call_id`** (Codex's analog of Claude's `tool_use_id`) — 
 
 ## Turn structure
 
-A turn is bracketed by `task_started{turn_id}` … `task_complete{turn_id}` (or `turn_aborted{turn_id}`). The same `turn_id` tags `turn_context` and `patch_apply_end`. Human turns have exactly one clean `user_message`; native inter-agent `trigger_turn` messages can start a non-human/userless turn. Within a turn, the `response_item`s are the model-facing sequence; the `event_msg`s interleave the clean prompt, streamed text, usage, and tool/patch/turn events.
+A turn is bracketed by `task_started{turn_id}` … `task_complete{turn_id}` (or `turn_aborted{turn_id}`). The same `turn_id` tags `turn_context` and `patch_apply_end`. Human turns have exactly one clean `user_message`; native inter-agent messages start non-human/userless turns. Within a turn, the `response_item`s are the model-facing sequence; the `event_msg`s interleave the clean prompt, streamed text, usage, and tool/patch/turn events.
 
 ## Rollback — in-file, append-only, explicit marker (semantics verified)
 
@@ -116,9 +123,9 @@ No tree; a rewind is an `event_msg` `thread_rolled_back {num_turns:N}` appended 
 
 **Verified semantics** (traced a 20-rewind file line by line). The dominant pattern: user interrupts a turn (`turn_aborted`) → `thread_rolled_back{n=1}` discards that turn → user re-submits the (often edited) prompt, which now completes. Clean example: `task_started`→`user:"Send two agents to review…"`→`turn_aborted`→`thread_rolled_back n=1`→`task_started`→`user:"Send two agents to review…"` (same text)→`task_complete`.
 
-So **`num_turns` counts live turns popped from the current tip** (usually human-prompt turns; native inter-agent `trigger_turn` records can also start a turn), and **rollbacks stack** (an `n=2` operates on the tip left by an earlier rollback, not on physical line position). The popped turns remain physically above the marker — abandoned, but retained.
+So **`num_turns` counts live turns popped from the current tip** (usually human-prompt turns; native inter-agent records also start non-human turns), and **rollbacks stack** (an `n=2` operates on the tip left by an earlier rollback, not on physical line position). The popped turns remain physically above the marker — abandoned, but retained.
 
-**Reconstruction:** maintain a stack of turns while replaying in file order; each clean `event_msg.user_message` pushes a human turn, and each `response_item.agent_message` with preceding `inter_agent_communication_metadata.trigger_turn` pushes a non-human/userless turn; each `thread_rolled_back{n}` pops the last `n`. Final stack = canonical conversation; popped turns = full-history-only. (Linear-log equivalent of excluding Claude's abandoned rollback subtree.)
+**Reconstruction:** maintain a stack of turns while replaying in file order; each clean `event_msg.user_message` pushes a human turn, and each `response_item.agent_message` or top-level `inter_agent_communication` pushes a non-human/userless turn; each `thread_rolled_back{n}` pops the last `n`. Final stack = canonical conversation; popped turns = full-history-only. (Linear-log equivalent of excluding Claude's abandoned rollback subtree.)
 
 ## Resume — same file, same id, re-emitted header
 
@@ -207,7 +214,7 @@ Resolved by the corpus sweep:
 
 Still to confirm (minor):
 - Exact `shell`/`shell_command` argument schemas (old eras) for clean command extraction.
-- `mcp_tool_call_end.invocation`/`result` shape; whether MCP calls also appear as `response_item function_call`.
+- Whether MCP calls also appear as `response_item function_call` in any older logs.
 - Image/`local_images` attachment shape in `user_message`.
 - Whether a true user-initiated "fork conversation" (verbatim history replay) exists and would need dedup — none seen here.
 - `update_plan` argument shape (plan/TODO state capture).

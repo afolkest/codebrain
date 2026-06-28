@@ -26,6 +26,7 @@ STATE_PATH = "__codebrain_codex_control_provenance__"
 MCP_REPLY_TOOLS = {"codex-reply", "codex_reply"}
 MCP_START_TOOLS = {"codex"}
 FUNCTION_SEND_TOOLS = {"send_input"}
+MULTI_AGENT_V1_NAMESPACE = "multi_agent_v1"
 
 
 def _empty_stats(**extra) -> dict:
@@ -87,7 +88,7 @@ def _payload_text(args: dict) -> str:
         for item in items:
             if isinstance(item, dict) and isinstance(item.get("text"), str):
                 parts.append(item["text"])
-    return "\n".join(parts)
+    return "".join(parts)
 
 
 def _result_thread_id(result) -> str | None:
@@ -187,7 +188,13 @@ def _submission_from_function(row) -> dict | None:
     if not isinstance(payload, dict) or payload.get("type") != "function_call":
         return None
     name = payload.get("name")
+    namespace = payload.get("namespace")
     if name not in FUNCTION_SEND_TOOLS:
+        return None
+    # Current Codex writes namespace="multi_agent_v1"; older transcripts predate
+    # that field. Use the structured namespace when present, but do not lose
+    # legacy sender-side evidence solely because the field is absent.
+    if namespace is not None and namespace != MULTI_AGENT_V1_NAMESPACE:
         return None
     args = _parse_json(payload.get("arguments"))
     target = args.get("target")
