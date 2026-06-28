@@ -157,10 +157,10 @@ Read a transcript: `SELECT * FROM transcript WHERE session_id=? AND live=1 ORDER
 
 ## Current limitations
 
-- **Main transcript path only** — sub-agents are deferred: Claude `<sessionId>/subagents/`
-  (inline `isSidechain` copies are ignored), pi `<session>/<runId>/run-<i>/`. Codex
-  sub-agent rollouts *are* ingested (they're standalone files) with a parent-session
-  link; the spawn-event link (`spawn_event_id`) is a later cross-file slice.
+- **Nested sub-agent transcript discovery is limited** — Claude `<sessionId>/subagents/`
+  and pi `<session>/<runId>/run-<i>/` files are collected/backfilled but not part of
+  normal top-level ingest discovery. Codex sub-agent rollouts are standalone files
+  and are ingested with parent-session lineage.
 - Refresh covers this machine's live tool homes plus synced remote pool subtrees;
   embeddings/sqlite-vec are later slices.
 - `bash`-side file mutations aren't tracked in `refs`/`touched` (known gap across
