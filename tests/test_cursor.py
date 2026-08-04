@@ -251,6 +251,12 @@ class TestCursorAdapter(unittest.TestCase):
         assert_session_invariants(self, parsed, "cursor")
         self.assertEqual(parsed.events[0].text, "from archive")
         self.assertEqual(parsed.session.machine, "pool-host")
+        self.assertEqual(parsed.source_head.revision, 1)
+        self.assertEqual(len(parsed.source_head.digest), 64)
+
+    def test_direct_snapshot_fixture_needs_no_archive_rank(self):
+        parsed = cursor.parse_snapshot(_snapshot())
+        self.assertIsNone(parsed.source_head)
 
     def test_invalid_projection_fails_closed(self):
         with self.assertRaises(cursor.CursorAdapterError):

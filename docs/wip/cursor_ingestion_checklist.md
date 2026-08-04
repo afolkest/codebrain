@@ -113,17 +113,17 @@ surfaces.
 
 ## Slice 8 — Corpus-scale refresh and revision authority
 
-- [ ] Make unchanged Cursor head discovery tens-of-milliseconds at corpus scale
+- [x] Make unchanged Cursor head discovery tens-of-milliseconds at corpus scale
   while preserving latest-reconstructible semantics after out-of-order arrival.
-- [ ] Back off permanent draft/source-error retries without delaying changed or
+- [x] Back off permanent draft/source-error retries without delaying changed or
   genuinely active/incomplete sessions indefinitely.
-- [ ] Apply later authored Cursor payload revisions authoritatively without
+- [x] Apply later authored Cursor payload revisions authoritatively without
   allowing inherited/stale copies to overwrite origin content or break pairing.
-- [ ] Add scale, retry, message/tool mutation, copied-session, and order-
+- [x] Add scale, retry, message/tool mutation, copied-session, and order-
   independence tests; benchmark the real archive and no-change refresh.
-- [ ] Run the full suite, diff/security scans, and three-reviewer final
+- [x] Run the full suite, diff/security scans, and three-reviewer final
   acceptance; fix every must-fix and should-fix finding.
-- [ ] Confirm the repository is clean and every completed slice is committed.
+- [x] Confirm the repository is clean and every completed slice is committed.
 
 Scope: rebuildable discovery bookkeeping and revision-aware canonical updates.
 

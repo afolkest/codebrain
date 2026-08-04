@@ -53,7 +53,9 @@ Access     CLI + raw SQL + grep                   ← agents write scripts
 - Each machine queries its own local DB → fast, works offline (laptop away from home with the mini asleep).
 - Normal reads refresh local live tool homes directly and project settled Cursor
   sessions for immediate current-session freshness, then refresh synced remote
-  pool subtrees for cross-machine history.
+  pool subtrees for cross-machine history. Cursor archive discovery uses
+  rebuildable, root-scoped per-session metadata signatures, so the unchanged
+  corpus path opens no revision JSON and only changed chains are reconstructed.
 - Tradeoff accepted: remote sessions are eventually consistent (collector interval + Syncthing latency + next local read command).
 
 **Sync transport: Syncthing.**

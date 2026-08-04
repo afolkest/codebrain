@@ -5,10 +5,17 @@ import io
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 
 from codebrain import db, ingest
 from codebrain.adapters import codex, pi
-from codebrain.adapters.base import EventRow, ParsedSession, PlacementRow, SessionRow
+from codebrain.adapters.base import (
+    EventRow,
+    ParsedSession,
+    PlacementRow,
+    SessionRow,
+    SourceHead,
+)
 from tests._helpers import memory_db, write_jsonl
 
 
@@ -202,6 +209,204 @@ class TestConflictSkip(unittest.TestCase):
         a = conn.execute("SELECT COUNT(*) AS c FROM session_events WHERE session_id='test:A'").fetchone()["c"]
         self.assertEqual(b, 0)
         self.assertEqual(a, 1)
+
+
+class TestCursorRevisionAuthority(unittest.TestCase):
+    def _event(self, **changes):
+        values = {
+            "event_id": "cursor:bubble:1767225601000:call",
+            "origin_session_id": "cursor:AUTHOR",
+            "ts": "2026-01-01T00:00:01.000Z",
+            "actor": "assistant",
+            "type": "tool_call",
+            "text": "read_file_v2: oldquartz.py",
+            "refs": {"files": ["oldquartz.py"], "commands": []},
+            "raw": {"version": "old", "params": {"targetFile": "oldquartz.py"}},
+            "tool_call_event_id": None,
+        }
+        values.update(changes)
+        return EventRow(**values)
+
+    def _stored(self, conn, event_id="cursor:bubble:1767225601000:call"):
+        row = conn.execute(
+            "SELECT * FROM events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        return {
+            "origin": row["origin_session_id"],
+            "ts": row["ts"],
+            "actor": row["actor"],
+            "type": row["type"],
+            "text": row["text"],
+            "refs": json.loads(row["refs"]),
+            "call": row["tool_call_event_id"],
+            "raw": json.loads(row["raw"]),
+        }
+
+    def test_cursor_head_rank_is_total_and_monotonic(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        sid = "cursor:S"
+        first = SourceHead(1, "a" * 64)
+        equal = SourceHead(1, "a" * 64)
+        tie_winner = SourceHead(1, "b" * 64)
+        next_revision = SourceHead(2, "0" * 64)
+
+        self.assertTrue(db.cursor_head_is_newer(conn, sid, first))
+        self.assertTrue(db.record_cursor_head(conn, sid, first))
+        self.assertFalse(db.cursor_head_is_newer(conn, sid, equal))
+        self.assertFalse(db.record_cursor_head(conn, sid, SourceHead(1, "0" * 64)))
+        self.assertTrue(db.cursor_head_is_newer(conn, sid, tie_winner))
+        self.assertTrue(db.record_cursor_head(conn, sid, tie_winner))
+        self.assertTrue(db.cursor_head_is_newer(conn, sid, next_revision))
+        self.assertTrue(db.record_cursor_head(conn, sid, next_revision))
+        row = conn.execute(
+            "SELECT revision, digest FROM cursor_session_heads WHERE session_id=?",
+            (sid,),
+        ).fetchone()
+        self.assertEqual((row["revision"], row["digest"]), (2, "0" * 64))
+        for invalid in (
+            SourceHead(0, "a" * 64),
+            SourceHead(1, "short"),
+            SourceHead(1, "A" * 64),
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    db.cursor_head_is_newer(conn, sid, invalid)
+
+    def test_structural_mismatches_are_hard_conflicts(self):
+        original = self._event()
+        changes = {
+            "ts": "2026-01-01T00:00:02.000Z",
+            "actor": "user",
+            "type": "message",
+            "tool_call_event_id": "cursor:other:1767225601000:call",
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                conn = memory_db()
+                try:
+                    self.assertTrue(db.upsert_cursor_event(conn, original))
+                    self.assertFalse(db.upsert_cursor_event(
+                        conn, replace(original, **{field: value})
+                    ))
+                    stored_key = "call" if field == "tool_call_event_id" else field
+                    self.assertEqual(
+                        self._stored(conn)[stored_key], getattr(original, field)
+                    )
+                finally:
+                    conn.close()
+
+    def test_authored_replaces_inherited_and_inherited_cannot_regress_it(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        inherited = self._event(origin_session_id=None, text="provisional",
+                                refs={"files": ["provisional.py"], "commands": []},
+                                raw={"version": "provisional"})
+        authored = self._event(text="authoritative",
+                               refs={"files": ["authoritative.py"], "commands": []},
+                               raw={"version": "authoritative"})
+        later_copy = self._event(origin_session_id=None, text="stale copy",
+                                 refs={"files": ["stale.py"], "commands": []},
+                                 raw={"version": "stale"})
+
+        self.assertTrue(db.upsert_cursor_event(conn, inherited))
+        self.assertTrue(db.upsert_cursor_event(conn, authored))
+        self.assertTrue(db.upsert_cursor_event(conn, later_copy))
+        stored = self._stored(conn)
+        self.assertEqual(stored["origin"], "cursor:AUTHOR")
+        self.assertEqual(stored["text"], "authoritative")
+        self.assertEqual(stored["refs"]["files"], ["authoritative.py"])
+        self.assertEqual(stored["raw"], {"version": "authoritative"})
+
+    def test_newer_same_origin_updates_content_refs_raw_fts_and_pairing(self):
+        conn = memory_db()
+        self.addCleanup(conn.close)
+        have_fts = db.has_fts5(conn)
+
+        original = self._event()
+        revised = self._event(
+            text="read_file_v2: newzircon.py",
+            refs={"files": ["newzircon.py"], "commands": []},
+            raw={"version": "new", "params": {"targetFile": "newzircon.py"}},
+        )
+        call_id = original.event_id
+        result_id = "cursor:bubble:1767225601000:result"
+        old_result = self._event(
+            event_id=result_id, actor="tool", type="tool_result",
+            text="oldquartz result", refs={"files": [], "commands": []},
+            raw={"result": "oldquartz result"}, tool_call_event_id=call_id,
+        )
+        new_result = replace(
+            old_result, text="newzircon result", raw={"result": "newzircon result"}
+        )
+        message_id = "cursor:message:1767225600000:message"
+        old_message = self._event(
+            event_id=message_id, actor="user", type="message",
+            text="oldquartz prompt", refs={"files": [], "commands": []},
+            raw={"text": "oldquartz prompt"},
+        )
+        new_message = replace(
+            old_message, text="newzircon prompt", raw={"text": "newzircon prompt"}
+        )
+
+        self.assertTrue(db.upsert_cursor_event(conn, original))
+        self.assertTrue(db.upsert_cursor_event(conn, old_result))
+        self.assertTrue(db.upsert_cursor_event(conn, old_message))
+        self.assertTrue(db.upsert_cursor_event(conn, revised))
+        self.assertTrue(db.upsert_cursor_event(conn, new_result))
+        self.assertTrue(db.upsert_cursor_event(conn, new_message))
+
+        self.assertEqual(self._stored(conn)["text"], "read_file_v2: newzircon.py")
+        result = self._stored(conn, result_id)
+        self.assertEqual(result["text"], "newzircon result")
+        self.assertEqual(result["call"], call_id)
+        self.assertEqual(self._stored(conn, message_id)["text"], "newzircon prompt")
+        files = {row["file"] for row in conn.execute(
+            "SELECT file FROM file_refs WHERE event_id=?", (call_id,)
+        )}
+        self.assertEqual(files, {"newzircon.py"})
+        if have_fts:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM events_fts WHERE events_fts MATCH 'oldquartz'"
+            ).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM events_fts WHERE events_fts MATCH 'newzircon'"
+            ).fetchone()[0], 3)
+
+    def test_inherited_only_variants_converge_independently_of_order(self):
+        variants = (
+            self._event(origin_session_id=None, text="variant alpha",
+                        refs={"files": ["alpha.py"], "commands": []},
+                        raw={"variant": "alpha"}),
+            self._event(origin_session_id=None, text="variant beta",
+                        refs={"files": ["beta.py"], "commands": []},
+                        raw={"variant": "beta"}),
+        )
+        outcomes = []
+        for ordered in (variants, tuple(reversed(variants))):
+            conn = memory_db()
+            try:
+                self.assertTrue(db.upsert_cursor_event(conn, ordered[0]))
+                self.assertTrue(db.upsert_cursor_event(conn, ordered[1]))
+                outcomes.append(self._stored(conn))
+            finally:
+                conn.close()
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_distinct_authored_origins_conflict_even_when_content_matches(self):
+        for upsert in (db.upsert_event, db.upsert_cursor_event):
+            with self.subTest(upsert=upsert.__name__):
+                conn = memory_db()
+                try:
+                    original = self._event()
+                    duplicate_author = replace(
+                        original, origin_session_id="cursor:OTHER"
+                    )
+                    self.assertTrue(upsert(conn, original))
+                    self.assertFalse(upsert(conn, duplicate_author))
+                    self.assertEqual(self._stored(conn)["origin"], "cursor:AUTHOR")
+                finally:
+                    conn.close()
 
 
 class TestMalformedRecords(unittest.TestCase):

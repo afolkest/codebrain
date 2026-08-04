@@ -16,6 +16,7 @@ import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -35,8 +36,19 @@ class CursorSnapshotIncomplete(CursorSnapshotError):
     """The ordered transcript references missing or ambiguous source data."""
 
 
+class CursorRetryCategory(str, Enum):
+    """Structured reason an unsettled session should be revisited."""
+
+    ACTIVE = "active"
+    DRAFT = "draft"
+
+
 class CursorSessionUnsettled(CursorSnapshotError):
     """Cursor is still mutating this session; retain the last settled export."""
+
+    def __init__(self, message: str, retry_category: CursorRetryCategory):
+        super().__init__(message)
+        self.retry_category = retry_category
 
 
 def connect_cursor(path: Path = DEFAULT_CURSOR_DB) -> sqlite3.Connection:
@@ -207,22 +219,32 @@ def _require_settled(composer: dict) -> None:
                 f"composer has an invalid structured list {field}"
             )
         if composer.get(field):
-            raise CursorSessionUnsettled("composer has active or queued bubbles")
+            raise CursorSessionUnsettled(
+                "composer has active or queued bubbles", CursorRetryCategory.ACTIVE,
+            )
     _require_exact_booleans(
         composer, "composer", ("isContinuationInProgress",)
     )
     if composer.get("isContinuationInProgress") is True:
-        raise CursorSessionUnsettled("composer continuation is in progress")
+        raise CursorSessionUnsettled(
+            "composer continuation is in progress", CursorRetryCategory.ACTIVE,
+        )
     status = composer.get("status")
     if status == "none":
-        raise CursorSessionUnsettled("composer is a draft")
+        raise CursorSessionUnsettled(
+            "composer is a draft", CursorRetryCategory.DRAFT,
+        )
     if status not in (None, "completed", "aborted"):
-        raise CursorSessionUnsettled("composer status is not terminal")
+        raise CursorSessionUnsettled(
+            "composer status is not terminal", CursorRetryCategory.ACTIVE,
+        )
     # Missing status is an observed historical convention, not accepted for the
     # modern encrypted/stateful generations where it could mean partial data.
     version = composer.get("_v")
     if status is None and isinstance(version, int) and version >= 14:
-        raise CursorSessionUnsettled("modern composer has no terminal status")
+        raise CursorSessionUnsettled(
+            "modern composer has no terminal status", CursorRetryCategory.ACTIVE,
+        )
 
 
 def _project_separate_order(conn: sqlite3.Connection, composer_id: str,

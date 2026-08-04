@@ -252,7 +252,21 @@ reconstructible segment needed to reproduce each chain.
 export machinery, not transcript evidence and not collection inputs. Header
 tokens drive cheap incremental exports, while a full composer reconciliation
 becomes due once the previous full pass is 24 hours old. Identical logical
-snapshots publish no revision.
+snapshots publish no revision. Exporter state version 2 stores only typed retry
+bookkeeping: `active` and `incomplete` sessions use exponential 60-second to
+one-hour delays; `draft`, `absent`, and `source-error` sessions retry daily.
+A changed valid header token or full reconciliation bypasses the delay. Legacy
+pending IDs migrate due immediately, malformed or far-future retry state fails
+open, stale-part scans are hourly, and an unchanged state file is not rewritten.
+
+Normal refresh does not reconstruct every chain. It computes no-follow metadata
+signatures independently for each 64-hex session directory and persists the
+validated selection plus the last selection deliberately handled by ingest in
+the rebuildable local SQLite cache. An unchanged session opens no revision JSON;
+a new, deleted, repaired, or out-of-order segment invalidates only that session.
+The uncached discovery path remains the verifier used by full ingest and
+collection. Cache rows are scoped by absolute archive root, so local and remote
+roots with the same session hash cannot collide.
 
 ## Mapping to the canonical schema
 
@@ -283,6 +297,16 @@ its event time precedes the current composer's `createdAt`; inherited events
 must form one contiguous prefix. Their `origin_session_id` is left unset, while
 authored events point to the current session. The final inherited event is the
 session branch point.
+
+Payload content can legitimately change under one stable identity as Cursor
+settles a tool result or revises a bubble. Each parsed archive head therefore
+carries `(revision, snapshotDigest)`, and canonical ingestion accepts only a
+greater total rank for that Cursor session. Later authored content from the same
+origin replaces the event row and refreshes FTS/file references while preserving
+call/result IDs and pairing. Inherited copies contribute placements but never
+overwrite authored content; if they arrive first, they remain provisional until
+the authored session arrives. Equal or lower heads from another pool root cannot
+regress the session.
 
 Untimed legacy events cannot safely dedupe across composers and use a
 session-scoped identity instead:

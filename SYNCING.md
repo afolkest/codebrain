@@ -120,7 +120,10 @@ remote tool writes ~/.pi
 The same remote sequence applies to Cursor after the remote collector projects a
 settled revision. Active, queued, draft, or internally incomplete Cursor sessions
 retain their last settled revision and become visible after a later successful
-projection.
+projection. Changed header tokens bypass exporter retry delay; active/incomplete
+states retry on a short capped backoff, while unchanged drafts, absent source
+rows, and structured source errors back off until the next daily retry or full
+reconciliation.
 
 With `--interval 300`, remote freshness is usually bounded by about five minutes
 plus Syncthing latency and machine sleep/offline time, then whichever local
@@ -213,6 +216,15 @@ out-of-order arrivals remain unavailable until their predecessors arrive. Pool
 publication is create-only: identical arrivals are no-ops and a conflicting
 file is preserved and reported rather than overwritten. Exporter state, locks,
 and temporary files remain local and never enter the pool.
+
+Read-time discovery caches no-follow revision metadata per archive root and
+hashed session directory. Unchanged directories open no revision JSON; an
+arrival, deletion, or in-place repair revalidates only the affected chain. The
+cache is rebuildable and records selected and successfully handled heads
+separately, so a write failure retries and a predecessor arriving after its
+successor immediately unlocks the latest reconstructible head. Canonical Cursor
+state advances only to a greater `(revision, snapshotDigest)` rank, so a stale
+copy from another root cannot roll it back.
 
 Default `sessdb grep` searches the safe Cursor archive plus pool roots; it never
 falls back to the live database or broad Cursor home directories. A custom

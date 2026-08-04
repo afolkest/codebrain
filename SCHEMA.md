@@ -120,9 +120,26 @@ inherited. Components are percent-escaped before joining.
   exist so far (ancestor not yet synced), `origin_session_id` stays NULL and
   fills in later — content is never lost. Order-independent.
 - **Origin invariant (has teeth)**: at most **one** `inherited=0` placement per event (so `origin_session_id` is 0-or-1, NULL until the origin is ingested). If ingest would create a *second* non-inherited placement — e.g. a copied event whose `ts` exactly ties the child's `created_at` and gets misread as authored — **do not overwrite** the origin (the upsert keeps the first non-null `origin_session_id`).
-- **Copy-consistency check**: an `events` upsert that hits an existing `event_id` whose `actor`/`type`/`text`/tool ids differ signals an id collision or a non-verbatim copy — **flag, don't merge**, and **per-event**: keep the first row, skip just that one event, and count it (`conflicts`). The rest of the session still commits — one anomalous event must never sink a whole session. (Genuine DB errors still isolate the offending *file*.)
+- **Copy-consistency check**: for ordinary append-only sources, an `events`
+  upsert that hits an existing `event_id` whose actor/type/text differs signals
+  an id collision or a non-verbatim copy — **flag, don't merge**, keep the first
+  row, and skip just that placement. Two distinct non-null
+  `origin_session_id` values are always a hard conflict, even if their content
+  matches.
+- **Cursor revision authority**: a validated Cursor head carries the total rank
+  `(revision, snapshotDigest)`. `cursor_session_heads` records the greatest rank
+  accepted for each canonical session in the same transaction as its session,
+  events, placements, derived indexes, and `ingest_state`; equal/lower ranks
+  cannot mutate canonical state. Within a newer accepted head, authored evidence
+  replaces provisional inherited content and later content from the same author
+  replaces its mutable `text`/`refs`/`raw` fields. An inherited copy never
+  overwrites authored evidence, but its placement is retained. Conflicting
+  inherited-only variants converge by canonical full-row digest until the
+  author arrives. Timestamp, actor, type, intrinsic result pairing, and distinct
+  authored origins remain hard collisions. Stable Cursor event IDs deliberately
+  do not include a payload or revision hash.
 - **No content-hashing for identity** (two identical `ls` calls are distinct). Content hashing belongs to the derivations cache, not here.
-- **Refresh-on-read (delta ingest)**: the internal `ingest_state` table (NOT part of the canonical model — bookkeeping, rebuildable) records each raw file's `(mtime, size)` at last parse. `refresh()` re-parses only new/changed files and runs in front of every CLI read, so the DB is always current for this machine at query time — there is no "on disk but not ingested yet" window. Full `ingest` remains the first-build / disaster-recovery pass (and primes `ingest_state`).
+- **Refresh-on-read (delta ingest)**: the internal `ingest_state` table (NOT part of the canonical model — bookkeeping, rebuildable) records each raw file's `(mtime, size)` at last parse. Cursor additionally uses root-scoped `cursor_archive_heads` rows: a no-follow metadata signature per hashed session directory, its validated selected head, and the last selection deliberately handled by ingest. An unchanged directory opens no revision JSON; a changed directory revalidates only its own chain. Selection and handled state remain separate so out-of-order predecessors, corruption fallback, and failed writes retry correctly. Both tables are disposable cache state. `refresh()` runs in front of every CLI read; full `ingest` remains the first-build / disaster-recovery pass.
 - **Re-parse is authoritative for placements**: re-ingesting a file *replaces* that session's `session_events` rows (delete-then-insert) — `seq`/`live`/`parent` are whole-session properties, so a grown file (e.g. a rollback appended later) must be able to flip earlier placements. `events` rows are never deleted: upstream file deletion never deletes from the archive.
 - **FTS**: `events_fts` is an external-content FTS5 index kept current by triggers on `events` — incremental by construction; `rebuild_fts` exists only as repair.
 

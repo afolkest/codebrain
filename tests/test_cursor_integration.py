@@ -9,7 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from codebrain import collect, cursor_archive, ingest
+from codebrain import collect, cursor_archive, db, ingest
+from codebrain.adapters import cursor
 from tests._helpers import memory_db
 from tests.test_cursor_export import _header, _modern_composer, _put, _state_db
 
@@ -61,6 +62,14 @@ def _tool_snapshot(sid, session_created_at):
             "createdAt": created_at, "payload": payload,
         }],
     }
+
+
+def _mutable_tool_snapshot(sid, session_created_at, *, target, result):
+    snapshot = _tool_snapshot(sid, session_created_at)
+    tool = snapshot["order"][0]["payload"]["toolFormerData"]
+    tool["params"] = {"targetFile": target}
+    tool["result"] = {"contents": result}
+    return snapshot
 
 
 def _live_cursor_db(path: Path):
@@ -188,6 +197,486 @@ class TestCursorRefreshIntegration(unittest.TestCase):
             {(row["session_id"], row["inherited"]) for row in placements},
             {("cursor:PARENT", 0), ("cursor:CHILD", 1)},
         )
+
+    def test_later_revision_updates_stable_tool_events_and_indexes(self):
+        old = _mutable_tool_snapshot(
+            "AUTHOR", BASE_MS, target="oldquartz.py", result="oldquartz result",
+        )
+        new = _mutable_tool_snapshot(
+            "AUTHOR", BASE_MS, target="newzircon.py", result="newzircon result",
+        )
+        cursor_archive.publish_snapshot(old, self.archive)
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        cursor_archive.publish_snapshot(new, self.archive)
+        stats = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+
+        call_id = "cursor:shared-tool:1767225601000:call"
+        result_id = "cursor:shared-tool:1767225601000:result"
+        call = self.conn.execute(
+            "SELECT text, refs, origin_session_id FROM events WHERE event_id=?",
+            (call_id,),
+        ).fetchone()
+        result = self.conn.execute(
+            "SELECT text, tool_call_event_id FROM events WHERE event_id=?",
+            (result_id,),
+        ).fetchone()
+        files = self.conn.execute(
+            "SELECT file FROM file_refs WHERE event_id=?", (call_id,)
+        ).fetchall()
+        head = self.conn.execute(
+            "SELECT revision FROM cursor_session_heads "
+            "WHERE session_id='cursor:AUTHOR'"
+        ).fetchone()
+        self.assertEqual((stats["sessions"], stats["conflicts"]), (1, 0))
+        self.assertIn("newzircon.py", call["text"])
+        self.assertEqual(call["origin_session_id"], "cursor:AUTHOR")
+        self.assertEqual(json.loads(call["refs"])["files"], ["newzircon.py"])
+        self.assertEqual([row["file"] for row in files], ["newzircon.py"])
+        self.assertIn("newzircon result", result["text"])
+        self.assertEqual(result["tool_call_event_id"], call_id)
+        self.assertEqual(head["revision"], 2)
+
+    def test_later_revision_updates_message_under_stable_identity(self):
+        cursor_archive.publish_snapshot(
+            _snapshot("AUTHOR", texts=("old message",)), self.archive
+        )
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        cursor_archive.publish_snapshot(
+            _snapshot("AUTHOR", texts=("revised message",)), self.archive
+        )
+        stats = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+
+        rows = self.conn.execute(
+            "SELECT event_id, text, origin_session_id FROM events"
+        ).fetchall()
+        self.assertEqual((stats["sessions"], stats["conflicts"]), (1, 0))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (rows[0]["event_id"], rows[0]["text"], rows[0]["origin_session_id"]),
+            (
+                "cursor:b1:1767225601000:message",
+                "revised message",
+                "cursor:AUTHOR",
+            ),
+        )
+
+    def test_authored_and_inherited_copies_converge_in_either_order(self):
+        outcomes = []
+        for child_first in (True, False):
+            with self.subTest(child_first=child_first):
+                conn = memory_db()
+                self.addCleanup(conn.close)
+                child_root = self.root / f"child-{child_first}"
+                parent_root = self.root / f"parent-{child_first}"
+                cursor_archive.publish_snapshot(
+                    _mutable_tool_snapshot(
+                        "CHILD", BASE_MS + 2000,
+                        target="stale.py", result="stale result",
+                    ),
+                    child_root,
+                )
+                cursor_archive.publish_snapshot(
+                    _mutable_tool_snapshot(
+                        "PARENT", BASE_MS,
+                        target="authoritative.py", result="authoritative result",
+                    ),
+                    parent_root,
+                )
+                roots = (child_root, parent_root) if child_first \
+                    else (parent_root, child_root)
+                for root in roots:
+                    ingest.ingest_source(conn, "cursor", raw_root=root)
+                call_id = "cursor:shared-tool:1767225601000:call"
+                row = conn.execute(
+                    "SELECT text, refs, origin_session_id FROM events WHERE event_id=?",
+                    (call_id,),
+                ).fetchone()
+                placements = conn.execute(
+                    "SELECT session_id, inherited FROM session_events "
+                    "WHERE event_id=? ORDER BY session_id", (call_id,),
+                ).fetchall()
+                outcomes.append((
+                    dict(row),
+                    [(p["session_id"], p["inherited"]) for p in placements],
+                ))
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(outcomes[0][0]["origin_session_id"], "cursor:PARENT")
+        self.assertIn("authoritative.py", outcomes[0][0]["text"])
+        self.assertEqual(
+            outcomes[0][1], [("cursor:CHILD", 1), ("cursor:PARENT", 0)]
+        )
+
+    def test_lower_rank_from_another_root_cannot_regress_session(self):
+        newer_root = self.root / "newer"
+        stale_root = self.root / "stale"
+        old = _mutable_tool_snapshot(
+            "AUTHOR", BASE_MS, target="old.py", result="old result",
+        )
+        new = _mutable_tool_snapshot(
+            "AUTHOR", BASE_MS, target="new.py", result="new result",
+        )
+        cursor_archive.publish_snapshot(old, stale_root)
+        cursor_archive.publish_snapshot(old, newer_root)
+        cursor_archive.publish_snapshot(new, newer_root)
+
+        ingest.ingest_source(self.conn, "cursor", raw_root=newer_root)
+        stats = ingest.ingest_source(self.conn, "cursor", raw_root=stale_root)
+
+        row = self.conn.execute(
+            "SELECT text FROM events "
+            "WHERE event_id='cursor:shared-tool:1767225601000:call'"
+        ).fetchone()
+        head = self.conn.execute(
+            "SELECT revision FROM cursor_session_heads "
+            "WHERE session_id='cursor:AUTHOR'"
+        ).fetchone()
+        self.assertEqual((stats["sessions"], stats["skipped"]), (0, 1))
+        self.assertIn("new.py", row["text"])
+        self.assertEqual(head["revision"], 2)
+
+    def test_failed_revision_write_rolls_back_content_and_head(self):
+        old = _mutable_tool_snapshot(
+            "AUTHOR", BASE_MS, target="old.py", result="old result",
+        )
+        new = _mutable_tool_snapshot(
+            "AUTHOR", BASE_MS, target="new.py", result="new result",
+        )
+        cursor_archive.publish_snapshot(old, self.archive)
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        cursor_archive.publish_snapshot(new, self.archive)
+        with mock.patch(
+                "codebrain.ingest.upsert_placement",
+                side_effect=RuntimeError("injected placement failure")):
+            failed = ingest.refresh(
+                self.conn, sources=("cursor",), roots={"cursor": self.archive}
+            )
+
+        call_id = "cursor:shared-tool:1767225601000:call"
+        text_after_failure = self.conn.execute(
+            "SELECT text FROM events WHERE event_id=?", (call_id,)
+        ).fetchone()["text"]
+        head_after_failure = self.conn.execute(
+            "SELECT revision FROM cursor_session_heads "
+            "WHERE session_id='cursor:AUTHOR'"
+        ).fetchone()["revision"]
+        retried = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        text_after_retry = self.conn.execute(
+            "SELECT text FROM events WHERE event_id=?", (call_id,)
+        ).fetchone()["text"]
+        self.assertEqual(failed["errors"], 1)
+        self.assertIn("old.py", text_after_failure)
+        self.assertEqual(head_after_failure, 1)
+        self.assertEqual(retried["sessions"], 1)
+        self.assertIn("new.py", text_after_retry)
+
+    def test_lost_head_race_is_a_rolled_back_skip_not_an_error(self):
+        path = cursor_archive.publish_snapshot(_snapshot("RACE"), self.archive)
+        processed = set()
+        with mock.patch(
+                "codebrain.ingest.record_cursor_head", return_value=False):
+            stats = ingest._ingest(
+                self.conn, [path], cursor.parse_file,
+                processed_paths=processed,
+            )
+        self.assertEqual((stats["skipped"], stats["errors"]), (1, 0))
+        self.assertEqual(processed, {path})
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id='cursor:RACE'"
+        ).fetchone())
+
+    def test_warm_cache_survives_database_reopen_without_json_validation(self):
+        cursor_archive.publish_snapshot(_snapshot("WARM"), self.archive)
+        db_path = self.root / "cache.db"
+        first_conn = db.connect(db_path)
+        ingest.refresh(
+            first_conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        first_conn.close()
+
+        reopened = db.connect(db_path)
+        self.addCleanup(reopened.close)
+        with mock.patch(
+                "codebrain.cursor_archive.select_session_head",
+                side_effect=AssertionError("warm cache revalidated JSON")), \
+             mock.patch(
+                "codebrain.cursor_archive._read_private_text",
+                side_effect=AssertionError("warm cache opened JSON")):
+            stats = ingest.refresh(
+                reopened, sources=("cursor",), roots={"cursor": self.archive}
+            )
+        self.assertEqual((stats["files"], stats["errors"]), (0, 0))
+
+    def test_one_changed_session_validates_only_its_chain(self):
+        cursor_archive.publish_snapshot(_snapshot("ONE"), self.archive)
+        cursor_archive.publish_snapshot(_snapshot("TWO"), self.archive)
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        cursor_archive.publish_snapshot(
+            _snapshot("ONE", texts=("one", "changed")), self.archive
+        )
+
+        original = cursor_archive.select_session_head
+        with mock.patch(
+                "codebrain.cursor_archive.select_session_head",
+                wraps=original) as select:
+            stats = ingest.refresh(
+                self.conn, sources=("cursor",), roots={"cursor": self.archive}
+            )
+        self.assertEqual((stats["sessions"], select.call_count), (1, 1))
+        self.assertEqual(
+            select.call_args.args[0].session_key,
+            cursor_archive.session_directory(self.archive, "ONE").parent.name,
+        )
+
+    def test_out_of_order_predecessor_arrival_unlocks_latest_head(self):
+        source = self.root / "ordered-source"
+        target = self.root / "ordered-target"
+        cursor_archive.publish_snapshot(_snapshot("ORDER"), source)
+        cursor_archive.publish_snapshot(
+            _snapshot("ORDER", texts=("one", "latest")), source
+        )
+        revisions = cursor_archive.discover_revisions(source)
+        destination_dir = cursor_archive.session_directory(target, "ORDER")
+        destination_dir.mkdir(parents=True)
+        (destination_dir / revisions[1].name).write_bytes(
+            cursor_archive.read_revision_bytes(revisions[1])
+        )
+
+        first = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": target}
+        )
+        (destination_dir / revisions[0].name).write_bytes(
+            cursor_archive.read_revision_bytes(revisions[0])
+        )
+        second = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": target}
+        )
+
+        tip = self.conn.execute(
+            "SELECT text FROM transcript WHERE session_id='cursor:ORDER' "
+            "ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        head = self.conn.execute(
+            "SELECT revision FROM cursor_session_heads "
+            "WHERE session_id='cursor:ORDER'"
+        ).fetchone()
+        self.assertEqual((first["files"], second["sessions"]), (0, 1))
+        self.assertEqual((tip["text"], head["revision"]), ("latest", 2))
+
+    def test_cache_write_failure_fails_open_and_revalidates(self):
+        cursor_archive.publish_snapshot(_snapshot("RETRY"), self.archive)
+        self.conn.execute(
+            "CREATE TRIGGER fail_cursor_cache BEFORE INSERT ON cursor_archive_heads "
+            "BEGIN SELECT RAISE(FAIL, 'injected cache failure'); END"
+        )
+        self.conn.commit()
+        first = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        self.conn.execute("DROP TRIGGER fail_cursor_cache")
+        self.conn.commit()
+
+        original = cursor_archive.select_session_head
+        with mock.patch(
+                "codebrain.cursor_archive.select_session_head",
+                wraps=original) as select:
+            second = ingest.refresh(
+                self.conn, sources=("cursor",), roots={"cursor": self.archive}
+            )
+        self.assertEqual(first["errors"], 1)
+        self.assertEqual((second["skipped"], select.call_count), (1, 1))
+
+    def test_malformed_cache_row_and_validator_bump_fail_open(self):
+        cursor_archive.publish_snapshot(_snapshot("CACHE"), self.archive)
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        original = cursor_archive.select_session_head
+        mutations = (
+            "selected_digest='not-a-digest'",
+            "selected_revision=selected_revision+1",
+            "selected_session_id='cursor:OTHER'",
+            "selected_session_id='CACHE'",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.conn.execute(
+                    f"UPDATE cursor_archive_heads SET {mutation}"
+                )
+                self.conn.commit()
+                with mock.patch(
+                        "codebrain.cursor_archive.select_session_head",
+                        wraps=original) as malformed_select:
+                    malformed = ingest.refresh(
+                        self.conn, sources=("cursor",),
+                        roots={"cursor": self.archive},
+                    )
+                self.assertEqual(
+                    (malformed["skipped"], malformed_select.call_count), (1, 1)
+                )
+
+        with mock.patch.object(
+                ingest, "CURSOR_ARCHIVE_VALIDATOR_VERSION", 2), \
+             mock.patch(
+                "codebrain.cursor_archive.select_session_head",
+                wraps=original) as bumped_select:
+            bumped = ingest.refresh(
+                self.conn, sources=("cursor",), roots={"cursor": self.archive}
+            )
+        self.assertEqual((bumped["skipped"], bumped_select.call_count), (1, 1))
+
+    def test_missing_or_unsafe_root_retains_cache_for_recovery(self):
+        cursor_archive.publish_snapshot(_snapshot("ROOT"), self.archive)
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        detached = self.root / "detached-archive"
+        self.archive.rename(detached)
+        missing = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        cached_while_missing = self.conn.execute(
+            "SELECT COUNT(*) FROM cursor_archive_heads"
+        ).fetchone()[0]
+        self.archive.symlink_to(detached, target_is_directory=True)
+        unsafe = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        self.archive.unlink()
+        detached.rename(self.archive)
+        with mock.patch(
+                "codebrain.cursor_archive.select_session_head",
+                side_effect=AssertionError("recovered unchanged root revalidated")):
+            recovered = ingest.refresh(
+                self.conn, sources=("cursor",), roots={"cursor": self.archive}
+            )
+        self.assertEqual((missing["errors"], cached_while_missing), (0, 1))
+        self.assertEqual(unsafe["errors"], 1)
+        self.assertEqual((recovered["files"], recovered["errors"]), (0, 0))
+
+    def test_archive_cache_isolated_by_root_for_same_session_hash(self):
+        one = self.root / "root-one"
+        two = self.root / "root-two"
+        cursor_archive.publish_snapshot(_snapshot("SAME", texts=("one",)), one)
+        cursor_archive.publish_snapshot(_snapshot("SAME", texts=("two",)), two)
+        ingest.refresh(self.conn, sources=("cursor",), roots={"cursor": one})
+        ingest.refresh(self.conn, sources=("cursor",), roots={"cursor": two})
+
+        roots = self.conn.execute(
+            "SELECT root, COUNT(*) AS n FROM cursor_archive_heads GROUP BY root"
+        ).fetchall()
+        self.assertEqual(len(roots), 2)
+        self.assertEqual({row["n"] for row in roots}, {1})
+
+    def test_equal_revision_divergence_converges_in_both_root_orders(self):
+        alpha_root = self.root / "equal-alpha"
+        beta_root = self.root / "equal-beta"
+        alpha_path = cursor_archive.publish_snapshot(
+            _snapshot("EQUAL", texts=("alpha",)), alpha_root
+        )
+        beta_path = cursor_archive.publish_snapshot(
+            _snapshot("EQUAL", texts=("beta",)), beta_root
+        )
+        expected_digest, expected_text = max(
+            (alpha_path.name.split("-", 1)[1][:-5], "alpha"),
+            (beta_path.name.split("-", 1)[1][:-5], "beta"),
+        )
+        outcomes = []
+        for roots in ((alpha_root, beta_root), (beta_root, alpha_root)):
+            conn = memory_db()
+            try:
+                for root in roots:
+                    ingest.ingest_source(conn, "cursor", raw_root=root)
+                event = conn.execute(
+                    "SELECT text, origin_session_id FROM events"
+                ).fetchone()
+                head = conn.execute(
+                    "SELECT revision, digest FROM cursor_session_heads "
+                    "WHERE session_id='cursor:EQUAL'"
+                ).fetchone()
+                placements = conn.execute(
+                    "SELECT COUNT(*) FROM session_events "
+                    "WHERE session_id='cursor:EQUAL'"
+                ).fetchone()[0]
+                outcomes.append((dict(event), tuple(head), placements))
+            finally:
+                conn.close()
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(outcomes[0], (
+            {"text": expected_text, "origin_session_id": "cursor:EQUAL"},
+            (1, expected_digest),
+            1,
+        ))
+
+    def test_corrupt_fallback_is_handled_once_without_canonical_regression(self):
+        first = cursor_archive.publish_snapshot(
+            _snapshot("FALLBACK", texts=("old",)), self.archive
+        )
+        second = cursor_archive.publish_snapshot(
+            _snapshot("FALLBACK", texts=("old", "new")), self.archive
+        )
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        second_bytes = second.read_bytes()
+        second.write_text("{}", encoding="utf-8")
+        fallback = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        with mock.patch(
+                "codebrain.cursor_archive.select_session_head",
+                side_effect=AssertionError("handled fallback revalidated")):
+            noop = ingest.refresh(
+                self.conn, sources=("cursor",), roots={"cursor": self.archive}
+            )
+
+        second.write_bytes(second_bytes)
+        repaired = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        placements = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM session_events "
+            "WHERE session_id='cursor:FALLBACK'"
+        ).fetchone()["n"]
+        head = self.conn.execute(
+            "SELECT revision FROM cursor_session_heads "
+            "WHERE session_id='cursor:FALLBACK'"
+        ).fetchone()["revision"]
+        self.assertIsNotNone(first)
+        self.assertEqual((fallback["skipped"], noop["files"]), (1, 0))
+        self.assertEqual((repaired["skipped"], placements, head), (1, 2, 2))
+
+    def test_scaled_warm_refresh_opens_no_revision_json(self):
+        for index in range(200):
+            snapshot = _snapshot(f"SCALE-{index}")
+            bubble_id = f"scale-bubble-{index}"
+            snapshot["order"][0]["bubbleId"] = bubble_id
+            snapshot["order"][0]["payload"]["bubbleId"] = bubble_id
+            cursor_archive.publish_snapshot(snapshot, self.archive)
+        ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+
+        with mock.patch(
+                "codebrain.cursor_archive._read_private_text",
+                side_effect=AssertionError("warm scale refresh opened JSON")):
+            stats = ingest.refresh(
+                self.conn, sources=("cursor",), roots={"cursor": self.archive}
+            )
+        self.assertEqual((stats["files"], stats["errors"]), (0, 0))
 
 
 class TestCursorCollectionIntegration(unittest.TestCase):

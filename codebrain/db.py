@@ -4,13 +4,14 @@ The DB is a rebuildable cache (DESIGN.md) — drop it and re-ingest from raw.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 from pathlib import Path
 
-from codebrain.adapters.base import EventRow, PlacementRow, SessionRow
+from codebrain.adapters.base import EventRow, PlacementRow, SessionRow, SourceHead
 from codebrain.paths import path_basename
 
 DEFAULT_DB = Path(os.environ.get("CODEBRAIN_DB", Path.home() / ".codebrain" / "codebrain.db"))
@@ -91,6 +92,35 @@ CREATE TABLE IF NOT EXISTS ingest_state (
   mtime      REAL NOT NULL,
   size       INTEGER NOT NULL,
   session_id TEXT
+);
+
+-- Internal Cursor authority watermark. Cursor archive revisions are immutable,
+-- but a session has many revision files and pool arrival can be out of order.
+-- The total (revision, digest) rank accepted here prevents a stale head from
+-- regressing canonical session/event/placement state.
+CREATE TABLE IF NOT EXISTS cursor_session_heads (
+  session_id TEXT PRIMARY KEY,
+  revision   INTEGER NOT NULL CHECK (revision > 0),
+  digest     TEXT NOT NULL CHECK (
+    length(digest) = 64 AND digest NOT GLOB '*[^0-9a-f]*'
+  )
+);
+
+-- Rebuildable Cursor archive discovery cache. This is deliberately root- and
+-- session-directory-scoped: one synced session arrival invalidates only its own
+-- revision chain. selected_* records the validated reconstructible head, while
+-- handled_name advances only after ingest deliberately handled that selection.
+CREATE TABLE IF NOT EXISTS cursor_archive_heads (
+  root                TEXT NOT NULL,
+  session_key         TEXT NOT NULL,
+  validator_version   INTEGER NOT NULL,
+  signature           TEXT NOT NULL,
+  selected_name       TEXT,
+  selected_session_id TEXT,
+  selected_revision   INTEGER,
+  selected_digest     TEXT,
+  handled_name        TEXT,
+  PRIMARY KEY (root, session_key)
 );
 
 -- bmux provenance overlay. NOT part of the canonical
@@ -383,17 +413,94 @@ def upsert_session(conn: sqlite3.Connection, s: SessionRow) -> None:
 def upsert_event(conn: sqlite3.Connection, e: EventRow) -> bool:
     """Insert/refresh one event. Returns True if written, False if SKIPPED due to a
     copy-consistency conflict — an existing row with the same event_id but different
-    actor/type/text (an id collision or a non-verbatim copy). On conflict we keep the
-    first row untouched and flag it (SCHEMA.md "flag, don't merge"); the caller counts
-    it and the rest of the session still commits. Skipping one event is strictly safer
-    than aborting the whole file, and conflicts are near-impossible (ids are globally
-    unique for claude/codex, copy-invariant for pi)."""
-    row = conn.execute(
-        "SELECT actor, type, text, refs FROM events WHERE event_id=?", (e.event_id,)
-    ).fetchone()
-    if row is not None and (row["actor"], row["type"], row["text"]) != (e.actor, e.type, e.text):
+    actor/type/text or a different non-null authoring session (an id collision or
+    non-verbatim copy). On conflict we keep the first row untouched and flag it
+    (SCHEMA.md "flag, don't merge"); the caller counts it and the rest of the session
+    still commits. Skipping one event is strictly safer than aborting the whole file,
+    and conflicts are near-impossible (ids are globally unique for claude/codex,
+    copy-invariant for pi)."""
+    row = _event_row(conn, e.event_id)
+    if row is not None:
+        if (row["actor"], row["type"], row["text"]) != (
+                e.actor, e.type, e.text):
+            return False
+        if _authored_origin_conflict(row["origin_session_id"], e.origin_session_id):
+            return False
+    _store_event(conn, e, row)
+    return True
+
+
+def upsert_cursor_event(conn: sqlite3.Connection, e: EventRow) -> bool:
+    """Apply Cursor's origin-authoritative event merge contract.
+
+    The caller must first gate the containing session on ``SourceHead`` rank.
+    Consequently, an authored row from the same origin is the newer accepted
+    revision and replaces all mutable evidence. Inherited copies remain useful
+    placements but can never overwrite authored evidence. Until the author is
+    seen, a canonical full-row digest makes conflicting inherited copies
+    converge independently of ingest order.
+
+    ``False`` means a structural identity/origin collision and tells ingest to
+    omit that placement. ``True`` includes accepted no-op inherited copies, so
+    their placements remain in the transcript forest.
+    """
+    row = _event_row(conn, e.event_id)
+    if row is None:
+        # Validate strict canonicalizability before inserting provisional state;
+        # later inherited comparisons depend on this being well-defined.
+        if _cursor_event_digest(e) is None:
+            return False
+        _store_event(conn, e, None)
+        return True
+
+    if (row["ts"], row["actor"], row["type"], row["tool_call_event_id"]) != (
+            e.ts, e.actor, e.type, e.tool_call_event_id):
         return False
+    old_origin = row["origin_session_id"]
+    new_origin = e.origin_session_id
+    if _authored_origin_conflict(old_origin, new_origin):
+        return False
+
+    if old_origin is not None:
+        if new_origin is None:
+            return True
+        # Same authored origin at a newer accepted session head.
+        if _cursor_event_digest(e) is None:
+            return False
+        _store_event(conn, e, row)
+        return True
+
+    if new_origin is not None:
+        # Authored evidence supersedes any provisional inherited variant.
+        if _cursor_event_digest(e) is None:
+            return False
+        _store_event(conn, e, row)
+        return True
+
+    incoming_digest = _cursor_event_digest(e)
+    stored_digest = _cursor_stored_event_digest(row)
+    if incoming_digest is None or stored_digest is None:
+        return False
+    if incoming_digest < stored_digest:
+        _store_event(conn, e, row)
+    return True
+
+
+def _event_row(conn: sqlite3.Connection, event_id: str):
+    return conn.execute(
+        "SELECT event_id, origin_session_id, ts, actor, type, text, refs, "
+        "tool_call_event_id, raw FROM events WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+
+
+def _authored_origin_conflict(old: str, new: str) -> bool:
+    return old is not None and new is not None and old != new
+
+
+def _store_event(conn: sqlite3.Connection, e: EventRow, row) -> None:
     refs_json = json.dumps(e.refs)
+    raw_json = json.dumps(e.raw)
     conn.execute(
         """
         INSERT INTO events (event_id, origin_session_id, ts, actor, type, text,
@@ -408,7 +515,7 @@ def upsert_event(conn: sqlite3.Connection, e: EventRow) -> bool:
             tool_call_event_id=excluded.tool_call_event_id, raw=excluded.raw
         """,
         (e.event_id, e.origin_session_id, e.ts, e.actor, e.type, e.text,
-         refs_json, e.tool_call_event_id, json.dumps(e.raw)),
+         refs_json, e.tool_call_event_id, raw_json),
     )
     if row is None:
         # Fresh insert: only touch the index if there are files (the ~80% no-file
@@ -421,7 +528,106 @@ def upsert_event(conn: sqlite3.Connection, e: EventRow) -> bool:
         # paths from a `patch_apply_end` record that only appears later. Resync (which
         # also clears, in case a ref was dropped) so `touched` can't go stale.
         _record_file_refs(conn, e)
-    return True
+
+
+def _cursor_event_digest(e: EventRow):
+    return _canonical_event_digest({
+        "event_id": e.event_id,
+        "origin_session_id": e.origin_session_id,
+        "ts": e.ts,
+        "actor": e.actor,
+        "type": e.type,
+        "text": e.text,
+        "refs": e.refs,
+        "tool_call_event_id": e.tool_call_event_id,
+        "raw": e.raw,
+    })
+
+
+def _cursor_stored_event_digest(row):
+    try:
+        refs = json.loads(row["refs"])
+        raw = json.loads(row["raw"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return _canonical_event_digest({
+        "event_id": row["event_id"],
+        "origin_session_id": row["origin_session_id"],
+        "ts": row["ts"],
+        "actor": row["actor"],
+        "type": row["type"],
+        "text": row["text"],
+        "refs": refs,
+        "tool_call_event_id": row["tool_call_event_id"],
+        "raw": raw,
+    })
+
+
+def _canonical_event_digest(value):
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8", errors="strict")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def cursor_head_is_newer(conn: sqlite3.Connection, session_id: str,
+                         head: SourceHead) -> bool:
+    """Whether ``head`` outranks the accepted Cursor head for ``session_id``."""
+    _validate_source_head(head)
+    row = conn.execute(
+        "SELECT revision, digest FROM cursor_session_heads WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    return row is None or not _stored_cursor_head_valid(row) \
+        or (head.revision, head.digest) > (
+        row["revision"], row["digest"]
+    )
+
+
+def record_cursor_head(conn: sqlite3.Connection, session_id: str,
+                       head: SourceHead) -> bool:
+    """Advance a Cursor session watermark without ever recording a lower rank."""
+    _validate_source_head(head)
+    cursor = conn.execute(
+        """
+        INSERT INTO cursor_session_heads (session_id, revision, digest)
+        VALUES (?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          revision=excluded.revision, digest=excluded.digest
+        WHERE excluded.revision > cursor_session_heads.revision
+           OR (excluded.revision = cursor_session_heads.revision
+               AND excluded.digest > cursor_session_heads.digest)
+           OR cursor_session_heads.revision <= 0
+           OR length(cursor_session_heads.digest) != 64
+           OR cursor_session_heads.digest GLOB '*[^0-9a-f]*'
+        """,
+        (session_id, head.revision, head.digest),
+    )
+    return cursor.rowcount == 1
+
+
+def _validate_source_head(head: SourceHead) -> None:
+    if not isinstance(head, SourceHead) \
+            or isinstance(head.revision, bool) \
+            or not isinstance(head.revision, int) or head.revision <= 0 \
+            or not isinstance(head.digest, str) or len(head.digest) != 64 \
+            or any(char not in "0123456789abcdef" for char in head.digest):
+        raise ValueError("invalid source head")
+
+
+def _stored_cursor_head_valid(row) -> bool:
+    revision = row["revision"]
+    digest = row["digest"]
+    return isinstance(revision, int) and not isinstance(revision, bool) \
+        and revision > 0 and isinstance(digest, str) and len(digest) == 64 \
+        and all(char in "0123456789abcdef" for char in digest)
 
 
 def upsert_placement(conn: sqlite3.Connection, p: PlacementRow) -> None:

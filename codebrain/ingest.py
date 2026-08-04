@@ -9,17 +9,26 @@ copy-invariant ids, so re-running is a no-op and every source shares one deduped
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
 import sqlite3
+import stat
 import sys
 from pathlib import Path
 from typing import Callable, Optional
 
 from codebrain import cursor_archive, cursor_export
 from codebrain.adapters import claude, codex, cursor, pi
-from codebrain.db import upsert_event, upsert_placement, upsert_session
+from codebrain.db import (
+    cursor_head_is_newer,
+    record_cursor_head,
+    upsert_cursor_event,
+    upsert_event,
+    upsert_placement,
+    upsert_session,
+)
 
 DEFAULT_CLAUDE_ROOT = Path.home() / ".claude"
 DEFAULT_CODEX_ROOT = Path.home() / ".codex"
@@ -29,6 +38,11 @@ DEFAULT_CURSOR_ROOT = cursor_export.DEFAULT_CURSOR_ROOT
 
 SOURCES = ("claude", "codex", "pi", "cursor")
 STATS_KEYS = ("files", "sessions", "events", "placements", "skipped", "conflicts", "errors")
+CURSOR_ARCHIVE_VALIDATOR_VERSION = 1
+
+
+class _CursorHeadSuperseded(RuntimeError):
+    """Another writer accepted an equal or greater Cursor head first."""
 
 
 def _empty_stats(**extra) -> dict:
@@ -114,7 +128,8 @@ def _record_state(conn, path: Path, st, session_id: Optional[str]) -> None:
     )
 
 
-def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) -> dict:
+def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
+            processed_paths: Optional[set[Path]] = None) -> dict:
     stats = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
              "skipped": 0, "conflicts": 0, "errors": 0}
     for path in files:
@@ -132,23 +147,48 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) 
             stats["errors"] += 1
             _record_state(conn, path, st, None)  # don't re-error every refresh; a
             conn.commit()                        # changed file is retried anyway
+            if processed_paths is not None:
+                processed_paths.add(path)
             continue
         if parsed is None:
             stats["skipped"] += 1  # contentless file (empty / no emittable events)
             _record_state(conn, path, st, None)
             conn.commit()
+            if processed_paths is not None:
+                processed_paths.add(path)
             continue
         conflicts = 0
         try:
             if enrich is not None:
                 enrich(parsed)
+            is_cursor = parsed.session.source == "cursor"
+            if is_cursor:
+                if parsed.source_head is None:
+                    raise ValueError("Cursor archive parse has no validated source head")
+                if not cursor_head_is_newer(
+                        conn, parsed.session.session_id, parsed.source_head):
+                    # The selected archive head can fall back when a newer segment
+                    # is missing or corrupt, and pool roots can arrive out of order.
+                    # Record that this file was handled, but never regress canonical
+                    # data below the greatest accepted source rank.
+                    _record_state(conn, path, st, parsed.session.session_id)
+                    conn.commit()
+                    stats["skipped"] += 1
+                    if processed_paths is not None:
+                        processed_paths.add(path)
+                    continue
             upsert_session(conn, parsed.session)
             skipped: set = set()
             for e in parsed.events:
-                if not upsert_event(conn, e):  # copy-consistency conflict (SCHEMA.md)
+                accepted = upsert_cursor_event(conn, e) if is_cursor \
+                    else upsert_event(conn, e)
+                if not accepted:  # copy-consistency conflict (SCHEMA.md)
                     conflicts += 1
                     skipped.add(e.event_id)
-                    print(f"  ~ conflict {path.name}: kept first content for {e.event_id}")
+                    print(
+                        f"  ~ conflict {path.name}: kept authoritative content "
+                        f"for {e.event_id}"
+                    )
             # A re-parse is authoritative for this session's placements: replace,
             # don't merge, so no stale placement survives a rewritten/shrunk file.
             conn.execute("DELETE FROM session_events WHERE session_id=?",
@@ -158,6 +198,19 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) 
                     continue  # the event row we'd point at holds another session's content
                 upsert_placement(conn, p)
             _record_state(conn, path, st, parsed.session.session_id)
+            if is_cursor and not record_cursor_head(
+                    conn, parsed.session.session_id, parsed.source_head):
+                raise _CursorHeadSuperseded
+            conn.commit()
+        except _CursorHeadSuperseded:
+            # Two refreshes can both pass the read gate before either obtains the
+            # SQLite write lock. The loser must roll back all provisional writes,
+            # but this is deliberate stale/equal suppression, not a source error.
+            conn.rollback()
+            stats["skipped"] += 1
+            if processed_paths is not None:
+                processed_paths.add(path)
+            continue
         except Exception as exc:  # noqa: BLE001 — a genuine DB error isolates one file
             print(f"  ! write error {path.name}: {exc}")
             stats["errors"] += 1
@@ -167,7 +220,8 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None) 
         stats["events"] += len(parsed.events)
         stats["placements"] += len(parsed.placements)
         stats["conflicts"] += conflicts
-        conn.commit()
+        if processed_paths is not None:
+            processed_paths.add(path)
     return stats
 
 
@@ -347,6 +401,212 @@ def ingest_source(conn: sqlite3.Connection, source: str,
     return stats
 
 
+def _cursor_root_key(root: Path) -> str:
+    # Keep roots isolated without resolving/following a caller-controlled symlink.
+    return os.path.abspath(os.fspath(root))
+
+
+def _cursor_revision_identity(value):
+    if not isinstance(value, str) or not value.endswith(".json"):
+        return None
+    try:
+        revision, digest = value[:-5].split("-", 1)
+    except ValueError:
+        return None
+    if len(revision) != 20 or not revision.isdigit() \
+            or len(digest) != 64 \
+            or any(char not in "0123456789abcdef" for char in digest):
+        return None
+    return int(revision), digest
+
+
+def _cursor_revision_name(value) -> bool:
+    return _cursor_revision_identity(value) is not None
+
+
+def _cursor_cache_row_valid(row, signature: str, session_key: str) -> bool:
+    if row is None or row["validator_version"] != CURSOR_ARCHIVE_VALIDATOR_VERSION \
+            or row["signature"] != signature:
+        return False
+    selected = row["selected_name"]
+    if selected is None:
+        return row["selected_session_id"] is None \
+            and row["selected_revision"] is None \
+            and row["selected_digest"] is None \
+            and row["handled_name"] is None
+    revision = row["selected_revision"]
+    digest = row["selected_digest"]
+    identity = _cursor_revision_identity(selected)
+    selected_session_id = row["selected_session_id"]
+    composer_id = selected_session_id.removeprefix("cursor:") \
+        if isinstance(selected_session_id, str) else ""
+    return identity is not None and identity == (revision, digest) \
+        and isinstance(selected_session_id, str) \
+        and selected_session_id.startswith("cursor:") \
+        and bool(composer_id) \
+        and hashlib.sha256(composer_id.encode("utf-8")).hexdigest() == session_key \
+        and isinstance(revision, int) and not isinstance(revision, bool) \
+        and revision > 0 \
+        and isinstance(digest, str) and len(digest) == 64 \
+        and all(char in "0123456789abcdef" for char in digest) \
+        and (row["handled_name"] is None
+             or _cursor_revision_name(row["handled_name"]))
+
+
+def _cursor_cached_selection_needs_validation(cached) -> bool:
+    selected = cached["selected_name"]
+    if selected is None:
+        return False
+    accepted_revision = cached["accepted_revision"]
+    accepted_digest = cached["accepted_digest"]
+    accepted = (accepted_revision, accepted_digest) \
+        if isinstance(accepted_revision, int) \
+        and not isinstance(accepted_revision, bool) and accepted_revision > 0 \
+        and isinstance(accepted_digest, str) and len(accepted_digest) == 64 \
+        and all(char in "0123456789abcdef" for char in accepted_digest) \
+        else None
+    selected_rank = cached["selected_revision"], cached["selected_digest"]
+    return cached["handled_name"] != selected \
+        or accepted is None or selected_rank > accepted
+
+
+def _refresh_cursor(conn: sqlite3.Connection, raw_root: Path,
+                    machine: Optional[str]) -> dict:
+    """Refresh one safe Cursor archive with per-session validation caching."""
+    stats = _empty_stats()
+    root = Path(raw_root)
+    sessions = root / "sessions"
+    try:
+        root_stat = os.lstat(root)
+        sessions_stat = os.lstat(sessions)
+    except FileNotFoundError:
+        # A missing/transient root is not evidence that accepted sessions vanished.
+        return stats
+    except OSError:
+        stats["errors"] += 1
+        return stats
+    if not stat.S_ISDIR(root_stat.st_mode) or not stat.S_ISDIR(sessions_stat.st_mode):
+        stats["errors"] += 1
+        return stats
+    try:
+        scan = cursor_archive.scan_archive_metadata(root)
+    except (OSError, cursor_archive.CursorArchiveError):
+        stats["errors"] += 1
+        return stats
+
+    root_key = _cursor_root_key(root)
+    cached_rows = {
+        row["session_key"]: row for row in conn.execute(
+            "SELECT cached.*, accepted.revision AS accepted_revision, "
+            "accepted.digest AS accepted_digest "
+            "FROM cursor_archive_heads AS cached "
+            "LEFT JOIN cursor_session_heads AS accepted "
+            "ON accepted.session_id=cached.selected_session_id "
+            "WHERE cached.root=?",
+            (root_key,),
+        )
+    }
+    parsed_heads: dict[Path, cursor_archive.CursorHead] = {}
+    updates = {}
+    candidates = []
+    for session in scan.sessions:
+        cached = cached_rows.get(session.session_key)
+        cache_hit = _cursor_cache_row_valid(
+            cached, session.signature, session.session_key,
+        )
+        validate = not cache_hit
+        if cache_hit:
+            validate = _cursor_cached_selection_needs_validation(cached)
+            if not validate:
+                continue
+
+        try:
+            head = cursor_archive.select_session_head(session)
+        except (OSError, cursor_archive.CursorArchiveError):
+            # Retain the old cache row and retry this session on the next scan.
+            continue
+        if head is None:
+            selected_name = selected_session_id = selected_digest = None
+            selected_revision = None
+        else:
+            selected_name = head.path.name
+            selected_session_id = f"cursor:{head.composer_id}"
+            selected_revision = head.revision
+            selected_digest = head.snapshot_digest
+        handled_name = cached["handled_name"] if cache_hit else None
+
+        selected_path = session.revision_dir / selected_name \
+            if selected_name is not None else None
+        if selected_path is not None:
+            candidates.append(selected_path)
+            parsed_heads[selected_path] = head
+
+        updates[session.session_key] = {
+            "signature": session.signature,
+            "selected_name": selected_name,
+            "selected_session_id": selected_session_id,
+            "selected_revision": selected_revision,
+            "selected_digest": selected_digest,
+            "handled_name": handled_name,
+            "path": selected_path,
+            "dirty": True,
+        }
+
+    processed: set[Path] = set()
+    if candidates:
+        producer = _machine_for_root("cursor", root, machine)
+        stats = _ingest(
+            conn, sorted(candidates),
+            lambda path: cursor.parse_head(parsed_heads[path], machine=producer),
+            processed_paths=processed,
+        )
+
+    for update in updates.values():
+        selected = update["selected_name"]
+        if selected is not None and update["path"] in processed:
+            update["handled_name"] = selected
+
+    try:
+        dirty_updates = {
+            session_key: update for session_key, update in updates.items()
+            if update["dirty"]
+        }
+        absent = set(cached_rows) - {session.session_key for session in scan.sessions}
+        if not dirty_updates and not absent:
+            return stats
+        conn.executemany(
+            """
+            INSERT INTO cursor_archive_heads (
+              root, session_key, validator_version, signature, selected_name,
+              selected_session_id, selected_revision, selected_digest, handled_name
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(root, session_key) DO UPDATE SET
+              validator_version=excluded.validator_version,
+              signature=excluded.signature,
+              selected_name=excluded.selected_name,
+              selected_session_id=excluded.selected_session_id,
+              selected_revision=excluded.selected_revision,
+              selected_digest=excluded.selected_digest,
+              handled_name=excluded.handled_name
+            """,
+            [(
+                root_key, session_key, CURSOR_ARCHIVE_VALIDATOR_VERSION,
+                update["signature"], update["selected_name"],
+                update["selected_session_id"], update["selected_revision"],
+                update["selected_digest"], update["handled_name"],
+            ) for session_key, update in dirty_updates.items()],
+        )
+        conn.executemany(
+            "DELETE FROM cursor_archive_heads WHERE root=? AND session_key=?",
+            [(root_key, session_key) for session_key in absent],
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        stats["errors"] += 1
+    return stats
+
+
 def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = None,
             roots: Optional[dict] = None) -> dict:
     """Delta ingest: re-parse only files that are new or whose (mtime, size) changed
@@ -354,8 +614,7 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
     tens of ms when nothing changed — which makes the DB effectively always
     current for this machine: there is no 'not ingested yet' window.
     `roots` optionally overrides a source's raw root ({"pi": Path(...)})."""
-    state = {r["path"]: (r["mtime"], r["size"])
-             for r in conn.execute("SELECT path, mtime, size FROM ingest_state")}
+    state = None
     total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
              "skipped": 0, "conflicts": 0, "errors": 0}
     for src in sources:
@@ -363,7 +622,19 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
         if src == "cursor" and raw_root is None:
             raw_root, export_stats = export_local_cursor_archive()
             total["errors"] += export_stats["errors"]
+        if src == "cursor":
+            stats = _refresh_cursor(
+                conn, Path(raw_root or DEFAULT_CURSOR_ROOT), machine,
+            )
+            for key, value in stats.items():
+                total[key] += value
+            continue
         files, parse_fn, enrich = _source_jobs(src, machine, raw_root)
+        if state is None:
+            state = {
+                row["path"]: (row["mtime"], row["size"])
+                for row in conn.execute("SELECT path, mtime, size FROM ingest_state")
+            }
         changed = []
         for f in files:
             try:

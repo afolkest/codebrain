@@ -155,3 +155,49 @@ choices do not belong here.
 - Follow-up: Slice 7 documents and smokes the final privacy boundary; Slice 8
   owns cheap head invalidation, retry backoff, and authored payload revision
   authority before final acceptance.
+
+## 2026-08-04 — Slice 8: Corpus-scale refresh and revision authority
+
+- Decision: Cache no-follow archive metadata independently per root and hashed
+  session directory, keeping the validated selected head separate from the last
+  selection deliberately handled by ingest. Advance a canonical Cursor session
+  only when its validated `(revision, snapshotDigest)` rank exceeds the accepted
+  watermark, in the same transaction as canonical and derived rows.
+- Context: The real safe archive held about 1,746 sessions and 404 MiB. Full head
+  reconstruction took roughly 6–8 seconds, while equivalent metadata scanning
+  took 50–90 ms. Export also retried 431 unchanged failures on every read, mostly
+  structured drafts. A real multi-revision tool bubble changed from loading to
+  completed under the same bubble/time/tool identity; first-writer event merging
+  lost that later result and could drop the authored placement when an inherited
+  copy arrived first.
+- Alternatives considered: hash payload content into event IDs; trust only a
+  global archive-tree signature; use mutable pool heads; retain flat pending IDs
+  and unconditional retries; let later inherited copies overwrite the event row.
+- Rationale: Stable source identity preserves copy deduplication, origins,
+  lineage, and call/result pairing. A root-scoped per-session cache preserves the
+  existing latest-reconstructible rule after out-of-order arrival while limiting
+  validation to changed chains. Typed structured retry categories avoid prompt
+  heuristics and let header changes/full reconciliation bypass backoff.
+- Product/architecture impact: Later authored Cursor revisions replace mutable
+  content and refresh FTS/file references without splitting event identity.
+  Inherited copies keep placements but cannot overwrite authored evidence;
+  equal/lower remote heads cannot regress canonical state. Normal unchanged
+  reads open no archive JSON. Cache and retry state remain rebuildable local
+  bookkeeping, not transcript truth and not synced evidence.
+- Acceptance evidence: The final real archive contained 1,747 sessions and 1,756
+  revision files. Seven hot metadata scans had an 88 ms median (85–91 ms range),
+  and seven warm explicit-root refreshes had a 116 ms median (109–120 ms range),
+  processed zero files, and opened zero revision JSON. Full validation of all
+  1,747 heads took 5.9 seconds; a separate cold canonical ingest populated
+  134,828 events/placements without errors. Synthetic scale and failure tests
+  cover warm restart, one-session invalidation, out-of-order predecessor arrival,
+  in-place repair/fallback, root isolation, malformed/versioned cache state,
+  cache/write rollback, concurrent watermark races, typed retry branches, and
+  both equal-rank and authored/inherited ingest orders.
+- Reversibility: The discovery cache, accepted-head table, and exporter retry
+  state can be dropped and rebuilt from immutable revisions. The authority rule
+  is source-specific but preserves all historical revision evidence in the raw
+  archive.
+- Follow-up: Revisit the validator version only when archive-chain validation
+  semantics change. Deferred Cursor CLI/ACP, Background Agent, orphan-history,
+  and ancillary-binary surfaces remain outside this execution cycle.

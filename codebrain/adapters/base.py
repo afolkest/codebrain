@@ -76,8 +76,16 @@ class SessionRow:
     title: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class SourceHead:
+    """Validated source revision rank attached to an archive-backed parse."""
+    revision: int
+    digest: str
+
+
 @dataclass
 class ParsedSession:
     session: SessionRow
     events: list = field(default_factory=list)
     placements: list = field(default_factory=list)
+    source_head: Optional[SourceHead] = None

@@ -17,7 +17,13 @@ from typing import Optional
 from urllib.parse import quote
 
 from codebrain import cursor_archive
-from codebrain.adapters.base import EventRow, ParsedSession, PlacementRow, SessionRow
+from codebrain.adapters.base import (
+    EventRow,
+    ParsedSession,
+    PlacementRow,
+    SessionRow,
+    SourceHead,
+)
 
 
 SOURCE = "cursor"
@@ -52,10 +58,21 @@ class CursorAdapterError(RuntimeError):
 
 
 def parse_file(path: Path, machine: Optional[str] = None) -> ParsedSession:
-    return parse_snapshot(cursor_archive.read_latest_snapshot(path), machine=machine)
+    return parse_head(cursor_archive.read_validated_head(path), machine=machine)
 
 
-def parse_snapshot(snapshot: dict, machine: Optional[str] = None) -> ParsedSession:
+def parse_head(head: cursor_archive.CursorHead,
+               machine: Optional[str] = None) -> ParsedSession:
+    """Parse a head already validated and reconstructed by the archive layer."""
+    return parse_snapshot(
+        head.snapshot,
+        machine=machine,
+        source_head=SourceHead(head.revision, head.snapshot_digest),
+    )
+
+
+def parse_snapshot(snapshot: dict, machine: Optional[str] = None,
+                   source_head: Optional[SourceHead] = None) -> ParsedSession:
     if not isinstance(snapshot, dict) \
             or isinstance(snapshot.get("projectionVersion"), bool) \
             or snapshot.get("projectionVersion") != 1:
@@ -193,7 +210,12 @@ def parse_snapshot(snapshot: dict, machine: Optional[str] = None) -> ParsedSessi
         title=session_data.get("name")
         if isinstance(session_data.get("name"), str) else None,
     )
-    return ParsedSession(session=session, events=events, placements=placements)
+    return ParsedSession(
+        session=session,
+        events=events,
+        placements=placements,
+        source_head=source_head,
+    )
 
 
 def _component(value: str) -> str:
