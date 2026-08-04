@@ -78,17 +78,54 @@ Scope: retrieval behavior and user-facing commands.
 Non-goals: automatic decisions/preferences, prompt classifiers, or source-text
 heuristics.
 
-## Slice 6 — Documentation, real-corpus smoke, and final verification
+## Slice 6 — Privacy and durability hardening
+
+- [x] Fail closed on malformed hidden/settled controls and harden Cursor
+  collection/default grep against destination/root symlinks.
+- [x] Restrict stale cleanup to exact collector-owned temporary names and fsync
+  every newly created Cursor pool directory edge.
+- [x] Cover every codebrain-owned symlink boundary, hidden-content leakage, and
+  malformed settled-state signals with destructive canaries.
+- [x] Run the full suite and focused security checks, then commit the completed
+  privacy/durability slice.
+
+Scope: source firewall and codebrain-owned destination/privacy boundaries.
+
+Non-goals: Cursor CLI/ACP protobuf decoding, remote Background Agents,
+historical unordered orphan bubbles, ancillary binary artifacts, or
+corpus-scale refresh/revision-authority changes.
+
+## Slice 7 — Documentation and real-corpus smoke
 
 - [ ] Document the Cursor format, safe-projection exception, source mapping,
   sync boundary, privacy exclusions, and deferred surfaces.
-- [ ] Add a non-mutating real-corpus smoke test with clean skipping when Cursor
-  is unavailable.
-- [ ] Run the full test suite, diff checks, security scans, and independent final
-  review; fix all must-fix and should-fix findings.
+- [ ] Add a strictly non-mutating real-corpus smoke over the safe archive, with
+  clean skipping when no archive is available.
+- [ ] Audit governing docs/help against the safe-evidence contract and exact
+  structured mapping conventions.
+- [ ] Run the full suite and diff checks, then commit the completed docs/smoke
+  slice.
+
+Scope: governing docs, user-visible help, and real safe-archive acceptance.
+
+Non-goals: live-database smoke, feature semantics changes, or deferred Cursor
+surfaces.
+
+## Slice 8 — Corpus-scale refresh and revision authority
+
+- [ ] Make unchanged Cursor head discovery tens-of-milliseconds at corpus scale
+  while preserving latest-reconstructible semantics after out-of-order arrival.
+- [ ] Back off permanent draft/source-error retries without delaying changed or
+  genuinely active/incomplete sessions indefinitely.
+- [ ] Apply later authored Cursor payload revisions authoritatively without
+  allowing inherited/stale copies to overwrite origin content or break pairing.
+- [ ] Add scale, retry, message/tool mutation, copied-session, and order-
+  independence tests; benchmark the real archive and no-change refresh.
+- [ ] Run the full suite, diff/security scans, and three-reviewer final
+  acceptance; fix every must-fix and should-fix finding.
 - [ ] Confirm the repository is clean and every completed slice is committed.
 
-Scope: governing docs and end-to-end acceptance.
+Scope: rebuildable discovery bookkeeping and revision-aware canonical updates.
 
-Non-goals: Cursor CLI/ACP protobuf decoding, remote Background Agents,
-historical unordered orphan bubbles, or ancillary binary artifacts.
+Non-goals: content-hash event identity, mutable pool revisions, prompt-text
+classification, or the deferred Cursor surfaces above.

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -233,6 +235,25 @@ class TestCursorCollectionIntegration(unittest.TestCase):
         self.assertEqual((stats["updated"], stats["errors"]), (0, 1))
         self.assertEqual(pooled.read_text(encoding="utf-8"), "foreign")
 
+    def test_existing_revision_symlink_is_not_read_or_replaced(self):
+        one = cursor_archive.publish_snapshot(_snapshot(), self.archive)
+        collect.collect_source(
+            "cursor", raw_root=self.archive, pool_root=self.pool, machine="mini"
+        )
+        pooled = self.pool / "raw" / "mini" / "cursor" / one.relative_to(self.archive)
+        pooled.unlink()
+        outside = self.root / "outside-revision.json"
+        outside.write_text("foreign", encoding="utf-8")
+        pooled.symlink_to(outside)
+
+        stats = collect.collect_source(
+            "cursor", raw_root=self.archive, pool_root=self.pool, machine="mini"
+        )
+
+        self.assertEqual((stats["unchanged"], stats["errors"]), (0, 1))
+        self.assertTrue(pooled.is_symlink())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "foreign")
+
     def test_concurrent_revision_arrival_is_never_overwritten(self):
         one = cursor_archive.publish_snapshot(_snapshot(), self.archive)
         destination = (
@@ -240,8 +261,8 @@ class TestCursorCollectionIntegration(unittest.TestCase):
         )
         revision_bytes = cursor_archive.read_revision_bytes(one)
 
-        def arrive(_source, target, **_kwargs):
-            Path(target).write_bytes(revision_bytes)
+        def arrive(_source, _target, **_kwargs):
+            destination.write_bytes(revision_bytes)
             raise FileExistsError("synced concurrently")
 
         with mock.patch("codebrain.collect.os.link", side_effect=arrive):
@@ -268,7 +289,108 @@ class TestCursorCollectionIntegration(unittest.TestCase):
             )
         self.assertEqual(stats["new"], 1)
         self.assertTrue(any(collect.stat.S_ISREG(mode) for mode in modes))
-        self.assertTrue(any(collect.stat.S_ISDIR(mode) for mode in modes))
+        # raw, machine, source, sessions, session, and revisions each fsync the
+        # parent edge that made them durable; publication fsyncs revisions again.
+        self.assertGreaterEqual(
+            sum(collect.stat.S_ISDIR(mode) for mode in modes), 7,
+        )
+
+    def test_destination_symlinks_cannot_escape_pool(self):
+        cursor_archive.publish_snapshot(_snapshot(), self.archive)
+        revision = cursor_archive.discover_revisions(self.archive)[0]
+        session_hash = revision.parent.parent.name
+        for component in (
+                "parent", "pool", "raw", "machine", "source",
+                "sessions", "session", "revisions"):
+            with self.subTest(component=component):
+                case = self.root / f"symlink-{component}"
+                case.mkdir()
+                pool = case / "pool"
+                outside = case / "outside"
+                outside.mkdir()
+                victim = outside / "victim.part"
+                victim.write_text("do not delete", encoding="utf-8")
+                owned_victim = outside / f".{revision.name}.4242.part"
+                owned_victim.write_text("also do not delete", encoding="utf-8")
+                old = time.time() - 7200
+                os.utime(victim, (old, old))
+                os.utime(owned_victim, (old, old))
+
+                if component == "parent":
+                    parent = case / "pool-parent"
+                    parent.symlink_to(outside, target_is_directory=True)
+                    pool = parent / "pool"
+                elif component == "pool":
+                    pool.symlink_to(outside, target_is_directory=True)
+                elif component == "raw":
+                    pool.mkdir()
+                    (pool / "raw").symlink_to(outside, target_is_directory=True)
+                elif component == "machine":
+                    (pool / "raw").mkdir(parents=True)
+                    (pool / "raw" / "mini").symlink_to(
+                        outside, target_is_directory=True,
+                    )
+                elif component == "source":
+                    (pool / "raw" / "mini").mkdir(parents=True)
+                    (pool / "raw" / "mini" / "cursor").symlink_to(
+                        outside, target_is_directory=True,
+                    )
+                elif component == "sessions":
+                    (pool / "raw" / "mini" / "cursor").mkdir(parents=True)
+                    (pool / "raw" / "mini" / "cursor" / "sessions").symlink_to(
+                        outside, target_is_directory=True,
+                    )
+                elif component == "session":
+                    sessions = pool / "raw" / "mini" / "cursor" / "sessions"
+                    sessions.mkdir(parents=True)
+                    (sessions / session_hash).symlink_to(
+                        outside, target_is_directory=True,
+                    )
+                else:
+                    session = (
+                        pool / "raw" / "mini" / "cursor" / "sessions"
+                        / session_hash
+                    )
+                    session.mkdir(parents=True)
+                    (session / "revisions").symlink_to(
+                        outside, target_is_directory=True,
+                    )
+
+                stats = collect.collect_source(
+                    "cursor", raw_root=self.archive,
+                    pool_root=pool, machine="mini",
+                )
+                self.assertEqual(stats["errors"], 1)
+                self.assertEqual(victim.read_text(encoding="utf-8"), "do not delete")
+                self.assertEqual(
+                    owned_victim.read_text(encoding="utf-8"), "also do not delete",
+                )
+                self.assertEqual(set(outside.iterdir()), {victim, owned_victim})
+
+    def test_stale_prune_removes_only_owned_cursor_temp_names(self):
+        revision = cursor_archive.publish_snapshot(_snapshot(), self.archive)
+        collect.collect_source(
+            "cursor", raw_root=self.archive, pool_root=self.pool, machine="mini"
+        )
+        pooled = (
+            self.pool / "raw" / "mini" / "cursor"
+            / revision.relative_to(self.archive)
+        )
+        unrelated = pooled.parent / "victim.part"
+        unrelated.write_text("not collector-owned", encoding="utf-8")
+        owned = pooled.parent / f".{pooled.name}.999999.part"
+        owned.write_text("torn", encoding="utf-8")
+        old = time.time() - 7200
+        os.utime(unrelated, (old, old))
+        os.utime(owned, (old, old))
+
+        stats = collect.collect_source(
+            "cursor", raw_root=self.archive, pool_root=self.pool, machine="mini"
+        )
+
+        self.assertEqual((stats["unchanged"], stats["errors"]), (1, 0))
+        self.assertTrue(unrelated.exists())
+        self.assertFalse(owned.exists())
 
     def test_default_collection_exports_but_explicit_root_does_not(self):
         writer = _live_cursor_db(self.root / "state.vscdb")

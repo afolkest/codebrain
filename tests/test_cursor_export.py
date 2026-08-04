@@ -208,21 +208,53 @@ class TestCursorProjection(CursorProjectionBase):
                  "isThought": True, "usageUuid": "usage"},
                 {"bubbleId": "summary", "type": 2, "text": "SECRET_SUMMARY",
                  "isSummarization": True, "serverBubbleId": "server"},
+                {"bubbleId": "false-thought", "type": 2,
+                 "text": "visible false thought", "isThought": False},
+                {"bubbleId": "false-summary", "type": 2,
+                 "text": "visible false summary", "isSummarization": False},
                 {"bubbleId": "visible", "type": 2, "text": "visible"},
             ],
         })
         self.writer.commit()
         snapshot = cursor_export.read_session_snapshot(self.path, "old")
-        thought, summary, visible = [r["payload"] for r in snapshot["order"]]
+        thought, summary, false_thought, false_summary, visible = [
+            r["payload"] for r in snapshot["order"]
+        ]
         self.assertEqual(thought, {
             "type": 2, "usageUuid": "usage", "isThought": True,
             "bubbleId": "thought",
         })
         self.assertNotIn("text", summary)
         self.assertEqual(summary["serverBubbleId"], "server")
+        self.assertEqual(false_thought["text"], "visible false thought")
+        self.assertIs(false_thought["isThought"], False)
+        self.assertEqual(false_summary["text"], "visible false summary")
+        self.assertIs(false_summary["isSummarization"], False)
         self.assertEqual(visible["text"], "visible")
         self.assertNotIn("SECRET_THOUGHT", json.dumps(snapshot))
         self.assertNotIn("SECRET_SUMMARY", json.dumps(snapshot))
+
+    def test_malformed_hidden_content_flags_fail_before_text_projection(self):
+        invalid_values = (None, 0, 1, "true")
+        for flag in ("isThought", "isSummarization"):
+            for index, invalid in enumerate(invalid_values):
+                sid = f"bad-hidden-{flag}-{index}"
+                with self.subTest(flag=flag, invalid=invalid):
+                    _put(self.writer, f"composerData:{sid}", {
+                        "_v": 1,
+                        "composerId": sid,
+                        "conversation": [{
+                            "bubbleId": "private",
+                            "type": 2,
+                            "text": "SECRET_PRIVATE_TEXT",
+                            flag: invalid,
+                        }],
+                    })
+                    self.writer.commit()
+
+                    with self.assertRaises(cursor_export.CursorSnapshotError) as cm:
+                        cursor_export.read_session_snapshot(self.path, sid)
+                    self.assertNotIn("SECRET_PRIVATE_TEXT", str(cm.exception))
 
     def test_data_only_composer_is_discovered(self):
         _put(self.writer, "composerData:data-only", {
@@ -377,6 +409,46 @@ class TestCursorProjection(CursorProjectionBase):
                 with self.assertRaises(cursor_export.CursorSessionUnsettled) as cm:
                     cursor_export.read_session_snapshot(self.path, "S")
                 self.assertNotIn("SECRET_STATUS", str(cm.exception))
+
+    def test_malformed_settlement_controls_fail_closed(self):
+        _header(self.writer, "S")
+        cases = (
+            {"generatingBubbleIds": None},
+            {"generatingBubbleIds": False},
+            {"generatingBubbleIds": 0},
+            {"generatingBubbleIds": ""},
+            {"queueItems": None},
+            {"queueItems": 0},
+            {"queueItems": ""},
+            {"queueItems": {}},
+            {"isContinuationInProgress": None},
+            {"isContinuationInProgress": 0},
+            {"isContinuationInProgress": 1},
+            {"isContinuationInProgress": ""},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                composer = _modern_composer("S", ())
+                composer.update(overrides)
+                _put(self.writer, "composerData:S", composer)
+                self.writer.commit()
+
+                with self.assertRaises(cursor_export.CursorSnapshotError):
+                    cursor_export.read_session_snapshot(self.path, "S")
+
+    def test_empty_and_false_settlement_controls_are_settled(self):
+        _header(self.writer, "S")
+        _put(self.writer, "composerData:S", _modern_composer(
+            "S",
+            (),
+            generatingBubbleIds=[],
+            queueItems=[],
+            isContinuationInProgress=False,
+        ))
+        self.writer.commit()
+
+        snapshot = cursor_export.read_session_snapshot(self.path, "S")
+        self.assertEqual(snapshot["order"], [])
 
     def test_dual_capability_and_embedded_duplicate_fail_closed(self):
         value = {

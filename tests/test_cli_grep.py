@@ -68,6 +68,91 @@ class TestGrepCli(unittest.TestCase):
         self.assertNotIn(str(unsafe_home), roots)
         self.assertNotIn(str(unsafe_db), roots)
 
+    def test_default_roots_exclude_symlinked_local_cursor_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unsafe_home = root / ".cursor"
+            unsafe_home.mkdir()
+            codebrain_home = root / ".codebrain"
+            codebrain_home.mkdir()
+            (codebrain_home / "cursor-raw").symlink_to(
+                unsafe_home, target_is_directory=True,
+            )
+
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", root / "missing-claude"), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_CURSOR_ROOT", codebrain_home / "cursor-raw"), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", root / "missing-pool"):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [])
+        self.assertNotIn(str(unsafe_home), roots)
+
+    def test_default_roots_exclude_cursor_root_below_symlinked_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            redirected = root / "redirected"
+            (redirected / "cursor-raw").mkdir(parents=True)
+            (root / ".codebrain").symlink_to(redirected, target_is_directory=True)
+
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", root / "missing-claude"), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch(
+                     "codebrain.cli.DEFAULT_CURSOR_ROOT", root / ".codebrain" / "cursor-raw",
+                 ), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", root / "missing-pool"):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [])
+
+    def test_default_roots_exclude_symlinked_remote_cursor_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool"
+            remote_machine = pool / "raw" / "remote"
+            remote_pi = remote_machine / "pi"
+            remote_pi.mkdir(parents=True)
+            unsafe_cursor = root / "unsafe-cursor"
+            unsafe_cursor.mkdir()
+            remote_cursor = remote_machine / "cursor"
+            remote_cursor.symlink_to(
+                unsafe_cursor, target_is_directory=True,
+            )
+
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", root / "missing-claude"), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_CURSOR_ROOT", root / "missing-cursor"), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", pool), \
+                 mock.patch("codebrain.ingest.socket.gethostname", return_value="local"):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [str(remote_pi)])
+        self.assertNotIn(str(remote_cursor), roots)
+
+    def test_default_roots_exclude_remote_cursor_below_symlinked_machine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool"
+            raw = pool / "raw"
+            raw.mkdir(parents=True)
+            redirected_machine = root / "redirected-machine"
+            (redirected_machine / "cursor").mkdir(parents=True)
+            remote_machine = raw / "remote"
+            remote_machine.symlink_to(redirected_machine, target_is_directory=True)
+
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", root / "missing-claude"), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_CURSOR_ROOT", root / "missing-cursor"), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", pool), \
+                 mock.patch("codebrain.ingest.socket.gethostname", return_value="local"):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [])
+
     def test_default_roots_handle_missing_pool_and_empty_live_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

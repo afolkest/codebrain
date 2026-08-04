@@ -11,7 +11,7 @@ Daily archaeology:
 
 Setup / repair:
   sessdb ingest                         full build/rebuild of the local DB
-  sessdb collect [--install-launchd]    mirror raw logs into the append-only pool
+  sessdb collect [--install-launchd]    mirror source evidence into the raw pool
   sessdb ingest-pool                    debug/repair ingest of synced pool subtrees
   sessdb backfill-claude <path>         import historical Claude backups into pool
   sessdb hide <session> --reason <why>  hide noisy sessions from default retrieval
@@ -21,7 +21,7 @@ Setup / repair:
 Escape hatches:
   sessdb show <session> [--all]         raw transcript view
   sessdb list [--limit N]               session metadata by start time
-  sessdb grep <pattern> [paths...]      ripgrep safe local/remote source roots
+  sessdb grep <pattern> [paths...]      local sources + remote pool; safe Cursor archive
   sessdb codex-control-sync             rebuild Codex control provenance
   sessdb cursor-provenance-sync         rebuild Cursor structured provenance
   sessdb schema                         print the DDL
@@ -41,6 +41,7 @@ import json
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
@@ -329,7 +330,7 @@ def cmd_ingest_pool(args):
         print(f"skipped local pool root(s): {total['skipped_local_roots']} "
               "(--include-local to ingest explicitly)")
     if args.include_local:
-        print("reparsing local live homes after --include-local to keep live logs authoritative")
+        print("reparsing local sources after --include-local to keep live evidence authoritative")
         live_total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
                       "skipped": 0, "conflicts": 0, "errors": 0}
         for src in sources:
@@ -1637,15 +1638,19 @@ def cmd_grep(args):
 def _default_grep_roots():
     roots = [
         DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT,
-        DEFAULT_CURSOR_ROOT,
     ]
-    roots.extend(
-        root for _, _, root in discover_pool_roots(
-            Path(DEFAULT_POOL),
-            include_local=False,
-            local_machines=local_machine_names(),
-        )
+    cursor_root = Path(DEFAULT_CURSOR_ROOT)
+    if _is_nofollow_directory(cursor_root, cursor_root.parent):
+        roots.append(cursor_root)
+    pool_roots = discover_pool_roots(
+        Path(DEFAULT_POOL),
+        include_local=False,
+        local_machines=local_machine_names(),
     )
+    for _, source, root in pool_roots:
+        if source == "cursor" and not _is_nofollow_directory(root, Path(DEFAULT_POOL)):
+            continue
+        roots.append(root)
     seen = set()
     existing = []
     for root in roots:
@@ -1658,6 +1663,32 @@ def _default_grep_roots():
         seen.add(value)
         existing.append(value)
     return existing
+
+
+def _is_nofollow_directory(path: Path, anchor: Path) -> bool:
+    """Require every component from a trusted anchor through path to be a directory.
+
+    Cursor grep roots are codebrain-owned privacy boundaries.  Checking only
+    ``is_dir()`` would follow a root (or an ancestor) symlink and could turn the
+    default grep into a search over Cursor's live private state.
+    """
+    path = Path(path)
+    anchor = Path(anchor)
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError:
+        return False
+    if any(part in ("", ".", "..") for part in relative.parts):
+        return False
+    candidates = [anchor]
+    current = anchor
+    for part in relative.parts:
+        current = current / part
+        candidates.append(current)
+    try:
+        return all(stat.S_ISDIR(candidate.lstat().st_mode) for candidate in candidates)
+    except OSError:
+        return False
 
 
 def _grep_command(pattern: str, paths: list[str], rg: str | None,
@@ -1718,7 +1749,7 @@ def main(argv=None):
     p.add_argument("--db", default=str(DEFAULT_DB), help=f"SQLite path (default {DEFAULT_DB})")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("ingest", help="build/update the DB from raw logs")
+    sp = sub.add_parser("ingest", help="build/update the DB from raw evidence")
     sp.add_argument("--source", choices=("all",) + SOURCES, default="all",
                     help="which source(s) to ingest (default all)")
     sp.add_argument("--machine", default=None, help="override hostname tag")
@@ -1726,7 +1757,7 @@ def main(argv=None):
                     help=f"override one source root; requires --source {'|'.join(SOURCES)}")
     sp.set_defaults(func=cmd_ingest)
 
-    sp = sub.add_parser("collect", help="mirror raw logs into the append-only pool")
+    sp = sub.add_parser("collect", help="mirror source evidence into the append-only pool")
     sp.add_argument("--pool", default=str(DEFAULT_POOL), help=f"pool root (default {DEFAULT_POOL})")
     sp.add_argument("--source", choices=("all",) + SOURCES, default="all",
                     help="which source(s) to collect (default all)")
@@ -1743,7 +1774,7 @@ def main(argv=None):
                     help="which source(s) to ingest from the pool (default all)")
     sp.add_argument("--machine", help="only ingest one pool raw/<machine> subtree")
     sp.add_argument("--include-local", action="store_true",
-                    help="also ingest local pool subtree, then reparse local live homes")
+                    help="also ingest local pool subtree, then reparse local sources")
     sp.set_defaults(func=cmd_ingest_pool)
 
     sp = sub.add_parser("backfill-claude",
@@ -1928,17 +1959,17 @@ def main(argv=None):
 
     sp = sub.add_parser(
         "grep",
-        help="ripgrep safe local source roots and synced remote pool roots by default",
+        help="ripgrep local source roots and remote pool; Cursor uses safe archive",
     )
     sp.add_argument("pattern")
     sp.add_argument(
         "paths",
         nargs="*",
-        help="optional raw-log paths; when provided, replace the default search scope",
+        help="optional source-evidence paths; when provided, replace the default search scope",
     )
     g = sp.add_mutually_exclusive_group()
     g.add_argument("-l", "--files-with-matches", dest="files_only", action="store_true",
-                   help="print only the raw-log file paths that contain a match")
+                   help="print only the source-evidence paths that contain a match")
     g.add_argument("-c", "--count", action="store_true",
                    help="print a match count per file instead of matching lines")
     sp.set_defaults(func=cmd_grep)

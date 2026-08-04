@@ -201,8 +201,16 @@ def _capability(composer: dict) -> str:
 
 
 def _require_settled(composer: dict) -> None:
-    if composer.get("generatingBubbleIds") or composer.get("queueItems"):
-        raise CursorSessionUnsettled("composer has active or queued bubbles")
+    for field in ("generatingBubbleIds", "queueItems"):
+        if field in composer and not isinstance(composer[field], list):
+            raise CursorSnapshotError(
+                f"composer has an invalid structured list {field}"
+            )
+        if composer.get(field):
+            raise CursorSessionUnsettled("composer has active or queued bubbles")
+    _require_exact_booleans(
+        composer, "composer", ("isContinuationInProgress",)
+    )
     if composer.get("isContinuationInProgress") is True:
         raise CursorSessionUnsettled("composer continuation is in progress")
     status = composer.get("status")
@@ -331,6 +339,7 @@ def _project_session_metadata(composer_id: str, composer: dict, header_row,
 
 
 def _project_bubble(bubble: dict, bubble_id: str) -> dict:
+    _require_exact_booleans(bubble, bubble_id, ("isThought", "isSummarization"))
     out = _pick_scalars(bubble, {
         "_v": int, "type": int, "text": str,
         "createdAt": (str, int, float), "requestId": str,
@@ -367,6 +376,16 @@ def _project_bubble(bubble: dict, bubble_id: str) -> dict:
     if attachments:
         out["attachments"] = attachments
     return out
+
+
+def _require_exact_booleans(value: dict, label: str,
+                            fields: tuple[str, ...]) -> None:
+    """Fail closed when privacy-sensitive source flags are malformed."""
+    for field in fields:
+        if field in value and type(value[field]) is not bool:
+            raise CursorSnapshotError(
+                f"{label}: invalid structured boolean {field}"
+            )
 
 
 def _project_tool(value) -> dict:

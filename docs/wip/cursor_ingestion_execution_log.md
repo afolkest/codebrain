@@ -125,3 +125,33 @@ choices do not belong here.
   force-sync CLI rebuilds them from canonical raw fields.
 - Follow-up: None. Aggregate copy-consistency review found no Cursor raw/ref/
   tool-result pairing conflicts requiring a source-specific database rule.
+
+## 2026-08-04 — Slice 6: Privacy and durability hardening
+
+- Decision: Hidden and settled control fields fail closed on malformed types,
+  and Cursor pool/grep roots use no-follow path validation. A live-database
+  smoke cannot be called strictly non-mutating; documentation and a safe-archive
+  smoke moved to Slice 7, while performance and revision-authority acceptance
+  moved to Slice 8.
+- Context: Independent review reproduced SQLite creating a `-shm` sidecar from
+  a nominally read-only WAL connection, hidden text leaking when a thought flag
+  changed type, and a symlinked pool destination redirecting writes and stale
+  temp deletion outside the pool. The same review cycle found corpus-scale and
+  payload-mutation issues that would make the documentation slice exceed a
+  reviewable boundary.
+- Alternatives considered: call the live-database smoke non-mutating because it
+  issues no SQL writes; retain path-based symlink checks; finish every acceptance
+  fix in one oversized slice.
+- Rationale: Security-sensitive source controls and codebrain-owned path
+  boundaries must fail closed. Safe archive heads can exercise real evidence in
+  Slice 7 without touching live SQLite. Splitting the remaining documentation
+  and correctness/performance work keeps each commit independently reviewable.
+- Product/architecture impact: “Safe projection” means a constrained private
+  evidence boundary, not secret-free transcript content; the pool remains
+  private, and no default operation can escape into Cursor application state.
+- Reversibility: Easy for smoke selection and validation strictness; moderate
+  for descriptor-relative collection because it intentionally strengthens the
+  durability contract.
+- Follow-up: Slice 7 documents and smokes the final privacy boundary; Slice 8
+  owns cheap head invalidation, retry backoff, and authored payload revision
+  authority before final acceptance.

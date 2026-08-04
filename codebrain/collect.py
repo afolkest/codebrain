@@ -1,25 +1,24 @@
-"""Collector: mirror this machine's raw agent logs into the append-only pool.
+"""Collector: mirror this machine's source evidence into the append-only pool.
 
-The pool (DESIGN.md) is the durable, syncable copy of the raw logs:
-`<pool>/raw/<machine>/<source>/<original relpath>`. Each machine writes only its
-own subtree, so replicating the pool across machines (Syncthing, later) can
-never conflict. Relpaths mirror the tool home, so ingest can point at
-`<pool>/raw/<machine>/<source>` exactly as it points at a live home.
+The pool (DESIGN.md) is the durable, syncable evidence boundary at
+`<pool>/raw/<machine>/<source>/...`. Claude/Codex/pi preserve allowlisted live-log
+relpaths. Cursor preserves only codebrain's immutable safe-revision layout.
+Each machine writes its own subtree; ordinary conflicts are avoided and an
+immutable Cursor path conflict is retained and reported.
 
 A sweep is a one-way valve with archive guarantees:
 
 - **Allowlists, never whole homes** — tool homes hold credentials (auth.json),
   settings, and the tools' own databases; none of that belongs in a synced pool.
-- **Stat-compare incrementality** — copy2 preserves mtime, so "changed?" is a
-  pure (size, mtime) compare against the pool copy itself. No bookkeeping
-  table, nothing to drift.
-- **Never deletes, never shrinks** — these logs are append-only, so a source
-  file smaller than its pool copy is a regression signal (truncation, botched
-  restore): the pool copy wins and the sweep warns.
-- **tmp + atomic rename** — a crash mid-copy cannot leave a torn pool file.
+- **Source-specific durability** — ordinary logs use stat comparison, shrink
+  guards, and temp-plus-rename; Cursor revisions use validated canonical bytes,
+  descriptor-relative no-follow traversal, and create-only links.
+- **Never deletes evidence** — cleanup removes only age-gated collector-owned
+  temp names; no source revision or pool evidence is pruned.
 
 This is durability only. Freshness is refresh-on-read (ingest.refresh), which
-reads the live homes directly — a periodic launchd sweep is plenty here.
+reads live homes and refreshes the local safe Cursor archive directly — a
+periodic launchd sweep is plenty here.
 """
 from __future__ import annotations
 
@@ -28,6 +27,7 @@ import shutil
 import socket
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -88,8 +88,7 @@ PATTERNS = {
 
 
 def discover(source: str, raw_root: Path):
-    """Allowlisted files under one tool home — regular files only, no symlinks
-    (a link could smuggle content from outside the home into the pool)."""
+    """Allowlisted source evidence — regular files only, no source symlinks."""
     root = Path(raw_root)
     if source == "cursor":
         return cursor_archive.discover_revisions(root)
@@ -105,11 +104,13 @@ def _prune_stale_parts(dest_root: Path, max_age_s: int = 3600) -> None:
     """Unlink tmp files orphaned by a crash/SIGTERM mid-copy. Age-gated so a
     concurrently running sweep's live tmp is never touched. (.part files are
     scratch, not archive — the never-delete rule doesn't apply to them.)"""
-    import time
     cutoff = time.time() - max_age_s
     for p in dest_root.rglob("*.part"):
         try:
-            if p.stat().st_mtime < cutoff:
+            file_stat = os.lstat(p)
+            if _is_collector_owned_part(p.name) \
+                    and stat.S_ISREG(file_stat.st_mode) \
+                    and file_stat.st_mtime < cutoff:
                 p.unlink()
         except OSError:
             pass
@@ -127,18 +128,12 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
     dest_root = Path(pool_root) / "raw" / machine / source
     stats = {"files": 0, "new": 0, "updated": 0, "unchanged": 0, "shrunk": 0,
              "errors": export_errors}
+    if source == "cursor":
+        return _collect_cursor_revisions(root, Path(pool_root), machine, stats)
     if dest_root.is_dir():
         _prune_stale_parts(dest_root)
     for f in discover(source, root):
         stats["files"] += 1
-        revision_bytes = None
-        if source == "cursor":
-            try:
-                revision_bytes = cursor_archive.read_revision_bytes(f)
-            except (OSError, cursor_archive.CursorArchiveError) as exc:
-                print(f"  ! invalid Cursor revision {f}: {exc}")
-                stats["errors"] += 1
-                continue
         try:
             sst = f.stat()
         except OSError:
@@ -149,19 +144,6 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
         except OSError:
             dst_st = None
         if dst_st is not None:
-            if revision_bytes is not None:
-                try:
-                    existing = _read_regular_file(dst)
-                except OSError as exc:
-                    print(f"  ! Cursor pool read error {dst}: {exc}")
-                    stats["errors"] += 1
-                    continue
-                if existing == revision_bytes:
-                    stats["unchanged"] += 1
-                else:
-                    print(f"  ! immutable Cursor revision conflict: keeping {dst}")
-                    stats["errors"] += 1
-                continue
             # Exact float equality is correct where copy2 round-trips mtime (APFS,
             # ns precision). On a coarse-mtime pool filesystem it degrades to
             # recopying — wasteful but never wrong, and loud in the stats.
@@ -182,30 +164,8 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
             dst.parent.mkdir(parents=True, exist_ok=True)
             # copy2 keeps mtime (→ next sweep's stat compare); follow_symlinks=False
             # closes the discover-then-copy race where a file becomes a symlink.
-            if revision_bytes is None:
-                shutil.copy2(f, tmp, follow_symlinks=False)
-            else:
-                with open(tmp, "xb") as fh:
-                    fh.write(revision_bytes)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
-            if revision_bytes is None:
-                os.replace(tmp, dst)
-            else:
-                try:
-                    os.link(tmp, dst, follow_symlinks=False)
-                except FileExistsError:
-                    tmp.unlink(missing_ok=True)
-                    existing = _read_regular_file(dst)
-                    if existing == revision_bytes:
-                        stats["unchanged"] += 1
-                    else:
-                        print(f"  ! immutable Cursor revision conflict: keeping {dst}")
-                        stats["errors"] += 1
-                    continue
-                tmp.unlink()
-                _fsync_directory(dst.parent)
+            shutil.copy2(f, tmp, follow_symlinks=False)
+            os.replace(tmp, dst)
         except OSError as exc:
             print(f"  ! copy error {f}: {exc}")
             stats["errors"] += 1
@@ -215,9 +175,237 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
     return stats
 
 
-def _read_regular_file(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+    | getattr(os, "O_NOFOLLOW", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _collect_cursor_revisions(root: Path, pool_root: Path, machine: str,
+                              stats: dict) -> dict:
+    """Create-only Cursor replication anchored beneath a no-follow pool fd."""
+    destination_fd = None
+    try:
+        try:
+            destination_fd = _open_cursor_destination(
+                pool_root, machine, create=False,
+            )
+            if destination_fd is not None:
+                _prune_cursor_parts(destination_fd)
+        except OSError as exc:
+            print(f"  ! unsafe Cursor pool destination: {exc}")
+            stats["errors"] += 1
+            return stats
+
+        for source_path in discover("cursor", root):
+            stats["files"] += 1
+            try:
+                revision_bytes = cursor_archive.read_revision_bytes(source_path)
+                relative = source_path.relative_to(root)
+                relative_parts = _cursor_revision_parts(relative)
+            except (OSError, ValueError, cursor_archive.CursorArchiveError) as exc:
+                print(f"  ! invalid Cursor revision {source_path}: {exc}")
+                stats["errors"] += 1
+                continue
+
+            try:
+                if destination_fd is None:
+                    destination_fd = _open_cursor_destination(
+                        pool_root, machine, create=True,
+                    )
+                    if destination_fd is None:  # pragma: no cover - create=True
+                        raise OSError("could not create Cursor pool destination")
+                parent_fd = _open_cursor_revision_parent(
+                    destination_fd, relative_parts[:-1],
+                )
+            except OSError as exc:
+                print(f"  ! unsafe Cursor pool destination: {exc}")
+                stats["errors"] += 1
+                continue
+
+            destination_name = relative_parts[-1]
+            try:
+                try:
+                    os.stat(destination_name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    _record_cursor_existing(
+                        parent_fd, destination_name, revision_bytes, stats,
+                    )
+                    continue
+                _publish_cursor_revision(
+                    parent_fd, destination_name, revision_bytes, stats,
+                )
+            except OSError as exc:
+                print(f"  ! Cursor pool write error {source_path}: {exc}")
+                stats["errors"] += 1
+            finally:
+                os.close(parent_fd)
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+    return stats
+
+
+def _open_cursor_destination(pool_root: Path, machine: str,
+                             create: bool) -> Optional[int]:
+    """Open ``pool/raw/<machine>/cursor`` without following owned components."""
+    pool_fd = _open_pool_root(Path(pool_root), create=create)
+    if pool_fd is None:
+        return None
+    current_fd = pool_fd
+    try:
+        for name in ("raw", machine, "cursor"):
+            child_fd = _open_child_directory(current_fd, name, create=create)
+            if child_fd is None:
+                return None
+            os.close(current_fd)
+            current_fd = child_fd
+        result = current_fd
+        current_fd = -1
+        return result
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def _open_pool_root(pool_root: Path, create: bool) -> Optional[int]:
+    if pool_root.name in ("", ".", ".."):
+        raise OSError("Cursor pool root must name a directory")
+    parent_fd = _open_directory(pool_root.parent, create=create)
+    if parent_fd is None:
+        return None
+    try:
+        return _open_child_directory(parent_fd, pool_root.name, create=create)
+    finally:
+        os.close(parent_fd)
+
+
+def _open_directory(path: Path, create: bool) -> Optional[int]:
+    """Open one caller-owned anchor, creating a missing suffix durably."""
+    try:
+        return os.open(path, _DIRECTORY_FLAGS)
+    except FileNotFoundError:
+        if not create:
+            return None
+    if path.name in ("", ".", "..") or path.parent == path:
+        raise OSError(f"cannot create Cursor pool directory {path}")
+    parent_fd = _open_directory(path.parent, create=True)
+    if parent_fd is None:  # pragma: no cover - create=True
+        raise OSError(f"cannot create Cursor pool parent {path.parent}")
+    try:
+        return _open_child_directory(parent_fd, path.name, create=True)
+    finally:
+        os.close(parent_fd)
+
+
+def _open_child_directory(parent_fd: int, name: str,
+                          create: bool) -> Optional[int]:
+    if name in ("", ".", "..") or "/" in name or "\\" in name:
+        raise OSError(f"unsafe Cursor pool path component {name!r}")
+    try:
+        return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            return None
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except FileExistsError:
+        pass
+    return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+
+
+def _cursor_revision_parts(relative: Path) -> tuple[str, str, str, str]:
+    parts = relative.parts
+    if len(parts) != 4 or parts[0] != "sessions" or parts[2] != "revisions" \
+            or len(parts[1]) != 64 \
+            or any(c not in "0123456789abcdef" for c in parts[1]) \
+            or not _is_cursor_revision_name(parts[3]):
+        raise ValueError("invalid Cursor archive destination layout")
+    return parts
+
+
+def _is_cursor_revision_name(name: str) -> bool:
+    try:
+        revision, snapshot_hash = name.removesuffix(".json").split("-", 1)
+    except ValueError:
+        return False
+    return name.endswith(".json") and len(revision) == 20 \
+        and revision.isdigit() and len(snapshot_hash) == 64 \
+        and all(c in "0123456789abcdef" for c in snapshot_hash)
+
+
+def _open_cursor_revision_parent(destination_fd: int,
+                                 parts: tuple[str, str, str]) -> int:
+    current_fd = os.dup(destination_fd)
+    try:
+        for name in parts:
+            child_fd = _open_child_directory(current_fd, name, create=True)
+            if child_fd is None:  # pragma: no cover - create=True
+                raise OSError(f"cannot create Cursor pool component {name!r}")
+            os.close(current_fd)
+            current_fd = child_fd
+        result = current_fd
+        current_fd = -1
+        return result
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def _record_cursor_existing(parent_fd: int, name: str, expected: bytes,
+                            stats: dict) -> None:
+    try:
+        existing = _read_regular_file_at(parent_fd, name)
+    except OSError as exc:
+        print(f"  ! Cursor pool read error {name}: {exc}")
+        stats["errors"] += 1
+        return
+    if existing == expected:
+        stats["unchanged"] += 1
+    else:
+        print(f"  ! immutable Cursor revision conflict: keeping {name}")
+        stats["errors"] += 1
+
+
+def _publish_cursor_revision(parent_fd: int, name: str, data: bytes,
+                             stats: dict) -> None:
+    tmp_name = f".{name}.{os.getpid()}.part"
+    fd = os.open(
+        tmp_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW,
+        stat.S_IRUSR | stat.S_IWUSR, dir_fd=parent_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.link(
+                tmp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            os.unlink(tmp_name, dir_fd=parent_fd)
+            _record_cursor_existing(parent_fd, name, data, stats)
+            return
+        os.unlink(tmp_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        stats["new"] += 1
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _read_regular_file_at(parent_fd: int, name: str) -> bytes:
+    fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_fd)
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
@@ -230,14 +418,68 @@ def _read_regular_file(path: Path) -> bytes:
             os.close(fd)
 
 
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
-        | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+def _prune_cursor_parts(destination_fd: int, max_age_s: int = 3600) -> None:
+    """Delete only stale temps whose names prove this collector owns them."""
+    sessions_fd = _open_child_directory(destination_fd, "sessions", create=False)
+    if sessions_fd is None:
+        return
     try:
-        os.fsync(fd)
+        with os.scandir(sessions_fd) as sessions:
+            session_names = [entry.name for entry in sessions
+                             if len(entry.name) == 64
+                             and all(c in "0123456789abcdef" for c in entry.name)
+                             and entry.is_dir(follow_symlinks=False)]
+        for session_name in session_names:
+            session_fd = _open_child_directory(
+                sessions_fd, session_name, create=False,
+            )
+            if session_fd is None:
+                continue
+            try:
+                revisions_fd = _open_child_directory(
+                    session_fd, "revisions", create=False,
+                )
+                if revisions_fd is not None:
+                    try:
+                        _prune_cursor_revision_parts(revisions_fd, max_age_s)
+                    finally:
+                        os.close(revisions_fd)
+            finally:
+                os.close(session_fd)
     finally:
-        os.close(fd)
+        os.close(sessions_fd)
+
+
+def _prune_cursor_revision_parts(revisions_fd: int, max_age_s: int) -> None:
+    cutoff = time.time() - max_age_s
+    with os.scandir(revisions_fd) as entries:
+        names = [entry.name for entry in entries if _is_cursor_owned_part(entry.name)]
+    for name in names:
+        try:
+            file_stat = os.stat(name, dir_fd=revisions_fd, follow_symlinks=False)
+            if stat.S_ISREG(file_stat.st_mode) and file_stat.st_mtime < cutoff:
+                os.unlink(name, dir_fd=revisions_fd)
+        except OSError:
+            pass
+
+
+def _is_cursor_owned_part(name: str) -> bool:
+    destination = _collector_part_destination(name)
+    return destination is not None and _is_cursor_revision_name(destination)
+
+
+def _is_collector_owned_part(name: str) -> bool:
+    return _collector_part_destination(name) is not None
+
+
+def _collector_part_destination(name: str) -> Optional[str]:
+    if not name.startswith(".") or not name.endswith(".part"):
+        return None
+    try:
+        destination, process_id = name[1:-len(".part")].rsplit(".", 1)
+    except ValueError:
+        return None
+    return destination if destination and process_id.isdigit() else None
 
 
 def collect_all(sources=SOURCES, machine: Optional[str] = None,

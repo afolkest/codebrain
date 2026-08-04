@@ -144,10 +144,14 @@ class TestSweep(CollectBase):
         stale.write_text("torn", encoding="utf-8")
         two_hours_ago = time.time() - 7200
         os.utime(stale, (two_hours_ago, two_hours_ago))
+        unrelated = d / "victim.part"
+        unrelated.write_text("not collector-owned", encoding="utf-8")
+        os.utime(unrelated, (two_hours_ago, two_hours_ago))
         fresh = d / ".live.jsonl.456.part"
         fresh.write_text("inflight", encoding="utf-8")
         self.sweep()
         self.assertFalse(stale.exists())
+        self.assertTrue(unrelated.exists())
         self.assertTrue(fresh.exists())
 
 

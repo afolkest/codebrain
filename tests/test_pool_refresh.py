@@ -158,7 +158,7 @@ class TestPoolRefresh(unittest.TestCase):
             "--source", "pi", "--include-local",
             env={"CODEBRAIN_LOCAL_MACHINES": "alias"}, roots=roots,
         )
-        self.assertIn("reparsing local live homes", out)
+        self.assertIn("reparsing local sources", out)
         conn = db.connect(self.db_path)
         self.addCleanup(conn.close)
         rows = conn.execute("SELECT session_id FROM sessions ORDER BY session_id").fetchall()
@@ -176,7 +176,7 @@ class TestPoolRefresh(unittest.TestCase):
             "--source", "pi", "--include-local", roots=roots,
         )
 
-        self.assertIn("reparsing local live homes", out)
+        self.assertIn("reparsing local sources", out)
         conn = db.connect(self.db_path)
         self.addCleanup(conn.close)
         rows = conn.execute("SELECT session_id FROM sessions ORDER BY session_id").fetchall()
