@@ -7,13 +7,13 @@ projection and keeps its normalized SQLite cache rebuildable.
 
 ## Slice 1 — Safe Cursor snapshot projection
 
-- [ ] Add a read-only Cursor SQLite reader and capability-gated logical snapshot
+- [x] Add a read-only Cursor SQLite reader and capability-gated logical snapshot
   projection for embedded and separate-bubble composer formats.
-- [ ] Preserve structured ordering, session metadata, tools, simulated/control
+- [x] Preserve structured ordering, session metadata, tools, simulated/control
   flags, lineage, and timestamp evidence.
-- [ ] Positively allowlist exported fields; exclude encryption keys, opaque
+- [x] Positively allowlist exported fields; exclude encryption keys, opaque
   conversation state, thinking, tool binaries, and unrelated context.
-- [ ] Cover WAL visibility, format generations, timestamp fallbacks, missing
+- [x] Cover WAL visibility, format generations, timestamp fallbacks, missing
   bubbles, active/draft sessions, and security canaries.
 
 Scope: logical in-memory snapshots and source-database safety.
@@ -92,4 +92,3 @@ Scope: governing docs and end-to-end acceptance.
 
 Non-goals: Cursor CLI/ACP protobuf decoding, remote Background Agents,
 historical unordered orphan bubbles, or ancillary binary artifacts.
-
