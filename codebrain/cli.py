@@ -21,13 +21,16 @@ Setup / repair:
 Escape hatches:
   sessdb show <session> [--all]         raw transcript view
   sessdb list [--limit N]               session metadata by start time
-  sessdb grep <pattern> [paths...]      ripgrep raw logs (live + remote pool by default)
+  sessdb grep <pattern> [paths...]      ripgrep safe local/remote source roots
   sessdb codex-control-sync             rebuild Codex control provenance
+  sessdb cursor-provenance-sync         rebuild Cursor structured provenance
   sessdb schema                         print the DDL
 
-Read commands refresh first: changed/new local live-home files and synced remote
-pool files are delta-ingested before the query runs. Results stay current for this
-machine and include synced remote history after Syncthing arrives. --no-refresh skips it.
+Read commands refresh first: changed/new local source files (or Cursor's safe
+codebrain-owned export) and synced remote pool files are delta-ingested before
+the query runs. Results stay current for this machine and include synced remote
+history after Syncthing arrives. --no-refresh skips source refresh, but still
+rebuilds structured provenance overlays when needed.
 
 Raw SQL escape hatch: just open the DB with any sqlite3 client (see --schema).
 """
@@ -44,13 +47,14 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from codebrain import bmux, codex_control
+from codebrain import bmux, codex_control, cursor_provenance
 from codebrain.backfill_claude import DEFAULT_ORIGIN, backfill as backfill_claude
 from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
 from codebrain.db import DEFAULT_DB, connect, has_fts5
 from codebrain.paths import path_basename as _path_basename, path_norm as _path_norm
 from codebrain.ingest import (
-    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES,
+    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_CURSOR_ROOT, DEFAULT_PI_ROOT,
+    SOURCES,
     discover_pool_roots, ingest_all, ingest_source, local_machine_names, refresh,
     refresh_pool,
 )
@@ -66,7 +70,7 @@ def _refresh_notice(local_stats, pool_stats):
         print(f"(refreshed {'; '.join(parts)})", file=sys.stderr)
 
 
-def _open(args, sync_bmux=True, sync_codex_control=True):
+def _open(args, sync_bmux=True, sync_codex_control=True, sync_cursor=True):
     """Connect and (unless --no-refresh) delta-ingest whatever changed on disk."""
     conn = connect(args.db)
     transcripts_changed = False
@@ -91,6 +95,11 @@ def _open(args, sync_bmux=True, sync_codex_control=True):
             codex_control.sync(conn, changed_hint=transcripts_changed)
         except Exception as exc:  # noqa: BLE001
             print(f"(Codex control provenance skipped: {exc})", file=sys.stderr)
+    if sync_cursor:
+        try:
+            cursor_provenance.sync(conn, changed_hint=transcripts_changed)
+        except Exception as exc:  # noqa: BLE001
+            print(f"(Cursor provenance skipped: {exc})", file=sys.stderr)
     return conn
 
 
@@ -265,7 +274,7 @@ def cmd_ingest(args):
     sources = SOURCES if args.source == "all" else (args.source,)
     if args.raw_root:
         if args.source == "all":
-            print("--raw-root requires --source claude|codex|pi", file=sys.stderr)
+            print(f"--raw-root requires --source {'|'.join(SOURCES)}", file=sys.stderr)
             sys.exit(2)
     conn = connect(args.db)
     print(f"ingesting [{', '.join(sources)}] → {args.db}")
@@ -527,7 +536,7 @@ def _user_message_where(args, skip_subagent_guard=False):
     if not skip_subagent_guard and not getattr(args, "include_subagents", False):
         where.append(_not_subagent_session_sql())
     if not getattr(args, "include_inherited", False):
-        where.append("t.inherited = 0")  # pi resume copies are context, not new user intent
+        where.append("t.inherited = 0")  # copied history is context, not new user intent
     if getattr(args, "source", None):
         where.append("s.source = ?")
         params.append(args.source)
@@ -1626,7 +1635,10 @@ def cmd_grep(args):
 
 
 def _default_grep_roots():
-    roots = [DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT]
+    roots = [
+        DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT,
+        DEFAULT_CURSOR_ROOT,
+    ]
     roots.extend(
         root for _, _, root in discover_pool_roots(
             Path(DEFAULT_POOL),
@@ -1666,7 +1678,9 @@ def cmd_bmux_sync(args):
     # Skip the automatic default-log hook in _open: this command rebuilds the
     # overlay explicitly (and possibly against a custom --log), so the hook would
     # be redundant or fight a non-default path.
-    conn = _open(args, sync_bmux=False, sync_codex_control=False)
+    conn = _open(
+        args, sync_bmux=False, sync_codex_control=False, sync_cursor=False,
+    )
     path = Path(args.log) if args.log else bmux._default_log()
     stats = bmux.sync(conn, path, force=True)
     print("bmux provenance: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
@@ -1676,9 +1690,20 @@ def cmd_bmux_sync(args):
 
 
 def cmd_codex_control_sync(args):
-    conn = _open(args, sync_bmux=False, sync_codex_control=False)
+    conn = _open(
+        args, sync_bmux=False, sync_codex_control=False, sync_cursor=False,
+    )
     stats = codex_control.sync(conn, force=True)
     print("Codex control provenance: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    conn.close()
+
+
+def cmd_cursor_provenance_sync(args):
+    conn = _open(
+        args, sync_bmux=False, sync_codex_control=False, sync_cursor=False,
+    )
+    stats = cursor_provenance.sync(conn, force=True)
+    print("Cursor provenance: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
     conn.close()
 
 
@@ -1698,7 +1723,7 @@ def main(argv=None):
                     help="which source(s) to ingest (default all)")
     sp.add_argument("--machine", default=None, help="override hostname tag")
     sp.add_argument("--raw-root",
-                    help="override one source root; requires --source claude|codex|pi")
+                    help=f"override one source root; requires --source {'|'.join(SOURCES)}")
     sp.set_defaults(func=cmd_ingest)
 
     sp = sub.add_parser("collect", help="mirror raw logs into the append-only pool")
@@ -1767,7 +1792,7 @@ def main(argv=None):
     sp.add_argument("--min-chars", type=int, default=0, help="minimum latest-considered user length")
     sp.add_argument("--max-chars", type=int, default=0, help="maximum latest-considered user length (0 = no cap)")
     sp.add_argument("--include-inherited", action="store_true",
-                    help="include pi resume/branch copies (default: authored messages only)")
+                    help="include copied branch/session history (default: authored messages only)")
     sp.add_argument("--include-subagents", action="store_true",
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--full", action="store_true", help="do not truncate last user preview")
@@ -1786,7 +1811,7 @@ def main(argv=None):
     sp.add_argument("--min-chars", type=int, default=0, help="minimum message length")
     sp.add_argument("--max-chars", type=int, default=0, help="maximum message length (0 = no cap)")
     sp.add_argument("--include-inherited", action="store_true",
-                    help="include pi resume/branch copies (default: authored messages only)")
+                    help="include copied branch/session history (default: authored messages only)")
     sp.add_argument("--include-subagents", action="store_true",
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--full", action="store_true", help="do not truncate message text")
@@ -1849,7 +1874,7 @@ def main(argv=None):
     sp.add_argument("--only-session", help="only search one session id/prefix, including inherited live context")
     sp.add_argument("--exclude-recent", help="exclude events newer than a relative duration like 1h")
     sp.add_argument("--include-inherited", action="store_true",
-                    help="include pi resume/branch copies (default: authored events only)")
+                    help="include copied branch/session history (default: authored events only)")
     sp.add_argument("--include-subagents", action="store_true",
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
@@ -1892,7 +1917,7 @@ def main(argv=None):
     sp.add_argument("--only-session", help="only scan one session id/prefix, including inherited live context")
     sp.add_argument("--exclude-recent", help="exclude events newer than a relative duration like 1h")
     sp.add_argument("--include-inherited", action="store_true",
-                    help="include pi resume/branch copies (default: authored events only)")
+                    help="include copied branch/session history (default: authored events only)")
     sp.add_argument("--include-subagents", action="store_true",
                     help="include sessions spawned by subagent tool calls")
     sp.add_argument("--all", action="store_true", help="include rolled-back events")
@@ -1903,7 +1928,7 @@ def main(argv=None):
 
     sp = sub.add_parser(
         "grep",
-        help="ripgrep over live local logs and synced remote pool logs by default",
+        help="ripgrep safe local source roots and synced remote pool roots by default",
     )
     sp.add_argument("pattern")
     sp.add_argument(
@@ -1928,6 +1953,14 @@ def main(argv=None):
                         help="rebuild Codex control-message provenance from indexed transcripts")
     sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
     sp.set_defaults(func=cmd_codex_control_sync)
+
+    sp = sub.add_parser(
+        "cursor-provenance-sync",
+        help="rebuild Cursor structured user-message provenance",
+    )
+    sp.add_argument("--no-refresh", action="store_true",
+                    help="skip delta ingest before rebuilding provenance")
+    sp.set_defaults(func=cmd_cursor_provenance_sync)
 
     sp = sub.add_parser("schema", help="print the DDL")
     sp.set_defaults(func=cmd_schema)

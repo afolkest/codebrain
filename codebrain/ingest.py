@@ -3,8 +3,9 @@
 This reads each tool's raw home directly (read-only) and is agnostic to whether
 the root is a live tool dir or a pool subtree (collect.py mirrors homes into
 `<pool>/raw/<machine>/<source>` with relpaths preserved, so either works as a
-root). All upserts key on copy-invariant ids, so re-running is a no-op and the
-three sources share one deduped `events` table.
+root). Cursor first projects its live database into a codebrain-owned safe
+archive. All upserts key on copy-invariant ids, so re-running is a no-op and all
+sources share one deduped `events` table.
 """
 from __future__ import annotations
 

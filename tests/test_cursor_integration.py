@@ -39,6 +39,28 @@ def _snapshot(sid="S", texts=("one",)):
     }
 
 
+def _tool_snapshot(sid, session_created_at):
+    created_at = BASE_MS + 1000
+    payload = {
+        "bubbleId": "shared-tool", "type": 2, "text": "",
+        "createdAt": created_at,
+        "toolFormerData": {
+            "name": "read_file_v2", "toolCallId": "reused-source-call",
+            "status": "completed", "params": {"targetFile": "shared.py"},
+            "result": {"contents": "same result"},
+        },
+    }
+    return {
+        "projectionVersion": 1, "composerId": sid, "sourceVersion": 17,
+        "sourceCapability": "separate-bubbles",
+        "session": {"composerId": sid, "createdAt": session_created_at},
+        "order": [{
+            "bubbleId": "shared-tool", "type": 2,
+            "createdAt": created_at, "payload": payload,
+        }],
+    }
+
+
 def _live_cursor_db(path: Path):
     writer = _state_db(path)
     _header(writer, "LIVE", createdAt=BASE_MS)
@@ -138,6 +160,32 @@ class TestCursorRefreshIntegration(unittest.TestCase):
         rows = self.conn.execute("SELECT session_id FROM sessions").fetchall()
         self.assertEqual([row["session_id"] for row in rows], ["cursor:GOOD"])
         self.assertEqual((stats["sessions"], stats["errors"]), (1, 1))
+
+    def test_copied_tool_call_and_result_pair_without_event_conflicts(self):
+        cursor_archive.publish_snapshot(
+            _tool_snapshot("PARENT", BASE_MS), self.archive
+        )
+        cursor_archive.publish_snapshot(
+            _tool_snapshot("CHILD", BASE_MS + 2000), self.archive
+        )
+        stats = ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+        events = self.conn.execute(
+            "SELECT event_id, type, tool_call_event_id FROM events ORDER BY event_id"
+        ).fetchall()
+        placements = self.conn.execute(
+            "SELECT session_id, event_id, inherited FROM session_events "
+            "ORDER BY session_id, event_id"
+        ).fetchall()
+        call_id = "cursor:shared-tool:1767225601000:call"
+        result = next(row for row in events if row["type"] == "tool_result")
+        self.assertEqual((stats["conflicts"], len(events), len(placements)), (0, 2, 4))
+        self.assertEqual(result["tool_call_event_id"], call_id)
+        self.assertEqual(
+            {(row["session_id"], row["inherited"]) for row in placements},
+            {("cursor:PARENT", 0), ("cursor:CHILD", 1)},
+        )
 
 
 class TestCursorCollectionIntegration(unittest.TestCase):

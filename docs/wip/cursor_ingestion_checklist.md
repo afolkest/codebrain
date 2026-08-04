@@ -66,12 +66,12 @@ Non-goals: syncing Cursor databases, application support, or project sidecars.
 
 ## Slice 5 — Provenance and CLI integration
 
-- [ ] Add structured Cursor origin evidence for simulated messages, plan
+- [x] Add structured Cursor origin evidence for simulated messages, plan
   execution, and subagent kickoff input.
-- [ ] Add Cursor source/root handling across CLI filters, refresh paths, prefix
+- [x] Add Cursor source/root handling across CLI filters, refresh paths, prefix
   resolution, help text, and safe raw grep.
-- [ ] Prove structured fields—not text—drive human-intent filtering and lineage.
-- [ ] Harden event copy-consistency pairing if required by Cursor result IDs.
+- [x] Prove structured fields—not text—drive human-intent filtering and lineage.
+- [x] Harden event copy-consistency pairing if required by Cursor result IDs.
 
 Scope: retrieval behavior and user-facing commands.
 

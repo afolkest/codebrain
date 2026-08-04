@@ -98,3 +98,30 @@ choices do not belong here.
   behavior is deliberately part of the pool durability contract.
 - Follow-up: A broader dirfd/no-follow refactor for all collector destination
   trees remains optional inherited hardening, not a Cursor-specific blocker.
+
+## 2026-08-04 — Slice 5: Provenance and CLI integration
+
+- Decision: Treat exact Cursor simulated/plan booleans and nonblank subagent
+  kickoff IDs as direct structured origin evidence. For older subagents without
+  an explicit kickoff field, classify the first authored placement by structured
+  parent relation and sequence, regardless of text content or liveness.
+- Context: Cursor represents control-plane input as ordinary user bubbles.
+  Review found that a nonempty-text/live-only fallback could skip an empty or
+  rolled-back kickoff and incorrectly move the verdict to a later human
+  follow-up. The corpus also contains sessions with multiple explicit kickoff
+  markers, each of which is direct event-level evidence.
+- Alternatives considered: infer from prompt wording; classify every subagent
+  user message; require the fallback event to be live/nonempty; degrade multiple
+  explicit markers to unknown.
+- Rationale: Source flags, canonical lineage, authored placement, and sequence
+  are stable structured signals. Evidence fans out to inherited placements and
+  remains a rebuildable overlay, while identical text and tool approval fields
+  have no semantic effect.
+- Product/architecture impact: Human-intent queries exclude Cursor control input
+  by default without turning derived classifications into canonical transcript
+  truth. Default raw grep searches only the sanitized Cursor archive, never the
+  Cursor database or live home.
+- Reversibility: Easy. Evidence kinds are independently replaceable and the
+  force-sync CLI rebuilds them from canonical raw fields.
+- Follow-up: None. Aggregate copy-consistency review found no Cursor raw/ref/
+  tool-result pairing conflicts requiring a source-specific database rule.

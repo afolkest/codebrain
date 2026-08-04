@@ -13,19 +13,24 @@ class TestGrepCli(unittest.TestCase):
             root = Path(tmp)
             live_claude = root / "live-claude"
             live_pi = root / "live-pi"
+            safe_cursor = root / "safe-cursor"
             live_claude.mkdir()
             live_pi.mkdir()
+            safe_cursor.mkdir()
             pool = root / "pool"
             remote_pi = pool / "raw" / "mini" / "pi"
+            remote_cursor = pool / "raw" / "mini" / "cursor"
             local_claude = pool / "raw" / "local" / "claude"
             alias_codex = pool / "raw" / "alias" / "codex"
             remote_pi.mkdir(parents=True)
+            remote_cursor.mkdir(parents=True)
             local_claude.mkdir(parents=True)
             alias_codex.mkdir(parents=True)
 
             with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", live_claude), \
                  mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
                  mock.patch("codebrain.cli.DEFAULT_PI_ROOT", live_pi), \
+                 mock.patch("codebrain.cli.DEFAULT_CURSOR_ROOT", safe_cursor), \
                  mock.patch("codebrain.cli.DEFAULT_POOL", pool), \
                  mock.patch("codebrain.ingest.socket.gethostname", return_value="host-under-test"), \
                  mock.patch.dict(
@@ -35,9 +40,33 @@ class TestGrepCli(unittest.TestCase):
                  ):
                 roots = cli._default_grep_roots()
 
-        self.assertEqual(roots, [str(live_claude), str(live_pi), str(remote_pi)])
+        self.assertEqual(roots, [
+            str(live_claude), str(live_pi), str(safe_cursor),
+            str(remote_pi), str(remote_cursor),
+        ])
         self.assertNotIn(str(local_claude), roots)
         self.assertNotIn(str(alias_codex), roots)
+
+    def test_default_roots_never_include_cursor_database_or_live_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            safe = root / "codebrain-cursor-raw"
+            unsafe_home = root / ".cursor"
+            unsafe_db = root / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+            safe.mkdir()
+            unsafe_home.mkdir()
+            unsafe_db.parent.mkdir(parents=True)
+            unsafe_db.write_text("private", encoding="utf-8")
+            with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", root / "missing-claude"), \
+                 mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
+                 mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_CURSOR_ROOT", safe), \
+                 mock.patch("codebrain.cli.DEFAULT_POOL", root / "missing-pool"):
+                roots = cli._default_grep_roots()
+
+        self.assertEqual(roots, [str(safe)])
+        self.assertNotIn(str(unsafe_home), roots)
+        self.assertNotIn(str(unsafe_db), roots)
 
     def test_default_roots_handle_missing_pool_and_empty_live_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -45,6 +74,7 @@ class TestGrepCli(unittest.TestCase):
             with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", root / "missing-claude"), \
                  mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
                  mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_CURSOR_ROOT", root / "missing-cursor"), \
                  mock.patch("codebrain.cli.DEFAULT_POOL", root / "missing-pool"):
                 roots = cli._default_grep_roots()
 
@@ -60,6 +90,7 @@ class TestGrepCli(unittest.TestCase):
             with mock.patch("codebrain.cli.DEFAULT_CLAUDE_ROOT", remote_pi), \
                  mock.patch("codebrain.cli.DEFAULT_CODEX_ROOT", root / "missing-codex"), \
                  mock.patch("codebrain.cli.DEFAULT_PI_ROOT", root / "missing-pi"), \
+                 mock.patch("codebrain.cli.DEFAULT_CURSOR_ROOT", root / "missing-cursor"), \
                  mock.patch("codebrain.cli.DEFAULT_POOL", pool), \
                  mock.patch("codebrain.ingest.socket.gethostname", return_value="host-under-test"):
                 roots = cli._default_grep_roots()
