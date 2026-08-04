@@ -88,16 +88,18 @@ def parse_snapshot(snapshot: dict, machine: Optional[str] = None) -> ParsedSessi
         inherited_by_id[event_id] = inherited
 
     for item in ordered:
+        item_type = item.get("type") if isinstance(item, dict) else None
         if not isinstance(item, dict) or not isinstance(item.get("payload"), dict) \
                 or not isinstance(item.get("bubbleId"), str) \
-                or item.get("type") not in (1, 2):
+                or not isinstance(item_type, int) or isinstance(item_type, bool) \
+                or item_type not in (1, 2):
             raise CursorAdapterError("invalid Cursor ordered bubble")
         payload = item["payload"]
         bubble_id = item["bubbleId"]
         if not bubble_id or bubble_id in seen_bubbles:
             raise CursorAdapterError("duplicate or empty Cursor bubble identity")
         seen_bubbles.add(bubble_id)
-        if payload.get("bubbleId") != bubble_id or payload.get("type") != item["type"]:
+        if payload.get("bubbleId") != bubble_id or payload.get("type") != item_type:
             raise CursorAdapterError("Cursor bubble identity mismatch")
 
         hidden = payload.get("isThought") is True \
@@ -106,7 +108,7 @@ def parse_snapshot(snapshot: dict, machine: Optional[str] = None) -> ParsedSessi
             continue
         text_value = payload.get("text")
         has_message = isinstance(text_value, str) and (
-            item["type"] == 1 or bool(text_value.strip())
+            item_type == 1 or bool(text_value.strip())
         )
         tool = payload.get("toolFormerData")
         has_tool = isinstance(tool, dict) and isinstance(tool.get("name"), str) \
@@ -133,7 +135,7 @@ def parse_snapshot(snapshot: dict, machine: Optional[str] = None) -> ParsedSessi
         if has_message:
             emit(
                 identity + ":message", ts,
-                "user" if item["type"] == 1 else "assistant", "message",
+                "user" if item_type == 1 else "assistant", "message",
                 text_value, _empty_refs(), payload, inherited,
             )
 

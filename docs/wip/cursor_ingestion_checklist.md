@@ -51,13 +51,13 @@ Non-goals: live database access, source collection, or provenance overlays.
 
 ## Slice 4 — Ingest, refresh, collection, and pool integration
 
-- [ ] Add `cursor` to source discovery, defaults, refresh, full ingest, and pool
+- [x] Add `cursor` to source discovery, defaults, refresh, full ingest, and pool
   machine handling.
-- [ ] Export before local refresh/collection while never exporting for custom or
+- [x] Export before local refresh/collection while never exporting for custom or
   pool roots.
-- [ ] Collect only immutable safe revision files and preserve the append-only
+- [x] Collect only immutable safe revision files and preserve the append-only
   pool contract.
-- [ ] Verify authoritative placement replacement, no-op refresh, rollback
+- [x] Verify authoritative placement replacement, no-op refresh, rollback
   shrink, remote pool round trip, and failure isolation.
 
 Scope: ingestion spine and sync durability.

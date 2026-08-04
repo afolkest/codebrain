@@ -70,6 +70,25 @@ def discover_heads(root: Path) -> list[Path]:
     return sorted(heads)
 
 
+def discover_revisions(root: Path) -> list[Path]:
+    """Every reconstructible immutable segment needed to replicate the archive."""
+    sessions = Path(root) / "sessions"
+    if not _is_plain_directory(Path(root)) or not _is_plain_directory(sessions):
+        return []
+    revisions = []
+    for revision_dir in sorted(sessions.glob("*/revisions")):
+        try:
+            revisions.extend(state.path for state in _complete_revisions(revision_dir))
+        except (OSError, CursorArchiveError):
+            continue
+    return sorted(set(revisions))
+
+
+def read_revision_bytes(path: Path) -> bytes:
+    """Read and validate one immutable segment without following its final link."""
+    return canonical_bytes(_read_segment(Path(path)))
+
+
 def read_latest_snapshot(head_path: Path) -> dict:
     """Reconstruct the complete logical projection selected by ``head_path``."""
     head_path = Path(head_path)
@@ -461,7 +480,8 @@ def _complete_revisions(revision_dir: Path) -> list[RevisionState]:
             continue
         segments.append((path, segment))
 
-    complete: dict[str, RevisionState] = {}
+    complete: dict[tuple[str, int], RevisionState] = {}
+    states = []
     pending = list(segments)
     progressed = True
     while pending and progressed:
@@ -475,8 +495,8 @@ def _complete_revisions(revision_dir: Path) -> list[RevisionState]:
                     continue
                 base_payloads = {}
             else:
-                previous = complete.get(previous_digest)
-                if previous is None or segment["revision"] != previous.revision + 1:
+                previous = complete.get((previous_digest, segment["revision"] - 1))
+                if previous is None:
                     remaining.append((path, segment))
                     continue
                 base_payloads = previous.payloads
@@ -492,10 +512,11 @@ def _complete_revisions(revision_dir: Path) -> list[RevisionState]:
                 snapshot_digest=segment["snapshotDigest"],
                 snapshot=segment["snapshot"], payloads=merged,
             )
-            complete[state.snapshot_digest] = state
+            complete[(state.snapshot_digest, state.revision)] = state
+            states.append(state)
             progressed = True
         pending = remaining
-    return list(complete.values())
+    return states
 
 
 def _read_segment(path: Path) -> dict:

@@ -16,14 +16,17 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
-from codebrain.adapters import claude, codex, pi
+from codebrain import cursor_archive, cursor_export
+from codebrain.adapters import claude, codex, cursor, pi
 from codebrain.db import upsert_event, upsert_placement, upsert_session
 
 DEFAULT_CLAUDE_ROOT = Path.home() / ".claude"
 DEFAULT_CODEX_ROOT = Path.home() / ".codex"
 DEFAULT_PI_ROOT = Path.home() / ".pi"
+DEFAULT_CURSOR_DB = cursor_export.DEFAULT_CURSOR_DB
+DEFAULT_CURSOR_ROOT = cursor_export.DEFAULT_CURSOR_ROOT
 
-SOURCES = ("claude", "codex", "pi")
+SOURCES = ("claude", "codex", "pi", "cursor")
 STATS_KEYS = ("files", "sessions", "events", "placements", "skipped", "conflicts", "errors")
 
 
@@ -55,6 +58,29 @@ def discover_codex_files(raw_root: Path):
 def discover_pi_files(raw_root: Path):
     base = Path(raw_root) / "agent" / "sessions"
     return sorted(base.glob("*/*.jsonl")) if base.is_dir() else []
+
+
+def discover_cursor_files(raw_root: Path):
+    return cursor_archive.discover_heads(Path(raw_root))
+
+
+def export_local_cursor_archive() -> tuple[Path, dict]:
+    """Refresh the codebrain-owned safe archive when Cursor exists locally."""
+    root = Path(DEFAULT_CURSOR_ROOT)
+    empty = {
+        "candidates": 0, "published": 0, "unchanged": 0,
+        "skipped": 0, "errors": 0,
+    }
+    if not Path(DEFAULT_CURSOR_DB).is_file():
+        return root, empty
+    try:
+        return root, cursor_archive.export_cursor(
+            db_path=Path(DEFAULT_CURSOR_DB), root=root,
+        )
+    except Exception as exc:  # noqa: BLE001 — retain and ingest the last good archive
+        print(f"  ! Cursor export error: {exc}")
+        empty["errors"] = 1
+        return root, empty
 
 
 def _load_codex_titles(raw_root: Path) -> dict:
@@ -301,13 +327,23 @@ def _source_jobs(source: str, machine: Optional[str], raw_root: Optional[Path] =
         root = raw_root or DEFAULT_PI_ROOT
         return (discover_pi_files(root),
                 lambda p: pi.parse_file(p, machine=machine), None)
+    if source == "cursor":
+        root = raw_root or DEFAULT_CURSOR_ROOT
+        return (discover_cursor_files(root),
+                lambda p: cursor.parse_file(p, machine=machine), None)
     raise ValueError(f"unknown source {source!r}")
 
 
 def ingest_source(conn: sqlite3.Connection, source: str,
                   raw_root: Optional[Path] = None, machine: Optional[str] = None) -> dict:
+    export_errors = 0
+    if source == "cursor" and raw_root is None:
+        raw_root, export_stats = export_local_cursor_archive()
+        export_errors = export_stats["errors"]
     files, parse_fn, enrich = _source_jobs(source, machine, raw_root)
-    return _ingest(conn, files, parse_fn, enrich)
+    stats = _ingest(conn, files, parse_fn, enrich)
+    stats["errors"] += export_errors
+    return stats
 
 
 def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = None,
@@ -322,7 +358,11 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
     total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
              "skipped": 0, "conflicts": 0, "errors": 0}
     for src in sources:
-        files, parse_fn, enrich = _source_jobs(src, machine, (roots or {}).get(src))
+        raw_root = (roots or {}).get(src)
+        if src == "cursor" and raw_root is None:
+            raw_root, export_stats = export_local_cursor_archive()
+            total["errors"] += export_stats["errors"]
+        files, parse_fn, enrich = _source_jobs(src, machine, raw_root)
         changed = []
         for f in files:
             try:

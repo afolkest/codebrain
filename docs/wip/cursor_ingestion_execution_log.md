@@ -73,3 +73,28 @@ choices do not belong here.
   later, but accepted event and spawn identities intentionally remain stable.
 - Follow-up: Slice 5 will expose Cursor's existing structured origin evidence
   to provenance filtering without adding text classification.
+
+## 2026-08-04 — Slice 4: Ingest, refresh, collection, and pool integration
+
+- Decision: Collect every reconstructible Cursor revision segment, while
+  ingesting only the latest reconstructible head; publish pool copies with a
+  create-only link and retain either identical or conflicting concurrent
+  arrivals without replacement.
+- Context: Cursor archive heads contain payload deltas and cannot reconstruct on
+  another machine without their predecessors. The generic collector's mutable
+  log replacement path could also overwrite an immutable revision that arrived
+  concurrently from sync.
+- Alternatives considered: collect only heads; filename-glob every JSON file;
+  reuse the generic `os.replace` and shrink-guard behavior.
+- Rationale: Archive validation excludes databases, exporter state, locks,
+  partial files, malformed segments, and symlinks. Separating all-segment
+  replication from head-only ingestion preserves both remote reconstruction and
+  authoritative placement replacement. File and directory fsyncs make a
+  reported new revision crash-durable.
+- Product/architecture impact: Live Cursor export occurs only when no raw-root
+  override is supplied; custom and pool roots are pure consumers of sanitized,
+  immutable evidence, and missing Cursor installations create no archive state.
+- Reversibility: Easy at the integration layer; the append-only no-overwrite
+  behavior is deliberately part of the pool durability contract.
+- Follow-up: A broader dirfd/no-follow refactor for all collector destination
+  trees remains optional inherited hardening, not a Cursor-specific blocker.

@@ -64,6 +64,8 @@ class TestPoolRefresh(unittest.TestCase):
             mock.patch("codebrain.ingest.DEFAULT_CLAUDE_ROOT", roots["claude"]),
             mock.patch("codebrain.ingest.DEFAULT_CODEX_ROOT", roots["codex"]),
             mock.patch("codebrain.ingest.DEFAULT_PI_ROOT", roots["pi"]),
+            mock.patch("codebrain.ingest.DEFAULT_CURSOR_ROOT", roots["cursor"]),
+            mock.patch("codebrain.ingest.DEFAULT_CURSOR_DB", self.root / "missing-cursor.db"),
             mock.patch("codebrain.cli.DEFAULT_POOL", self.pool),
         ]
         if env is not None:
@@ -120,6 +122,8 @@ class TestPoolRefresh(unittest.TestCase):
         with mock.patch("codebrain.ingest.DEFAULT_CLAUDE_ROOT", roots["claude"]), \
              mock.patch("codebrain.ingest.DEFAULT_CODEX_ROOT", roots["codex"]), \
              mock.patch("codebrain.ingest.DEFAULT_PI_ROOT", roots["pi"]), \
+             mock.patch("codebrain.ingest.DEFAULT_CURSOR_ROOT", roots["cursor"]), \
+             mock.patch("codebrain.ingest.DEFAULT_CURSOR_DB", self.root / "missing-cursor.db"), \
              mock.patch("codebrain.cli.DEFAULT_POOL", self.pool), \
              mock.patch.dict(os.environ, {"CODEBRAIN_LOCAL_MACHINES": "alias"}, clear=False), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

@@ -95,6 +95,7 @@ class TestRevisionArchive(unittest.TestCase):
             cursor_archive.read_latest_snapshot(paths[-1]), snapshots[-1]
         )
         self.assertEqual(cursor_archive.discover_heads(self.root), [paths[-1]])
+        self.assertEqual(cursor_archive.discover_revisions(self.root), paths)
 
     def test_out_of_order_arrival_selects_latest_reconstructible_chain(self):
         one = cursor_archive.publish_snapshot(_snapshot(texts=("one",)), self.root)

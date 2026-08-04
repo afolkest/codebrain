@@ -26,12 +26,15 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import stat
 import sys
 from pathlib import Path
 from typing import Optional
 
+from codebrain import cursor_archive
 from codebrain.ingest import (
-    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT, SOURCES,
+    DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_CURSOR_ROOT, DEFAULT_PI_ROOT,
+    SOURCES, export_local_cursor_archive,
 )
 
 DEFAULT_POOL = Path.home() / "codebrain-pool"
@@ -41,6 +44,7 @@ DEFAULT_ROOTS = {
     "claude": DEFAULT_CLAUDE_ROOT,
     "codex": DEFAULT_CODEX_ROOT,
     "pi": DEFAULT_PI_ROOT,
+    "cursor": DEFAULT_CURSOR_ROOT,
 }
 
 
@@ -87,6 +91,8 @@ def discover(source: str, raw_root: Path):
     """Allowlisted files under one tool home — regular files only, no symlinks
     (a link could smuggle content from outside the home into the pool)."""
     root = Path(raw_root)
+    if source == "cursor":
+        return cursor_archive.discover_revisions(root)
     seen = set()
     for pattern in PATTERNS[source]:
         for f in root.glob(pattern):
@@ -112,13 +118,27 @@ def _prune_stale_parts(dest_root: Path, max_age_s: int = 3600) -> None:
 def collect_source(source: str, raw_root: Optional[Path] = None,
                    pool_root: Path = DEFAULT_POOL, machine: Optional[str] = None) -> dict:
     machine = _machine_name(machine)
-    root = Path(raw_root or DEFAULT_ROOTS[source])
+    export_errors = 0
+    if source == "cursor" and raw_root is None:
+        root, export_stats = export_local_cursor_archive()
+        export_errors = export_stats["errors"]
+    else:
+        root = Path(raw_root or DEFAULT_ROOTS[source])
     dest_root = Path(pool_root) / "raw" / machine / source
-    stats = {"files": 0, "new": 0, "updated": 0, "unchanged": 0, "shrunk": 0, "errors": 0}
+    stats = {"files": 0, "new": 0, "updated": 0, "unchanged": 0, "shrunk": 0,
+             "errors": export_errors}
     if dest_root.is_dir():
         _prune_stale_parts(dest_root)
     for f in discover(source, root):
         stats["files"] += 1
+        revision_bytes = None
+        if source == "cursor":
+            try:
+                revision_bytes = cursor_archive.read_revision_bytes(f)
+            except (OSError, cursor_archive.CursorArchiveError) as exc:
+                print(f"  ! invalid Cursor revision {f}: {exc}")
+                stats["errors"] += 1
+                continue
         try:
             sst = f.stat()
         except OSError:
@@ -129,6 +149,19 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
         except OSError:
             dst_st = None
         if dst_st is not None:
+            if revision_bytes is not None:
+                try:
+                    existing = _read_regular_file(dst)
+                except OSError as exc:
+                    print(f"  ! Cursor pool read error {dst}: {exc}")
+                    stats["errors"] += 1
+                    continue
+                if existing == revision_bytes:
+                    stats["unchanged"] += 1
+                else:
+                    print(f"  ! immutable Cursor revision conflict: keeping {dst}")
+                    stats["errors"] += 1
+                continue
             # Exact float equality is correct where copy2 round-trips mtime (APFS,
             # ns precision). On a coarse-mtime pool filesystem it degrades to
             # recopying — wasteful but never wrong, and loud in the stats.
@@ -149,8 +182,30 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
             dst.parent.mkdir(parents=True, exist_ok=True)
             # copy2 keeps mtime (→ next sweep's stat compare); follow_symlinks=False
             # closes the discover-then-copy race where a file becomes a symlink.
-            shutil.copy2(f, tmp, follow_symlinks=False)
-            os.replace(tmp, dst)
+            if revision_bytes is None:
+                shutil.copy2(f, tmp, follow_symlinks=False)
+            else:
+                with open(tmp, "xb") as fh:
+                    fh.write(revision_bytes)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+            if revision_bytes is None:
+                os.replace(tmp, dst)
+            else:
+                try:
+                    os.link(tmp, dst, follow_symlinks=False)
+                except FileExistsError:
+                    tmp.unlink(missing_ok=True)
+                    existing = _read_regular_file(dst)
+                    if existing == revision_bytes:
+                        stats["unchanged"] += 1
+                    else:
+                        print(f"  ! immutable Cursor revision conflict: keeping {dst}")
+                        stats["errors"] += 1
+                    continue
+                tmp.unlink()
+                _fsync_directory(dst.parent)
         except OSError as exc:
             print(f"  ! copy error {f}: {exc}")
             stats["errors"] += 1
@@ -158,6 +213,31 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
             continue
         stats["new" if dst_st is None else "updated"] += 1
     return stats
+
+
+def _read_regular_file(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise OSError("not a private regular file")
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+        | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def collect_all(sources=SOURCES, machine: Optional[str] = None,

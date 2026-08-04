@@ -258,6 +258,9 @@ class TestCursorAdapter(unittest.TestCase):
         bad = _snapshot(order=({"bubbleId": "bad", "type": 3, "payload": {}},))
         with self.assertRaises(cursor.CursorAdapterError):
             cursor.parse_snapshot(bad)
+        boolean_type = _item("bool", True, "not a numeric type")
+        with self.assertRaises(cursor.CursorAdapterError):
+            cursor.parse_snapshot(_snapshot(order=(boolean_type,)))
         duplicate = _item("same", 1, "x", "2026-01-01T00:00:01Z")
         with self.assertRaises(cursor.CursorAdapterError):
             cursor.parse_snapshot(_snapshot(order=(duplicate, duplicate)))
