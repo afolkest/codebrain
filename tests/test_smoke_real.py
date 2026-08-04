@@ -1,13 +1,13 @@
 """Real-corpus smoke: run the schema invariants over a spread of ACTUAL logs.
 
 This is the guard that synthetic fixtures can't be: it catches format shapes we
-didn't imagine. It reads each tool's home read-only and skips cleanly on a
-machine that doesn't have those logs (e.g. CI), so it's safe to commit.
+didn't imagine. It reads each source corpus (the safe archive for Cursor)
+read-only and skips cleanly when evidence is unavailable, so it's safe to commit.
 """
 import unittest
 
 from codebrain import ingest
-from codebrain.adapters import claude, codex, pi
+from codebrain.adapters import claude, codex, cursor, pi
 from tests._helpers import assert_session_invariants
 
 SAMPLE = 12   # files per source, spread across the corpus
@@ -38,6 +38,10 @@ class TestRealCorpusSmoke(unittest.TestCase):
     def test_codex(self):
         self._run(ingest.discover_codex_files(ingest.DEFAULT_CODEX_ROOT),
                   lambda f: codex.parse_file(f, machine="t"), "codex")
+
+    def test_cursor(self):
+        self._run(ingest.discover_cursor_files(ingest.DEFAULT_CURSOR_ROOT),
+                  lambda f: cursor.parse_file(f, machine="t"), "cursor")
 
     def test_pi(self):
         self._run(ingest.discover_pi_files(ingest.DEFAULT_PI_ROOT),

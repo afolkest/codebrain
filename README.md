@@ -1,14 +1,14 @@
 # codebrain
 
 `codebrain` is a local, searchable store of coding-agent sessions from Claude,
-Codex, and pi. It is meant for future agents trying to reconstruct user intent:
-goals, constraints, preferences, decisions, corrections, and the context around
-files or repos.
+Codex, Cursor, and pi. It is meant for future agents trying to reconstruct user
+intent: goals, constraints, preferences, decisions, corrections, and the context
+around files or repos.
 
-Raw logs are the source of truth. The SQLite DB is a rebuildable cache:
+Raw evidence is the source of truth. The SQLite DB is a rebuildable cache:
 
 ```text
-raw tool logs -> per-source adapters -> SQLite -> CLI / FTS / raw SQL
+source logs / safe Cursor projection -> per-source adapters -> SQLite -> CLI / FTS / raw SQL
 ```
 
 See [DESIGN.md](DESIGN.md) for architecture, [SCHEMA.md](SCHEMA.md) for the DB
@@ -22,9 +22,9 @@ pip install -e .
 sessdb ingest
 ```
 
-Daily read commands refresh first: changed local live logs and synced remote pool
-logs are delta-ingested before the query runs. Use `--no-refresh` only when you
-explicitly want to skip that.
+Daily read commands refresh first: changed local live logs, a safe projection of
+settled Cursor sessions, and synced remote pool logs are delta-ingested before the
+query runs. Use `--no-refresh` only when you explicitly want to skip that.
 
 ## Agent Workflow
 
@@ -90,7 +90,7 @@ Escape hatches:
 ```bash
 sessdb show <session> --all   # raw transcript view, including rolled-back events
 sessdb list                   # session metadata by start time
-sessdb grep <pattern>         # ripgrep raw live logs + remote pool roots
+sessdb grep <pattern>         # local source roots + remote pool; Cursor uses safe archive
 sessdb schema                 # print DDL for sqlite3 clients
 ```
 
@@ -99,7 +99,7 @@ sessdb schema                 # print DDL for sqlite3 clients
 Common filters compose across the discovery commands:
 
 ```bash
---source claude|codex|pi
+--source claude|codex|cursor|pi
 --cwd <substring>
 --after 2026-01-01
 --before 7d
@@ -121,8 +121,8 @@ Common filters compose across the discovery commands:
 --user-chars 0 --agent-chars 0 --tool-chars 0
 ```
 
-Default discovery excludes hidden sessions, sub-agent sessions, and inherited pi
-copies. Those are retrieval defaults, not data deletion.
+Default discovery excludes hidden sessions, sub-agent sessions, and inherited
+pi/Cursor copies. Those are retrieval defaults, not data deletion.
 
 ## Human Intent vs Control Input
 
@@ -134,6 +134,7 @@ to keep those messages out of default human-intent retrieval:
 - Codex MCP `codex` / `codex-reply` tool calls
 - Codex multi-agent `send_input`
 - Codex native inter-agent messages, which are parsed as non-user messages
+- Cursor simulated messages, plan execution, and sub-agent kickoff input
 
 Native user-message origins:
 
@@ -149,6 +150,7 @@ sessdb userlog --origin master-control
 sessdb userlog --origin unknown
 sessdb search "query" --actor user --origin all
 sessdb codex-control-sync
+sessdb cursor-provenance-sync
 sessdb bmux-sync
 ```
 
@@ -157,15 +159,18 @@ user-message origins instead of hiding them.
 
 ## Sync Model
 
-`collect` mirrors allowlisted raw logs into an append-only pool:
+`collect` mirrors allowlisted raw evidence into an append-only pool:
 
 ```text
 ~/codebrain-pool/raw/<machine>/<source>/...
 ```
 
 Sync that pool with Syncthing. Do not sync the SQLite DB or live tool homes.
-Normal read commands use local live logs plus synced remote pool subtrees. See
-[SYNCING.md](SYNCING.md) for machine-name aliases and stale-local-pool behavior.
+Cursor is the deliberate source-boundary exception: collection copies only
+codebrain's allowlisted immutable projection, never Cursor's live database.
+Normal read commands use local live logs, the local settled Cursor projection,
+and synced remote pool subtrees. See [SYNCING.md](SYNCING.md) for machine-name
+aliases and stale-local-pool behavior.
 
 Old Claude backups are imported into the pool, not restored into live
 `~/.claude`:
@@ -198,6 +203,8 @@ Source adapters normalize different raw shapes into that model:
   sidechain de-duplication.
 - Codex: flat append-only log, synthesized turn forest, rollback markers,
   control-message provenance, apply-patch refs, sub-agent/fork lineage.
+- Cursor: ordered composer bubbles from an immutable safe projection, structured
+  tool pairing/control provenance, copied-prefix inheritance, sub-agent lineage.
 - pi: `parentId` tree, resume/branch copied prefixes, cross-file dedup,
   structured sub-agent lineage.
 
@@ -207,6 +214,8 @@ Source adapters normalize different raw shapes into that model:
   normal top-level ingest discovery.
 - Shell-side file mutations are not tracked in `refs` / `touched`.
 - Codex reasoning is encrypted in current logs and excluded.
+- Cursor CLI/ACP protobuf history, remote Background Agents, unordered orphan
+  bubbles, and ancillary project artifacts are not ingested.
 - Embeddings / sqlite-vec are not a current retrieval path.
 - `title` and repo resolution are incomplete for some sources.
 

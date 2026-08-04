@@ -1,13 +1,17 @@
 # Cross-machine sync
 
-`codebrain` syncs raw session archives, not the SQLite cache.
+`codebrain` syncs raw session evidence, not the SQLite cache. For Cursor, the
+syncable evidence is codebrain's safe immutable projection—not Cursor's live
+SQLite database.
 
 ## Layers
 
 ```text
 1. live tool homes
    ~/.claude  ~/.codex  ~/.pi
+   Cursor state.vscdb (read-only source)
 
+      -> Cursor safe projection at ~/.codebrain/cursor-raw
       -> sessdb collect
 
 2. syncable raw pool
@@ -60,7 +64,13 @@ Do not sync:
 ~/.claude
 ~/.codex
 ~/.pi
+~/Library/Application Support/Cursor
+~/.cursor
+~/.codebrain/cursor-raw
 ```
+
+The local Cursor projection archive is collected into the pool; sync the pool,
+not either its upstream database or its private working archive.
 
 Add this Syncthing ignore pattern for collector temp files:
 
@@ -73,7 +83,7 @@ Add this Syncthing ignore pattern for collector temp files:
 After setup, normal read commands refresh both:
 
 ```text
-local live tool homes
+local live tool homes and settled Cursor projections
 remote synced pool subtrees
 ```
 
@@ -93,6 +103,8 @@ Local sessions:
 
 ```text
 tool writes ~/.pi -> next sessdb command refreshes live home -> visible
+Cursor commits a settled composer
+-> next sessdb command projects an immutable safe revision -> visible
 ```
 
 Remote sessions:
@@ -104,6 +116,11 @@ remote tool writes ~/.pi
 -> next local sessdb command refreshes remote pool
 -> visible
 ```
+
+The same remote sequence applies to Cursor after the remote collector projects a
+settled revision. Active, queued, draft, or internally incomplete Cursor sessions
+retain their last settled revision and become visible after a later successful
+projection.
 
 With `--interval 300`, remote freshness is usually bounded by about five minutes
 plus Syncthing latency and machine sleep/offline time, then whichever local
@@ -161,3 +178,43 @@ export CODEBRAIN_LOCAL_MACHINES=mini,old-mini-name
 
 `CODEBRAIN_LOCAL_MACHINES` lets read-time pool refresh skip local aliases after a
 host rename or custom collection name.
+
+## Cursor safety boundary
+
+Cursor stores local chat state at:
+
+```text
+~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
+```
+
+That live SQLite database and its WAL contain more than transcript evidence,
+including opaque application state and potentially sensitive configuration.
+`codebrain` opens it with SQLite `mode=ro` and `query_only`, takes a coherent
+WAL-aware read transaction, and recursively projects only reviewed transcript
+fields. It never treats `state.vscdb`, its WAL/SHM files, `~/.cursor`, project
+sidecars, logs, tool-output artifacts, or credentials as collection roots.
+The boundary prevents unrelated application state from being swept up; it does
+not make transcript content secret-free. Visible messages and lossless tool
+arguments/results can contain source, paths, output, or credentials, so the safe
+archive and pool remain private trusted-device storage.
+
+The safe archive lives at `~/.codebrain/cursor-raw` and contains immutable,
+content-hashed per-session revision segments. Each segment records the complete
+logical bubble order and only new or changed allowlisted payloads; a revision is
+ingestible only when its chain reconstructs fully. `collect` copies every
+reconstructible segment to:
+
+```text
+~/codebrain-pool/raw/<machine>/cursor/sessions/<session-hash>/revisions/...
+```
+
+Ingest reads only the latest reconstructible revision for each session. Remote
+out-of-order arrivals remain unavailable until their predecessors arrive. Pool
+publication is create-only: identical arrivals are no-ops and a conflicting
+file is preserved and reported rather than overwritten. Exporter state, locks,
+and temporary files remain local and never enter the pool.
+
+Default `sessdb grep` searches the safe Cursor archive plus pool roots; it never
+falls back to the live database or broad Cursor home directories. A custom
+Cursor raw root is always a consumer-only archive root and does not trigger a
+live export.

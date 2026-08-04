@@ -218,7 +218,7 @@ def _ensure_stats(conn: sqlite3.Connection) -> None:
 def _ensure_visibility_columns(conn: sqlite3.Connection) -> None:
     """Migrate existing caches to the session visibility schema.
 
-    The raw logs remain authoritative; visibility is a reversible retrieval
+    Raw evidence remains authoritative; visibility is a reversible retrieval
     policy stored in the rebuildable SQLite cache.
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}

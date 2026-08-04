@@ -1,11 +1,11 @@
-"""Ingest raw logs into the local SQLite cache (idempotent, multi-source).
+"""Ingest raw evidence into the local SQLite cache (idempotent, multi-source).
 
-This reads each tool's raw home directly (read-only) and is agnostic to whether
-the root is a live tool dir or a pool subtree (collect.py mirrors homes into
-`<pool>/raw/<machine>/<source>` with relpaths preserved, so either works as a
-root). Cursor first projects its live database into a codebrain-owned safe
-archive. All upserts key on copy-invariant ids, so re-running is a no-op and all
-sources share one deduped `events` table.
+Claude/Codex/pi read allowlisted logs from a live home or matching pool subtree.
+Cursor is the live-boundary exception: its application database is projected
+read-only into codebrain's private safe archive first, and local, custom, and
+pool roots all ingest only immutable projection heads. All upserts key on
+copy-invariant ids, so re-running is a no-op and every source shares one deduped
+`events` table.
 """
 from __future__ import annotations
 

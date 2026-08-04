@@ -97,13 +97,13 @@ corpus-scale refresh/revision-authority changes.
 
 ## Slice 7 — Documentation and real-corpus smoke
 
-- [ ] Document the Cursor format, safe-projection exception, source mapping,
+- [x] Document the Cursor format, safe-projection exception, source mapping,
   sync boundary, privacy exclusions, and deferred surfaces.
-- [ ] Add a strictly non-mutating real-corpus smoke over the safe archive, with
+- [x] Add a strictly non-mutating real-corpus smoke over the safe archive, with
   clean skipping when no archive is available.
-- [ ] Audit governing docs/help against the safe-evidence contract and exact
+- [x] Audit governing docs/help against the safe-evidence contract and exact
   structured mapping conventions.
-- [ ] Run the full suite and diff checks, then commit the completed docs/smoke
+- [x] Run the full suite and diff checks, then commit the completed docs/smoke
   slice.
 
 Scope: governing docs, user-visible help, and real safe-archive acceptance.

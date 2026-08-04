@@ -42,7 +42,7 @@ class EventRow:
     type: str             # message | tool_call | tool_result
     text: Optional[str]
     refs: dict            # {"files": [...], "commands": [...]}
-    raw: dict             # the original source record
+    raw: dict             # canonical raw evidence (original record or safe projection)
     tool_call_event_id: Optional[str] = None   # tool_result → its paired tool_call
     origin_session_id: Optional[str] = None
 
@@ -55,7 +55,7 @@ class PlacementRow:
     seq: int
     parent_event_id: Optional[str]
     live: int             # 1 on this session's live branch, else 0
-    inherited: int        # 1 if copied in from a parent session (pi), else 0
+    inherited: int        # 1 if copied in from a parent session (pi/Cursor), else 0
 
 
 @dataclass
