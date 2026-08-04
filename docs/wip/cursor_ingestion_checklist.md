@@ -23,11 +23,11 @@ integration, CLI/ACP/background-agent stores.
 
 ## Slice 2 — Immutable revision archive
 
-- [ ] Publish deterministic immutable per-session revision segments with
+- [x] Publish deterministic immutable per-session revision segments with
   snapshot/payload hashes and atomic private-file semantics.
-- [ ] Store complete current order plus only new/changed safe payloads.
-- [ ] Reconstruct the latest complete revision under out-of-order arrival.
-- [ ] Add incremental header tokens, periodic/full reconciliation, locking, and
+- [x] Store complete current order plus only new/changed safe payloads.
+- [x] Reconstruct the latest complete revision under out-of-order arrival.
+- [x] Add incremental header tokens, periodic/full reconciliation, locking, and
   failure isolation.
 
 Scope: codebrain-owned raw Cursor archive and its discovery/reconstruction API.

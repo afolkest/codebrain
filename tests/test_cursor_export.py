@@ -285,6 +285,22 @@ class TestCursorProjection(CursorProjectionBase):
         with self.assertRaises(cursor_export.CursorSnapshotError):
             cursor_export.read_session_snapshot(self.path, "bad")
 
+    def test_deep_and_non_utf8_json_strings_are_typed_source_errors(self):
+        values = (
+            '{"_v":1,"conversation":' + "[" * 1500 + "0" + "]" * 1500 + "}",
+            '{"_v":1,"conversation":[],"name":"\\ud800"}',
+        )
+        for index, value in enumerate(values):
+            sid = f"bad-{index}"
+            with self.subTest(sid=sid):
+                self.writer.execute(
+                    "INSERT INTO cursorDiskKV(key,value) VALUES (?,?)",
+                    (f"composerData:{sid}", value),
+                )
+                self.writer.commit()
+                with self.assertRaises(cursor_export.CursorSnapshotError):
+                    cursor_export.read_session_snapshot(self.path, sid)
+
     def test_null_header_and_exact_bubble_fail_closed(self):
         _header(self.writer, "S", value=None)
         _put(self.writer, "composerData:S", _modern_composer("S", ("u1",)))

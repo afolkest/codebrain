@@ -26,3 +26,26 @@ choices do not belong here.
 - Follow-up: Immutable revision publication in Slice 2 must serialize with
   strict canonical JSON and retain the last settled snapshot on projection
   errors.
+
+## 2026-08-04 — Slice 2: Immutable revision archive
+
+- Decision: Archive publication is anchored to no-follow directory descriptors,
+  while malformed header rows and sessions are tracked as independent pending
+  work instead of invalidating an export sweep.
+- Context: Independent review demonstrated that path-based creation could follow
+  archive-internal symlinks outside the requested root, and that aggregate token
+  validation let one malformed SQLite scalar suppress every valid session.
+  Deep or non-UTF-8 JSON also crossed the intended typed failure boundary.
+- Alternatives considered: path-level symlink checks under the process lock;
+  rejecting the entire header scan; accepting Python decoder failures as fatal.
+- Rationale: Descriptor-relative creation, create-only revision links, recursive
+  directory fsyncs, bounded JSON validation, and per-session pending state keep
+  the safe archive private, crash-reconstructible, and fail-open for unaffected
+  sessions.
+- Product/architecture impact: Only reconstructible immutable heads are source
+  evidence; exporter bookkeeping remains local and rebuildable, and one damaged
+  source record cannot erase or delay unrelated history.
+- Reversibility: Moderate. The archive version is explicit, while stricter
+  validation can be relaxed later without changing valid revision contents.
+- Follow-up: The Slice 3 adapter must consume reconstructed snapshots rather
+  than parsing delta segments directly.

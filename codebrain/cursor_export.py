@@ -268,7 +268,6 @@ def _resolve_copied_bubble(conn: sqlite3.Connection, bubble_id: str,
     wanted_ts = summary.get("createdAt")
     if not isinstance(wanted_ts, str) or not wanted_ts:
         return None
-    suffix = "%:" + bubble_id
     matches = []
     escaped_id = bubble_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pattern = "bubbleId:%:" + escaped_id
@@ -531,7 +530,7 @@ def _json_object(value, label: str) -> Optional[dict]:
         raise CursorSnapshotError(f"{label}: JSON value is not text")
     try:
         decoded = json.loads(value)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         raise CursorSnapshotError(f"{label}: invalid JSON")
     if not isinstance(decoded, dict):
         raise CursorSnapshotError(f"{label}: JSON value is not an object")
@@ -607,13 +606,42 @@ def _sqlite_bool(value, label: str) -> bool:
     raise CursorSnapshotError(f"invalid structured boolean column {label}")
 
 
-def _is_json_tree(value) -> bool:
-    if value is None or isinstance(value, (str, bool, int)):
-        return True
-    if isinstance(value, float):
-        return value == value and value not in (float("inf"), float("-inf"))
-    if isinstance(value, list):
-        return all(_is_json_tree(v) for v in value)
-    if isinstance(value, dict):
-        return all(isinstance(k, str) and _is_json_tree(v) for k, v in value.items())
-    return False
+def _is_json_tree(value, max_depth: int = 256, max_nodes: int = 1_000_000) -> bool:
+    """Validate strict, UTF-8 JSON without recursive Python traversal."""
+    stack = [(value, 0)]
+    seen = 0
+    while stack:
+        current, depth = stack.pop()
+        seen += 1
+        if seen > max_nodes:
+            return False
+        if current is None or isinstance(current, (bool, int)):
+            continue
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                return False
+            continue
+        if isinstance(current, float):
+            if not math.isfinite(current):
+                return False
+            continue
+        if isinstance(current, (list, dict)):
+            if depth >= max_depth:
+                return False
+            if isinstance(current, dict):
+                for key in current:
+                    if not isinstance(key, str):
+                        return False
+                    try:
+                        key.encode("utf-8", errors="strict")
+                    except UnicodeEncodeError:
+                        return False
+                values = current.values()
+            else:
+                values = current
+            stack.extend((item, depth + 1) for item in values)
+            continue
+        return False
+    return True
