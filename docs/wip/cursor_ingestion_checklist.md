@@ -36,13 +36,13 @@ Non-goals: normalized database ingestion or direct collection from `~/.cursor`.
 
 ## Slice 3 — Canonical Cursor adapter
 
-- [ ] Map Cursor sessions, messages, tool calls/results, refs, timestamps, and
+- [x] Map Cursor sessions, messages, tool calls/results, refs, timestamps, and
   placements into the canonical envelope.
-- [ ] Implement copy-invariant timestamped event IDs and safe session-scoped
+- [x] Implement copy-invariant timestamped event IDs and safe session-scoped
   fallback IDs for untimed historical bubbles.
-- [ ] Implement inherited-prefix detection, branch points, structured subagent
+- [x] Implement inherited-prefix detection, branch points, structured subagent
   lineage, and spawn-call linkage.
-- [ ] Exclude thinking and unstructured classifications; exercise all adapter
+- [x] Exclude thinking and unstructured classifications; exercise all adapter
   invariants and version/tool edge cases.
 
 Scope: sanitized revision snapshot to `ParsedSession`.

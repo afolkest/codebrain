@@ -49,3 +49,27 @@ choices do not belong here.
   validation can be relaxed later without changing valid revision contents.
 - Follow-up: The Slice 3 adapter must consume reconstructed snapshots rather
   than parsing delta segments directly.
+
+## 2026-08-04 — Slice 3: Canonical Cursor adapter
+
+- Decision: Treat inherited emitted bubbles as a contiguous prefix and fail
+  closed if later structured timestamps cross back before the session creation
+  boundary; resolve child spawn links only from a uniquely matching, emittable
+  parent tool bubble identified by both call and child IDs.
+- Context: Cursor reuses tool-call IDs, while copied bubbles preserve their
+  bubble identity and authored timestamp. Independent review also found that a
+  looser parent lookup could mint a spawn event ID for a bubble the adapter
+  itself would reject or suppress.
+- Alternatives considered: classify each bubble independently; link by tool
+  call ID alone; retain a dangling spawn ID when parent evidence is malformed.
+- Rationale: Timestamped bubble-component IDs deduplicate copied history, the
+  prefix invariant avoids inventing non-linear placement semantics from corrupt
+  ordering, and the exact structured predicate guarantees every resolved spawn
+  can correspond to the canonical parent call event.
+- Product/architecture impact: Cursor lineage remains evidence-first and uses
+  structured identities only; ambiguous or malformed evidence is preserved as
+  parent relation without a fabricated spawn link.
+- Reversibility: Moderate. Additional structured lineage formats can be added
+  later, but accepted event and spawn identities intentionally remain stable.
+- Follow-up: Slice 5 will expose Cursor's existing structured origin evidence
+  to provenance filtering without adding text classification.

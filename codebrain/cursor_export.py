@@ -118,6 +118,9 @@ def project_session(conn: sqlite3.Connection, composer_id: str) -> Optional[dict
     capability = _capability(composer)
     _require_settled(composer)
     session = _project_session_metadata(composer_id, composer, header_row, header_value)
+    spawn = _resolve_subagent_spawn(conn, composer_id, composer.get("subagentInfo"))
+    if spawn and isinstance(session.get("subagentInfo"), dict):
+        session["subagentInfo"].update(spawn)
 
     if capability == "embedded":
         source_order = composer["conversation"]
@@ -592,6 +595,78 @@ def _project_subagent_info(value) -> dict:
             if projected:
                 out["toolCallConversationStartIndexById"] = projected
     return out
+
+
+def _resolve_subagent_spawn(conn: sqlite3.Connection, child_id: str, value) -> dict:
+    """Resolve a child to one current parent call using structured identities."""
+    if not isinstance(value, dict):
+        return {}
+    parent_id = value.get("parentComposerId")
+    call_id = value.get("toolCallId")
+    if not isinstance(parent_id, str) or not parent_id \
+            or not isinstance(call_id, str) or not call_id:
+        return {}
+    try:
+        parent = _kv_object(
+            conn, "composerData:" + parent_id, null_is_missing=False
+        )
+        if parent is None:
+            return {}
+        capability = _capability(parent)
+        candidates = []
+        if capability == "embedded":
+            source = ((bubble, None) for bubble in parent["conversation"])
+        else:
+            entries = []
+            for summary in parent["fullConversationHeadersOnly"]:
+                if not isinstance(summary, dict):
+                    continue
+                bubble_id = summary.get("bubbleId")
+                if not isinstance(bubble_id, str) or not bubble_id:
+                    continue
+                bubble = _kv_object(conn, f"bubbleId:{parent_id}:{bubble_id}")
+                if bubble is not None:
+                    entries.append((bubble, summary))
+            source = iter(entries)
+        for bubble, summary in source:
+            if not isinstance(bubble, dict):
+                continue
+            summary_id = summary.get("bubbleId") if isinstance(summary, dict) else None
+            stored_id = bubble.get("bubbleId")
+            if isinstance(summary_id, str) and stored_id is not None \
+                    and stored_id != summary_id:
+                continue
+            bubble_type = bubble.get("type")
+            if not isinstance(bubble_type, int) or isinstance(bubble_type, bool) \
+                    or bubble_type not in (1, 2) \
+                    or (isinstance(summary, dict) and summary.get("type") is not None
+                        and summary.get("type") != bubble_type):
+                continue
+            if bubble.get("isThought") is True \
+                    or bubble.get("isSummarization") is True:
+                continue
+            tool = bubble.get("toolFormerData")
+            additional = tool.get("additionalData") if isinstance(tool, dict) else None
+            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) \
+                    or not tool["name"] or tool.get("toolCallId") != call_id \
+                    or not isinstance(additional, dict) \
+                    or additional.get("subagentComposerId") != child_id:
+                continue
+            bubble_id = summary_id or stored_id or bubble.get("id")
+            created_at = _source_created_at(
+                bubble, summary if isinstance(summary, dict) else None
+            )
+            if isinstance(bubble_id, str) and bubble_id \
+                    and _valid_source_time(created_at):
+                candidates.append((bubble_id, created_at))
+        if len(candidates) == 1:
+            return {
+                "spawnBubbleId": candidates[0][0],
+                "spawnCreatedAt": candidates[0][1],
+            }
+    except (sqlite3.Error, CursorSnapshotError):
+        return {}
+    return {}
 
 
 def _string_list(value) -> list[str]:
