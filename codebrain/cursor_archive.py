@@ -9,7 +9,7 @@ import os
 import sqlite3
 import stat
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -31,6 +31,10 @@ RETRY_CATEGORIES = frozenset({
 
 class CursorArchiveError(RuntimeError):
     pass
+
+
+class CursorArchiveBusy(CursorArchiveError):
+    """Another exporter holds the archive lock and the caller declined to wait."""
 
 
 @dataclass
@@ -297,18 +301,39 @@ def publish_snapshot(snapshot: dict, root: Path) -> Optional[Path]:
 def export_cursor(db_path: Path = cursor_export.DEFAULT_CURSOR_DB,
                   root: Path = cursor_export.DEFAULT_CURSOR_ROOT,
                   full_reconcile: bool = False,
-                  now: Optional[float] = None) -> dict:
-    """Incrementally project changed Cursor sessions into immutable revisions."""
+                  now: Optional[float] = None, *,
+                  authoritative: bool = True) -> dict:
+    """Incrementally project changed Cursor sessions into immutable revisions.
+
+    ``authoritative=False`` is the read-path mode: it never waits for a
+    concurrent exporter (a held lock returns ``busy=1`` and publishes nothing)
+    and projects only sessions whose header tokens changed, leaving full
+    reconciles, retry-due sessions, and stale temp pruning to the periodic
+    collector sweep. Reads therefore never pay for archive maintenance; they
+    are at most one collector interval stale for sessions a token misses.
+    """
     root = Path(root)
     now = time.time() if now is None else now
     if isinstance(now, bool) or not isinstance(now, (int, float)) \
             or not math.isfinite(now):
         raise CursorArchiveError("export time must be finite")
+    if full_reconcile and not authoritative:
+        raise CursorArchiveError("a full reconcile requires an authoritative export")
     stats = {
         "candidates": 0, "published": 0, "unchanged": 0,
-        "skipped": 0, "errors": 0,
+        "skipped": 0, "errors": 0, "busy": 0,
     }
-    with archive_lock(root) as root_fd:
+    exit_stack = ExitStack()
+    try:
+        # The lock is taken here (enter_context), so a declined non-blocking
+        # acquisition surfaces before the body ever runs.
+        root_fd = exit_stack.enter_context(
+            archive_lock(root, blocking=authoritative)
+        )
+    except CursorArchiveBusy:
+        stats["busy"] = 1
+        return stats
+    with exit_stack:
         state = _read_exporter_state(root, now)
         last_full = state.get("lastFullReconcileAt")
         last_full_valid = not isinstance(last_full, bool) \
@@ -316,15 +341,18 @@ def export_cursor(db_path: Path = cursor_export.DEFAULT_CURSOR_DB,
             and last_full <= now
         if not last_full_valid:
             last_full = 0
-        due_full = full_reconcile or not state or not last_full_valid or (
-            now - last_full >= FULL_RECONCILE_SECONDS
-        )
+        due_full = full_reconcile or (authoritative and (
+            not state or not last_full_valid
+            or now - last_full >= FULL_RECONCILE_SECONDS
+        ))
         last_part_prune = state.get("lastPartPruneAt")
         last_part_valid = not isinstance(last_part_prune, bool) \
             and isinstance(last_part_prune, (int, float)) \
             and math.isfinite(last_part_prune) and last_part_prune <= now
-        due_part_prune = not last_part_valid \
+        due_part_prune = authoritative and (
+            not last_part_valid
             or now - last_part_prune >= PART_PRUNE_SECONDS
+        )
         if not last_part_valid:
             last_part_prune = 0
         try:
@@ -358,7 +386,8 @@ def export_cursor(db_path: Path = cursor_export.DEFAULT_CURSOR_DB,
                 sid for sid in ids
                 if due_full or tokens.get(sid) != old_tokens.get(sid)
                 or (sid in invalid_header_ids and sid not in retries)
-                or (sid in retries and retries[sid]["nextAttemptAt"] <= now)
+                or (authoritative and sid in retries
+                    and retries[sid]["nextAttemptAt"] <= now)
             )
             stats["candidates"] = len(candidates)
             new_tokens = {
@@ -598,14 +627,20 @@ def _open_revision_directory(root_fd: int, composer_id: str):
 
 
 @contextmanager
-def archive_lock(root: Path):
+def archive_lock(root: Path, *, blocking: bool = True):
     root = Path(root)
     root_fd = _open_private_root(root)
     fd = None
     locked = False
     try:
         fd = _open_private_lock(root_fd)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX if blocking
+                        else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CursorArchiveBusy(
+                "another exporter holds the archive lock"
+            ) from exc
         locked = True
         yield root_fd
     finally:

@@ -217,6 +217,14 @@ publication is create-only: identical arrivals are no-ops and a conflicting
 file is preserved and reported rather than overwritten. Exporter state, locks,
 and temporary files remain local and never enter the pool.
 
+Export authority is split by caller. Read commands refresh opportunistically:
+they never wait for a concurrent exporter (a held lock skips the export and
+ingests the last published heads) and they project only sessions whose header
+tokens changed. The periodic collector sweep is the authoritative exporter: it
+owns the daily full reconcile, retry-due sessions, and stale temp pruning. A
+read command is therefore never the process that pays for archive maintenance;
+its Cursor view is at most one collector interval stale when it skips.
+
 Read-time discovery caches no-follow revision metadata per archive root and
 hashed session directory. Unchanged directories open no revision JSON; an
 arrival, deletion, or in-place repair revalidates only the affected chain. The

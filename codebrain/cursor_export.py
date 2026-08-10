@@ -251,6 +251,7 @@ def _project_separate_order(conn: sqlite3.Connection, composer_id: str,
                             composer: dict) -> list[dict]:
     ordered = []
     seen = set()
+    copied_key_index = None
     for index, summary in enumerate(composer["fullConversationHeadersOnly"]):
         if not isinstance(summary, dict) or not isinstance(summary.get("bubbleId"), str) \
                 or not summary.get("bubbleId"):
@@ -267,7 +268,9 @@ def _project_separate_order(conn: sqlite3.Connection, composer_id: str,
             conn, f"bubbleId:{composer_id}:{bubble_id}", null_is_missing=False
         )
         if bubble is None:
-            bubble = _resolve_copied_bubble(conn, bubble_id, summary)
+            if copied_key_index is None:
+                copied_key_index = _bubble_key_index(conn)
+            bubble = _resolve_copied_bubble(conn, bubble_id, summary, copied_key_index)
         if bubble is None:
             raise CursorSnapshotIncomplete(
                 f"{composer_id}: missing ordered bubble {bubble_id}"
@@ -291,8 +294,29 @@ def _project_separate_order(conn: sqlite3.Connection, composer_id: str,
     return ordered
 
 
+def _bubble_key_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """All bubble KV keys grouped by the id after their last colon.
+
+    Built at most once per projected session, inside that session's pinned read
+    transaction. The range predicate stays on the covering key index (';' is
+    the code point after ':'), so this never touches value blobs — unlike the
+    per-bubble ``LIKE ... ESCAPE`` fallback it replaces, whose escape clause
+    forced a full table scan of the multi-GB live database for every copied
+    bubble.
+    """
+    index: dict[str, list[str]] = {}
+    for row in conn.execute(
+        "SELECT key FROM cursorDiskKV WHERE key >= 'bubbleId:' AND key < 'bubbleId;'"
+    ):
+        key = row[0]
+        if isinstance(key, str):
+            index.setdefault(key.rsplit(":", 1)[-1], []).append(key)
+    return index
+
+
 def _resolve_copied_bubble(conn: sqlite3.Connection, bubble_id: str,
-                           summary: dict) -> Optional[dict]:
+                           summary: dict,
+                           key_index: dict[str, list[str]]) -> Optional[dict]:
     """Resolve copied v17 placements whose target composer has no KV payload.
 
     A global fallback is safe only with an exact structured timestamp and one
@@ -301,16 +325,25 @@ def _resolve_copied_bubble(conn: sqlite3.Connection, bubble_id: str,
     wanted_ts = summary.get("createdAt")
     if not isinstance(wanted_ts, str) or not wanted_ts:
         return None
+    suffix = ":" + bubble_id
+    if ":" in bubble_id:
+        keys = (k for group in key_index.values() for k in group)
+    else:
+        keys = iter(key_index.get(bubble_id, ()))
     matches = []
-    escaped_id = bubble_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    pattern = "bubbleId:%:" + escaped_id
-    for row in conn.execute(
-        "SELECT key,value FROM cursorDiskKV WHERE key LIKE ? ESCAPE '\\'",
-        (pattern,),
-    ):
-        if not row["key"].endswith(":" + bubble_id):
+    for key in keys:
+        # Match the shape 'bubbleId:' + owner + ':' + bubble_id, exactly as the
+        # replaced LIKE pattern did: the length guard rejects a key whose only
+        # colon is the prefix's own.
+        if not key.endswith(suffix) \
+                or len(key) < len("bubbleId:") + len(suffix):
             continue
-        candidate = _json_object(row["value"], row["key"])
+        row = conn.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?", (key,)
+        ).fetchone()
+        if row is None:
+            continue
+        candidate = _json_object(row[0], key)
         if candidate and candidate.get("createdAt") == wanted_ts \
                 and candidate.get("bubbleId") == bubble_id \
                 and (summary.get("type") is None

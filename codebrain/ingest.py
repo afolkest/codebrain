@@ -79,18 +79,25 @@ def discover_cursor_files(raw_root: Path):
     return cursor_archive.discover_heads(Path(raw_root))
 
 
-def export_local_cursor_archive() -> tuple[Path, dict]:
-    """Refresh the codebrain-owned safe archive when Cursor exists locally."""
+def export_local_cursor_archive(authoritative: bool = True) -> tuple[Path, dict]:
+    """Refresh the codebrain-owned safe archive when Cursor exists locally.
+
+    ``authoritative=False`` is the read path: it never waits for a concurrent
+    exporter (the ``busy`` stat records the skip) and projects only header-token
+    changes, deferring full reconciles and retry-due sessions to the collector
+    sweep — so a read command is never the process that pays for archive
+    maintenance."""
     root = Path(DEFAULT_CURSOR_ROOT)
     empty = {
         "candidates": 0, "published": 0, "unchanged": 0,
-        "skipped": 0, "errors": 0,
+        "skipped": 0, "errors": 0, "busy": 0,
     }
     if not Path(DEFAULT_CURSOR_DB).is_file():
         return root, empty
     try:
         return root, cursor_archive.export_cursor(
             db_path=Path(DEFAULT_CURSOR_DB), root=root,
+            authoritative=authoritative,
         )
     except Exception as exc:  # noqa: BLE001 — retain and ingest the last good archive
         print(f"  ! Cursor export error: {exc}")
@@ -612,7 +619,9 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
     """Delta ingest: re-parse only files that are new or whose (mtime, size) changed
     since ingest_state last saw them. Cheap enough to run before every read —
     tens of ms when nothing changed — which makes the DB effectively always
-    current for this machine: there is no 'not ingested yet' window.
+    current for this machine: there is no 'not ingested yet' window. The Cursor
+    export here is opportunistic (non-blocking, header-token changes only); the
+    collector sweep owns full reconciles, so a read never waits on maintenance.
     `roots` optionally overrides a source's raw root ({"pi": Path(...)})."""
     state = None
     total = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
@@ -620,7 +629,7 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
     for src in sources:
         raw_root = (roots or {}).get(src)
         if src == "cursor" and raw_root is None:
-            raw_root, export_stats = export_local_cursor_archive()
+            raw_root, export_stats = export_local_cursor_archive(authoritative=False)
             total["errors"] += export_stats["errors"]
         if src == "cursor":
             stats = _refresh_cursor(

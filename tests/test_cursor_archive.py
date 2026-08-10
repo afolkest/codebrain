@@ -415,6 +415,71 @@ class TestIncrementalExport(unittest.TestCase):
         )
         self.assertEqual((first["skipped"], forced["candidates"]), (1, 1))
 
+    def test_read_path_skips_when_another_exporter_holds_the_lock(self):
+        with cursor_archive.archive_lock(self.archive):
+            stats = cursor_archive.export_cursor(
+                self.db_path, self.archive, now=1000, authoritative=False,
+            )
+        self.assertEqual((stats["busy"], stats["candidates"]), (1, 0))
+        self.assertEqual(cursor_archive.discover_heads(self.archive), [])
+        self.assertFalse((self.archive / "exporter-state.json").exists())
+        unblocked = cursor_archive.export_cursor(
+            self.db_path, self.archive, now=1001, authoritative=False,
+        )
+        self.assertEqual((unblocked["busy"], unblocked["published"]), (0, 1))
+
+    def test_read_path_export_defers_full_reconcile_to_the_collector(self):
+        cursor_archive.export_cursor(self.db_path, self.archive, now=1000)
+        _put(self.writer, "composerData:data-only", {
+            "_v": 1, "createdAt": 1,
+            "conversation": [{"bubbleId": "u", "type": 1, "text": "x"}],
+        })
+        self.writer.commit()
+        due = 1000 + cursor_archive.FULL_RECONCILE_SECONDS
+        light = cursor_archive.export_cursor(
+            self.db_path, self.archive, now=due, authoritative=False,
+        )
+        deep = cursor_archive.export_cursor(self.db_path, self.archive, now=due + 1)
+        self.assertEqual((light["candidates"], light["published"]), (0, 0))
+        self.assertEqual((deep["candidates"], deep["published"]), (2, 1))
+
+    def test_read_path_export_defers_due_retries_to_the_collector(self):
+        _put(self.writer, "composerData:S", _modern_composer(
+            "S", ("u1",), generatingBubbleIds=["u1"],
+        ))
+        self.writer.commit()
+        first = cursor_archive.export_cursor(self.db_path, self.archive, now=1000)
+        light = cursor_archive.export_cursor(
+            self.db_path, self.archive, now=1061, authoritative=False,
+        )
+        sweep = cursor_archive.export_cursor(self.db_path, self.archive, now=1062)
+        self.assertEqual(
+            (first["skipped"], light["candidates"], sweep["candidates"]),
+            (1, 0, 1),
+        )
+
+    def test_read_path_export_still_publishes_token_changes(self):
+        cursor_archive.export_cursor(self.db_path, self.archive, now=1000)
+        _put(self.writer, "bubbleId:S:u1", {
+            "_v": 3, "bubbleId": "u1", "type": 1, "text": "changed",
+            "createdAt": "2026-01-01T00:00:01Z",
+        })
+        self.writer.execute(
+            "UPDATE composerHeaders SET checkpointAt=checkpointAt+1 WHERE composerId='S'"
+        )
+        self.writer.commit()
+        light = cursor_archive.export_cursor(
+            self.db_path, self.archive, now=1001, authoritative=False,
+        )
+        self.assertEqual((light["candidates"], light["published"]), (1, 1))
+
+    def test_full_reconcile_requires_authoritative_export(self):
+        with self.assertRaises(cursor_archive.CursorArchiveError):
+            cursor_archive.export_cursor(
+                self.db_path, self.archive, full_reconcile=True, now=1000,
+                authoritative=False,
+            )
+
     def test_draft_retry_uses_daily_backoff(self):
         _put(self.writer, "composerData:S", _modern_composer("S", status="none"))
         self.writer.commit()

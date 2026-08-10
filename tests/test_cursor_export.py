@@ -281,6 +281,41 @@ class TestCursorProjection(CursorProjectionBase):
         snapshot = cursor_export.read_session_snapshot(self.path, "child")
         self.assertEqual(snapshot["order"][0]["payload"]["text"], "copy")
 
+    def test_multiple_copied_bubbles_resolve_through_shared_index(self):
+        _header(self.writer, "child")
+        composer = _modern_composer("child", ("c1", "c2"))
+        for i, bid in enumerate(("c1", "c2")):
+            composer["fullConversationHeadersOnly"][i]["createdAt"] = \
+                f"2026-01-01T00:00:0{i}Z"
+            _put(self.writer, f"bubbleId:parent:{bid}", {
+                "_v": 3, "bubbleId": bid, "type": 1 if i == 0 else 2,
+                "text": f"copy{i}", "createdAt": f"2026-01-01T00:00:0{i}Z",
+            })
+        _put(self.writer, "composerData:child", composer)
+        self.writer.commit()
+
+        snapshot = cursor_export.read_session_snapshot(self.path, "child")
+        self.assertEqual(
+            [item["payload"]["text"] for item in snapshot["order"]],
+            ["copy0", "copy1"],
+        )
+
+    def test_copy_lookup_ignores_key_whose_only_colon_is_the_prefix(self):
+        _header(self.writer, "child")
+        composer = _modern_composer("child", ("orphan",))
+        composer["fullConversationHeadersOnly"][0]["createdAt"] = \
+            "2026-01-01T00:00:01Z"
+        _put(self.writer, "composerData:child", composer)
+        # No owner segment: the replaced LIKE pattern required
+        # 'bubbleId:' + owner + ':' + id, so this key must stay unmatched.
+        _put(self.writer, "bubbleId:orphan", {
+            "bubbleId": "orphan", "type": 1, "text": "wrong",
+            "createdAt": "2026-01-01T00:00:01Z",
+        })
+        self.writer.commit()
+        with self.assertRaises(cursor_export.CursorSnapshotIncomplete):
+            cursor_export.read_session_snapshot(self.path, "child")
+
     def test_ambiguous_copy_fails_closed(self):
         _header(self.writer, "child")
         composer = _modern_composer("child", ("copied",))

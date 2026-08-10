@@ -121,7 +121,9 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
     machine = _machine_name(machine)
     export_errors = 0
     if source == "cursor" and raw_root is None:
-        root, export_stats = export_local_cursor_archive()
+        # The collector is the authoritative exporter: it waits for the lock
+        # and owns full reconciles, retry-due sessions, and part pruning.
+        root, export_stats = export_local_cursor_archive(authoritative=True)
         export_errors = export_stats["errors"]
     else:
         root = Path(raw_root or DEFAULT_ROOTS[source])

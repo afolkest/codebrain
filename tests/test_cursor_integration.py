@@ -111,6 +111,28 @@ class TestCursorRefreshIntegration(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["machine"], "local")
 
+    def test_refresh_export_is_opportunistic_and_collect_is_authoritative(self):
+        cursor_archive.publish_snapshot(_snapshot(), self.archive)
+        fake_db = self.root / "state.vscdb"
+        fake_db.write_bytes(b"present")
+        stats_stub = {"candidates": 0, "published": 0, "unchanged": 0,
+                      "skipped": 0, "errors": 0, "busy": 0}
+        with mock.patch.object(ingest, "DEFAULT_CURSOR_DB", fake_db), \
+             mock.patch.object(ingest, "DEFAULT_CURSOR_ROOT", self.archive), \
+             mock.patch("codebrain.ingest.cursor_archive.export_cursor",
+                        return_value=dict(stats_stub)) as export:
+            ingest.refresh(self.conn, sources=("cursor",))
+        export.assert_called_once()
+        self.assertFalse(export.call_args.kwargs["authoritative"])
+
+        with mock.patch.object(ingest, "DEFAULT_CURSOR_DB", fake_db), \
+             mock.patch.object(ingest, "DEFAULT_CURSOR_ROOT", self.archive), \
+             mock.patch("codebrain.ingest.cursor_archive.export_cursor",
+                        return_value=dict(stats_stub)) as export:
+            collect.collect_source("cursor", pool_root=self.root / "pool")
+        export.assert_called_once()
+        self.assertTrue(export.call_args.kwargs["authoritative"])
+
     def test_explicit_archive_never_exports(self):
         cursor_archive.publish_snapshot(_snapshot(), self.archive)
         with mock.patch("codebrain.ingest.cursor_archive.export_cursor") as export:
