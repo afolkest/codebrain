@@ -290,6 +290,45 @@ class TestLaunchdPlist(unittest.TestCase):
         with self.assertRaises(ValueError):
             collect._plist_dict(command="refresh; rm -rf /")
 
+    def test_install_launchd_retries_bootstrap_after_bootout_race(self):
+        """launchd tears the old label down asynchronously, so the bootstrap
+        right after the bootout can fail with EIO ("Bootstrap failed: 5")
+        until the teardown lands. install_launchd must retry through the
+        transient window, and must still raise once retries are exhausted."""
+        def result(rc=0, stderr=""):
+            return mock.Mock(returncode=rc, stderr=stderr)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ), \
+                mock.patch.object(Path, "home", return_value=Path(tmp)):
+            os.environ.pop("CODEBRAIN_MACHINE", None)
+            calls = []
+
+            def fake_run(argv, **_):
+                calls.append(argv[1])
+                if argv[1] == "bootout":
+                    return result()
+                if calls.count("bootstrap") <= 2:  # fail twice, then succeed
+                    return result(5, "Bootstrap failed: 5: Input/output error")
+                return result()
+
+            with mock.patch("subprocess.run", side_effect=fake_run), \
+                    mock.patch("time.sleep") as slept:
+                path = collect.install_launchd(interval=60, command="sweep")
+            self.assertTrue(path.exists())
+            self.assertEqual(calls.count("bootstrap"), 3)
+            # Backoff grows between attempts; no sleep before the first try.
+            self.assertEqual([c.args[0] for c in slept.call_args_list],
+                             [0.5, 1.0])
+
+            # A label that never frees up still surfaces the launchctl error.
+            with mock.patch("subprocess.run",
+                            return_value=result(5, "Bootstrap failed: 5")), \
+                    mock.patch("time.sleep") as slept:
+                with self.assertRaises(RuntimeError):
+                    collect.install_launchd(interval=60, command="sweep")
+            self.assertEqual(len(slept.call_args_list), 4)  # 5 attempts total
+
 
 if __name__ == "__main__":
     unittest.main()

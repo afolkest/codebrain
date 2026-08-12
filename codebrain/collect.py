@@ -541,8 +541,16 @@ def install_launchd(interval: int = 1800, pool_root: Path = DEFAULT_POOL,
     uid = os.getuid()
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"],
                    capture_output=True)  # unload a previous version, if any
-    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
-                       capture_output=True, text=True)
+    # launchd tears the old job down asynchronously, so a bootstrap issued right
+    # after the bootout can fail with "Bootstrap failed: 5: Input/output error"
+    # until the label is actually free. Retry briefly before giving up.
+    bootstrap = ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)]
+    r = subprocess.run(bootstrap, capture_output=True, text=True)
+    for attempt in range(1, 5):
+        if r.returncode == 0:
+            break
+        time.sleep(0.5 * attempt)
+        r = subprocess.run(bootstrap, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"launchctl bootstrap failed: {r.stderr.strip()}")
     return plist_path
