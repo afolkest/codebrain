@@ -18,6 +18,9 @@ PLAN_KIND = "cursor_plan_execution"
 KICKOFF_KIND = "cursor_subagent_kickoff"
 EVIDENCE_KINDS = (SIMULATED_KIND, PLAN_KIND, KICKOFF_KIND)
 STATE_PATH = "__codebrain_cursor_provenance__"
+# Participates in the skip fingerprint: bump whenever classification logic
+# changes so unchanged source data still gets exactly one rebuild.
+ALGO_VERSION = 1
 
 
 def _empty_stats(**extra) -> dict:
@@ -30,13 +33,17 @@ def _empty_stats(**extra) -> dict:
 
 
 def _source_rows(conn: sqlite3.Connection) -> list:
+    # CROSS JOIN pins the join order to sessions -> placements -> events (PK).
+    # Left to itself the planner drives off ix_ev_actor_type_ts and visits every
+    # user message of every source before filtering to cursor sessions — 2-3x
+    # slower on a large multi-source cache (measured 12s vs 5s on 1.4M events).
     return conn.execute(
         """
         SELECT s.session_id, s.relation, s.parent_session_id,
                se.event_id, se.seq, se.live, se.inherited, e.raw
         FROM sessions s
-        JOIN session_events se ON se.session_id = s.session_id
-        JOIN events e ON e.event_id = se.event_id
+        CROSS JOIN session_events se ON se.session_id = s.session_id
+        CROSS JOIN events e ON e.event_id = se.event_id
         WHERE s.source = 'cursor' AND e.actor = 'user' AND e.type = 'message'
         ORDER BY s.session_id, se.seq, se.event_id
         """
@@ -53,6 +60,18 @@ def _fingerprint(rows: list) -> str:
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()
+
+
+def _head_fingerprint(conn: sqlite3.Connection) -> str:
+    # cursor_session_heads is one row per Cursor session, so this stays
+    # milliseconds where _source_rows() drags events.raw through a full join.
+    rows = conn.execute(
+        """
+        SELECT session_id, revision, digest FROM cursor_session_heads
+        ORDER BY session_id
+        """
+    ).fetchall()
+    return _fingerprint([(ALGO_VERSION,), *rows])
 
 
 def _state(conn: sqlite3.Connection):
@@ -74,11 +93,21 @@ def _parse_raw(value) -> dict:
 
 def sync(conn: sqlite3.Connection, changed_hint: bool = True,
          force: bool = False) -> dict:
-    rows = _source_rows(conn)
-    fingerprint = _fingerprint(rows)
-    if not force and not changed_hint and _state(conn) == fingerprint:
+    # Every accepted write of Cursor sessions/events/placements commits in the
+    # same per-file transaction that advances that session's row in
+    # cursor_session_heads (ingest._ingest / db.record_cursor_head), so an
+    # unchanged head fingerprint implies an unchanged _source_rows() result.
+    # Gating on the heads keeps the events.raw join off the read path.
+    # changed_hint is deliberately not consulted: the head watermark subsumes
+    # it; the parameter remains for call-site compatibility (cli._open).
+    # The fingerprint is computed BEFORE _source_rows() so the stored value is
+    # never newer than the data the rebuild read; a concurrent head advance
+    # can only cause one extra rebuild, never a stale skip.
+    fingerprint = _head_fingerprint(conn)
+    if not force and _state(conn) == fingerprint:
         return _empty_stats(skipped=1)
 
+    rows = _source_rows(conn)
     stats = _empty_stats()
     try:
         raw_by_event = {}
@@ -160,6 +189,9 @@ def sync(conn: sqlite3.Connection, changed_hint: bool = True,
             provenance.record_origin_evidence(conn, row)
         provenance.rebuild_effective_origins(conn)
         stats["evidence"] = len(evidence)
+        # Pre-head-gating versions stored a _source_rows() fingerprint here; it
+        # can never equal a head fingerprint, so an upgraded database does
+        # exactly one full rebuild and then re-enters the skip path.
         conn.execute(
             "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) "
             "VALUES (?, 0, ?, ?)",

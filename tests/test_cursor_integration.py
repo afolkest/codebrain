@@ -376,9 +376,12 @@ class TestCursorRefreshIntegration(unittest.TestCase):
             self.conn, sources=("cursor",), roots={"cursor": self.archive}
         )
         cursor_archive.publish_snapshot(new, self.archive)
+        # Fail at the head-recording step: it always runs for a cursor session,
+        # unlike placement writes, which a content-only revision no longer touches
+        # (unchanged placements are skipped, not rewritten).
         with mock.patch(
-                "codebrain.ingest.upsert_placement",
-                side_effect=RuntimeError("injected placement failure")):
+                "codebrain.ingest.record_cursor_head",
+                side_effect=RuntimeError("injected head failure")):
             failed = ingest.refresh(
                 self.conn, sources=("cursor",), roots={"cursor": self.archive}
             )

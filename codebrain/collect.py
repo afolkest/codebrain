@@ -496,14 +496,19 @@ def collect_all(sources=SOURCES, machine: Optional[str] = None,
 
 
 def _plist_dict(interval: int = 1800, pool_root: Path = DEFAULT_POOL,
-                source: str = "all", machine: Optional[str] = None) -> dict:
+                source: str = "all", machine: Optional[str] = None,
+                command: str = "collect") -> dict:
     """The LaunchAgent definition, as data (plistlib serializes it — escaping of
     odd path characters comes free). Runs THIS interpreter (`sys.executable -m
-    codebrain collect`) so the env that can import codebrain is the env launchd
+    codebrain <command>`) so the env that can import codebrain is the env launchd
     runs; WorkingDirectory covers the run-from-checkout (no pip install) case.
-    RunAtLoad catches sweeps missed while the machine was off."""
+    RunAtLoad catches sweeps missed while the machine was off. `command` is
+    "collect" (durability only) or "sweep" (durability + DB freshness); one
+    label, so installing either replaces the other rather than double-running."""
+    if command not in ("collect", "sweep"):
+        raise ValueError(f"unsupported LaunchAgent command {command!r}")
     log = Path.home() / ".codebrain" / "logs" / "collect.log"
-    argv = [sys.executable, "-m", "codebrain", "collect", "--pool", str(pool_root)]
+    argv = [sys.executable, "-m", "codebrain", command, "--pool", str(pool_root)]
     if source != "all":
         argv += ["--source", source]
     machine = machine or os.environ.get("CODEBRAIN_MACHINE")
@@ -522,12 +527,13 @@ def _plist_dict(interval: int = 1800, pool_root: Path = DEFAULT_POOL,
 
 
 def install_launchd(interval: int = 1800, pool_root: Path = DEFAULT_POOL,
-                    source: str = "all", machine: Optional[str] = None) -> Path:
+                    source: str = "all", machine: Optional[str] = None,
+                    command: str = "collect") -> Path:
     """Write + (re)load a LaunchAgent that sweeps every `interval` seconds."""
     import plistlib
     import subprocess
 
-    spec = _plist_dict(interval, pool_root, source, machine)
+    spec = _plist_dict(interval, pool_root, source, machine, command=command)
     Path(spec["StandardOutPath"]).parent.mkdir(parents=True, exist_ok=True)
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)

@@ -338,9 +338,11 @@ def _record_file_refs(conn: sqlite3.Connection, e: EventRow) -> None:
 
 
 def has_fts5(conn: sqlite3.Connection) -> bool:
+    # Probe in the temp schema: the probe must not write to the main database,
+    # or every nominally read-only open of a WAL DB takes the write lock.
     try:
-        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts_probe USING fts5(x)")
-        conn.execute("DROP TABLE IF EXISTS _fts_probe")
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp._fts_probe USING fts5(x)")
+        conn.execute("DROP TABLE IF EXISTS temp._fts_probe")
         return True
     except sqlite3.OperationalError:
         return False
@@ -373,11 +375,8 @@ def _ensure_fts(conn: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS events_fts_ad AFTER DELETE ON events BEGIN
           INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
         END;
-        CREATE TRIGGER IF NOT EXISTS events_fts_au AFTER UPDATE ON events BEGIN
-          INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
-          INSERT INTO events_fts(rowid, text) VALUES (new.rowid, new.text);
-        END;
     """)
+    _ensure_fts_update_trigger(conn)
     if fresh:
         n = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         if n:
@@ -386,9 +385,73 @@ def _ensure_fts(conn: sqlite3.Connection) -> None:
             conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')")
 
 
+# UPDATE OF text alone is not enough: the upsert's SET list always names text,
+# so it would still fire when only refs/raw changed. The NULL-safe WHEN clause
+# limits FTS churn to rows whose text actually changed — the only case
+# external-content integrity needs the delete+insert pair.
+_FTS_AU_SQL = """CREATE TRIGGER events_fts_au AFTER UPDATE OF text ON events
+WHEN old.text IS NOT new.text
+BEGIN
+  INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+  INSERT INTO events_fts(rowid, text) VALUES (new.rowid, new.text);
+END"""
+
+
+def _fts_au_needs_migration(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='events_fts_au'"
+    ).fetchone()
+    sql = (row["sql"] or "") if row is not None else ""
+    # Both the column scope AND the WHEN guard must be present — a trigger
+    # carrying only one of them still churns FTS on non-text updates.
+    return "UPDATE OF text" not in sql or "old.text IS NOT new.text" not in sql
+
+
+def _ensure_fts_update_trigger(conn: sqlite3.Connection) -> None:
+    """Create/migrate events_fts_au to the text-scoped shape, atomically.
+
+    The pre-scoping trigger fired an FTS delete+insert on EVERY events update,
+    even ones that left text untouched; dropping it never desyncs the index —
+    only the firing condition narrows. Drop+create must share one write
+    transaction: a concurrent writer updating text in the gap would desync the
+    external-content index, and two upgrading connections could race the DROP.
+    The unlocked probe keeps steady-state opens read-only; it is re-checked
+    under the lock before acting."""
+    if not _fts_au_needs_migration(conn):
+        return
+    started = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started = True
+        if _fts_au_needs_migration(conn):
+            conn.execute("DROP TRIGGER IF EXISTS events_fts_au")
+            conn.execute(_FTS_AU_SQL)
+        if started:
+            conn.commit()
+    except sqlite3.OperationalError:
+        # The migration is a performance fix, not correctness — the old trigger
+        # over-fires but never desyncs the index. If a concurrent writer holds
+        # the lock past busy_timeout, opening must not fail: skip and let the
+        # next open retry (same posture as _ensure_stats' ANALYZE).
+        if started and conn.in_transaction:
+            conn.rollback()
+
+
 # ---- idempotent upserts (re-ingest is a no-op; see SCHEMA.md Ingest contract) ----
 
 def upsert_session(conn: sqlite3.Connection, s: SessionRow) -> None:
+    row = conn.execute(
+        "SELECT source, machine, cwd, repo, created_at, started_at, ended_at, "
+        "parent_session_id, relation, spawn_event_id, branch_point_event_id, "
+        "tip_event_id, title FROM sessions WHERE session_id=?",
+        (s.session_id,),
+    ).fetchone()
+    if row is not None and tuple(row) == (
+            s.source, s.machine, s.cwd, s.repo, s.created_at, s.started_at,
+            s.ended_at, s.parent_session_id, s.relation, s.spawn_event_id,
+            s.branch_point_event_id, s.tip_event_id, s.title):
+        return  # unchanged re-parse: skip the write (hidden_at/_reason untouched either way)
     conn.execute(
         """
         INSERT INTO sessions (session_id, source, machine, cwd, repo, created_at,
@@ -464,7 +527,12 @@ def upsert_cursor_event(conn: sqlite3.Connection, e: EventRow) -> bool:
     if old_origin is not None:
         if new_origin is None:
             return True
-        # Same authored origin at a newer accepted session head.
+        # Same authored origin at a newer accepted session head. A byte-identical
+        # re-present was digest-validated when first stored, so skip the
+        # canonical-digest work along with the write — the common case, since an
+        # accepted head re-presents the session's whole history.
+        if _stored_event_matches(row, e):
+            return True
         if _cursor_event_digest(e) is None:
             return False
         _store_event(conn, e, row)
@@ -477,6 +545,10 @@ def upsert_cursor_event(conn: sqlite3.Connection, e: EventRow) -> bool:
         _store_event(conn, e, row)
         return True
 
+    # An identical inherited copy would tie on digests and change nothing —
+    # skip the two canonical-digest computations for that common case.
+    if _stored_event_matches(row, e):
+        return True
     incoming_digest = _cursor_event_digest(e)
     stored_digest = _cursor_stored_event_digest(row)
     if incoming_digest is None or stored_digest is None:
@@ -498,9 +570,37 @@ def _authored_origin_conflict(old: str, new: str) -> bool:
     return old is not None and new is not None and old != new
 
 
+def _stored_event_matches(row, e: EventRow, refs_json: str | None = None,
+                          raw_json: str | None = None) -> bool:
+    """Whether the stored row already equals what storing `e` would produce.
+
+    Refresh re-parses a grown append-only log in full, so almost every upsert
+    re-presents an event the DB already holds byte-for-byte. The upsert's
+    UPDATE is never free — it rewrites the row and (for text changes) the
+    events_fts index — so callers skip it when this holds. The UPDATE keeps
+    the first non-null origin, so compare against COALESCE(stored, incoming).
+    """
+    try:
+        refs = refs_json if refs_json is not None else json.dumps(e.refs)
+        raw = raw_json if raw_json is not None else json.dumps(e.raw)
+    except (TypeError, ValueError, RecursionError):
+        # Unserializable incoming payload can never match stored JSON text;
+        # report no match and let the caller's own validation reject it.
+        return False
+    effective_origin = row["origin_session_id"] \
+        if row["origin_session_id"] is not None else e.origin_session_id
+    return (row["origin_session_id"], row["ts"], row["actor"], row["type"],
+            row["text"], row["refs"], row["tool_call_event_id"],
+            row["raw"]) == (
+            effective_origin, e.ts, e.actor, e.type, e.text, refs,
+            e.tool_call_event_id, raw)
+
+
 def _store_event(conn: sqlite3.Connection, e: EventRow, row) -> None:
     refs_json = json.dumps(e.refs)
     raw_json = json.dumps(e.raw)
+    if row is not None and _stored_event_matches(row, e, refs_json, raw_json):
+        return
     conn.execute(
         """
         INSERT INTO events (event_id, origin_session_id, ts, actor, type, text,

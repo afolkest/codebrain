@@ -12,6 +12,7 @@ Daily archaeology:
 Setup / repair:
   sessdb ingest                         full build/rebuild of the local DB
   sessdb collect [--install-launchd]    mirror source evidence into the raw pool
+  sessdb sweep [--install-launchd]      collect + refresh in one background pass
   sessdb ingest-pool                    debug/repair ingest of synced pool subtrees
   sessdb backfill-claude <path>         import historical Claude backups into pool
   sessdb hide <session> --reason <why>  hide noisy sessions from default retrieval
@@ -306,6 +307,52 @@ def cmd_collect(args):
         print(str(exc), file=sys.stderr)
         sys.exit(2)
     print("done: " + ", ".join(f"{k}={v}" for k, v in total.items()))
+
+
+def cmd_sweep(args):
+    """One background maintenance pass: durability (collect into the pool), then
+    freshness (delta-refresh local sources + synced pool + provenance overlays).
+    Meant for launchd — when it runs periodically, read commands' own refresh
+    finds almost nothing left to absorb, so reads stay fast even right after
+    heavy agent activity."""
+    try:
+        if args.install_launchd:
+            path = install_launchd(interval=args.interval, pool_root=Path(args.pool),
+                                   source=args.source, machine=args.machine,
+                                   command="sweep")
+            print(f"LaunchAgent loaded: {path}")
+            print(f"  sweeps (collect + refresh) every {args.interval}s → {args.pool}  "
+                  f"(log: ~/.codebrain/logs/collect.log)")
+            print(f"  remove with: launchctl bootout gui/$(id -u)/{LAUNCHD_LABEL} && rm {path}")
+            return
+        sources = SOURCES if args.source == "all" else (args.source,)
+        print(f"sweeping [{', '.join(sources)}] → {args.pool}")
+        collect_total = collect_all(sources=sources, machine=args.machine,
+                                    pool_root=Path(args.pool))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    print("collect: " + ", ".join(f"{k}={v}" for k, v in collect_total.items()))
+    conn = connect(args.db)
+    try:
+        local_stats = refresh(conn, sources=sources)
+        pool_stats = {}
+        if (Path(args.pool) / "raw").is_dir():
+            pool_stats = refresh_pool(conn, Path(args.pool), sources=sources,
+                                      include_local=False,
+                                      local_machines=local_machine_names())
+        changed = bool(local_stats.get("events") or pool_stats.get("events"))
+        for label, sync in (("bmux", bmux.sync), ("Codex control", codex_control.sync),
+                            ("Cursor", cursor_provenance.sync)):
+            try:
+                sync(conn, changed_hint=changed)
+            except Exception as exc:  # noqa: BLE001 — maintenance stays best-effort
+                print(f"({label} provenance skipped: {exc})", file=sys.stderr)
+    finally:
+        conn.close()
+    print("refresh: local " + ", ".join(f"{k}={v}" for k, v in local_stats.items()))
+    if pool_stats:
+        print("refresh: pool " + ", ".join(f"{k}={v}" for k, v in pool_stats.items()))
 
 
 def cmd_ingest_pool(args):
@@ -1767,6 +1814,19 @@ def main(argv=None):
     sp.add_argument("--interval", type=int, default=1800,
                     help="LaunchAgent sweep period in seconds (default 1800)")
     sp.set_defaults(func=cmd_collect)
+
+    sp = sub.add_parser("sweep",
+                        help="collect + refresh in one background pass (for launchd)")
+    sp.add_argument("--pool", default=str(DEFAULT_POOL), help=f"pool root (default {DEFAULT_POOL})")
+    sp.add_argument("--source", choices=("all",) + SOURCES, default="all",
+                    help="which source(s) to sweep (default all)")
+    sp.add_argument("--machine", default=None, help="override hostname subtree")
+    sp.add_argument("--install-launchd", action="store_true",
+                    help="install a LaunchAgent running sweep periodically "
+                         "(macOS; replaces a collect-only agent — same label)")
+    sp.add_argument("--interval", type=int, default=1800,
+                    help="LaunchAgent sweep period in seconds (default 1800)")
+    sp.set_defaults(func=cmd_sweep)
 
     sp = sub.add_parser("ingest-pool", help="debug/repair ingest of synced pool subtrees")
     sp.add_argument("--pool", default=str(DEFAULT_POOL), help=f"pool root (default {DEFAULT_POOL})")

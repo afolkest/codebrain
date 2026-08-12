@@ -168,6 +168,14 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
         try:
             if enrich is not None:
                 enrich(parsed)
+            # Take the writer lock BEFORE any read the write decisions depend on
+            # (cursor head gate, event-row compares, placement diff). Skipping
+            # unchanged rows means the first statement below may otherwise be a
+            # read, letting two concurrent refreshers both decide against the
+            # same stale state. (The old always-write upserts serialized this
+            # region by accident.) Parsing stays outside the lock.
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             is_cursor = parsed.session.source == "cursor"
             if is_cursor:
                 if parsed.source_head is None:
@@ -196,13 +204,31 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
                         f"  ~ conflict {path.name}: kept authoritative content "
                         f"for {e.event_id}"
                     )
-            # A re-parse is authoritative for this session's placements: replace,
-            # don't merge, so no stale placement survives a rewritten/shrunk file.
-            conn.execute("DELETE FROM session_events WHERE session_id=?",
-                         (parsed.session.session_id,))
-            for p in parsed.placements:
-                if p.event_id in skipped:
-                    continue  # the event row we'd point at holds another session's content
+            # A re-parse is authoritative for this session's placements: the DB
+            # must end up exactly matching the parse (no stale placement survives
+            # a rewritten/shrunk file). But write only the difference — a grown
+            # append-only log re-derives thousands of unchanged placements, and
+            # rewriting them all was measurable write amplification on refresh.
+            existing = {
+                r["event_id"]: (r["seq"], r["parent_event_id"], r["live"],
+                                r["inherited"])
+                for r in conn.execute(
+                    "SELECT event_id, seq, parent_event_id, live, inherited "
+                    "FROM session_events WHERE session_id=?",
+                    (parsed.session.session_id,))
+            }
+            keep = [p for p in parsed.placements if p.event_id not in skipped]
+            # skipped events stay stale-deleted: the row we'd point at holds
+            # another session's content
+            stale = set(existing) - {p.event_id for p in keep}
+            if stale:
+                conn.executemany(
+                    "DELETE FROM session_events WHERE session_id=? AND event_id=?",
+                    [(parsed.session.session_id, eid) for eid in stale])
+            for p in keep:
+                if existing.get(p.event_id) == (p.seq, p.parent_event_id,
+                                                p.live, p.inherited):
+                    continue
                 upsert_placement(conn, p)
             _record_state(conn, path, st, parsed.session.session_id)
             if is_cursor and not record_cursor_head(

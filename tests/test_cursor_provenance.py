@@ -9,9 +9,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from codebrain import cli, cursor_provenance, db, provenance
-from codebrain.adapters.base import EventRow, PlacementRow, SessionRow
+from codebrain import cli, cursor_archive, cursor_provenance, db, ingest, provenance
+from codebrain.adapters.base import EventRow, PlacementRow, SessionRow, SourceHead
 from tests._helpers import memory_db
+from tests.test_cursor_integration import _snapshot
 
 
 def _session(conn, sid, *, relation=None, parent=None, source="cursor"):
@@ -32,6 +33,12 @@ def _event(conn, sid, eid, text, raw=None, *, seq=0, inherited=0,
         session_id=sid, event_id=eid, seq=seq,
         parent_event_id=None, live=live, inherited=inherited,
     ))
+
+
+def _advance_head(conn, sid, revision):
+    # Mirrors the ingest contract sync gates on: every accepted canonical
+    # Cursor write commits together with a head advance (ingest._ingest).
+    db.record_cursor_head(conn, sid, SourceHead(revision, "0" * 64))
 
 
 def _origins(conn):
@@ -176,6 +183,7 @@ class TestCursorStructuredProvenance(unittest.TestCase):
         cursor_provenance.sync(self.conn, force=True)
 
         _event(self.conn, sid, eid, "input", {})
+        _advance_head(self.conn, sid, 1)
         self.conn.commit()
         cursor_provenance.sync(self.conn, changed_hint=True)
         kinds = {
@@ -187,6 +195,120 @@ class TestCursorStructuredProvenance(unittest.TestCase):
         self.assertEqual(kinds, {"other_deriver"})
         self.assertEqual(
             cursor_provenance.sync(self.conn, changed_hint=False)["skipped"], 1
+        )
+
+
+class TestCursorProvenanceHeadGating(unittest.TestCase):
+    """sync's change detection is driven by cursor_session_heads, not hints."""
+
+    def setUp(self):
+        self.conn = memory_db()
+        self.addCleanup(self.conn.close)
+        self.sid = "cursor:GATE"
+        _session(self.conn, self.sid)
+        _event(self.conn, self.sid, "cursor:flagged", "generated",
+               {"isSimulatedMsg": True}, seq=0)
+        _advance_head(self.conn, self.sid, 1)
+        self.conn.commit()
+
+    def test_unchanged_heads_skip_without_writes_despite_changed_hint(self):
+        self.assertEqual(cursor_provenance.sync(self.conn)["skipped"], 0)
+        before = self.conn.total_changes
+        stats = cursor_provenance.sync(self.conn, changed_hint=True)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["events"], 0)
+        self.assertEqual(self.conn.total_changes, before)
+
+    def test_head_advance_invalidates_skip_and_rebuild_reclassifies(self):
+        cursor_provenance.sync(self.conn)
+        _event(self.conn, self.sid, "cursor:flagged", "generated", {}, seq=0)
+        _advance_head(self.conn, self.sid, 2)
+        self.conn.commit()
+        stats = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual(stats["skipped"], 0)
+        self.assertNotIn((self.sid, "cursor:flagged"), _origins(self.conn))
+
+    def test_force_rebuilds_even_when_heads_unchanged(self):
+        self.assertEqual(cursor_provenance.sync(self.conn)["skipped"], 0)
+        stats = cursor_provenance.sync(self.conn, force=True)
+        self.assertEqual(stats["skipped"], 0)
+        self.assertEqual(stats["events"], 1)
+        self.assertEqual(stats["master_control"], 1)
+
+    def test_skip_never_runs_the_source_rows_join(self):
+        # The whole point of the head gate: the events.raw join must stay off
+        # the read path when nothing changed, not merely produce a no-op.
+        cursor_provenance.sync(self.conn)
+        with mock.patch.object(cursor_provenance, "_source_rows",
+                               side_effect=AssertionError("join ran on skip")):
+            stats = cursor_provenance.sync(self.conn, changed_hint=True)
+        self.assertEqual(stats["skipped"], 1)
+
+    def test_algo_version_bump_forces_one_rebuild(self):
+        cursor_provenance.sync(self.conn)
+        with mock.patch.object(cursor_provenance, "ALGO_VERSION",
+                               cursor_provenance.ALGO_VERSION + 1):
+            stats = cursor_provenance.sync(self.conn, changed_hint=False)
+            self.assertEqual(stats["skipped"], 0)
+            self.assertEqual(stats["master_control"], 1)
+            self.assertEqual(
+                cursor_provenance.sync(self.conn, changed_hint=False)["skipped"], 1
+            )
+
+    def test_legacy_source_fingerprint_state_rebuilds_once_then_skips(self):
+        # Exactly what pre-head-gating sync stored: a _source_rows fingerprint.
+        legacy = cursor_provenance._fingerprint(
+            cursor_provenance._source_rows(self.conn)
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) "
+            "VALUES (?, 0, ?, ?)",
+            (cursor_provenance.STATE_PATH, 1, legacy),
+        )
+        self.conn.commit()
+        first = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual(first["skipped"], 0)
+        self.assertEqual(first["master_control"], 1)
+        self.assertEqual(
+            cursor_provenance.sync(self.conn, changed_hint=False)["skipped"], 1
+        )
+
+
+class TestCursorProvenanceIngestInvalidation(unittest.TestCase):
+    """A real archive ingest advances cursor_session_heads and re-arms sync."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.archive = Path(self.tmp.name) / "archive"
+        self.conn = memory_db()
+        self.addCleanup(self.conn.close)
+
+    def _refresh(self):
+        return ingest.refresh(
+            self.conn, sources=("cursor",), roots={"cursor": self.archive}
+        )
+
+    def test_new_revision_reingest_rebuilds_classification(self):
+        cursor_archive.publish_snapshot(_snapshot("PROV"), self.archive)
+        self._refresh()
+        self.assertEqual(cursor_provenance.sync(self.conn)["skipped"], 0)
+        self.assertEqual(
+            cursor_provenance.sync(self.conn, changed_hint=True)["skipped"], 1
+        )
+
+        flagged = _snapshot("PROV")
+        flagged["order"][0]["payload"]["isSimulatedMsg"] = True
+        cursor_archive.publish_snapshot(flagged, self.archive)
+        self.assertEqual(self._refresh()["sessions"], 1)
+
+        stats = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual((stats["skipped"], stats["master_control"]), (0, 1))
+        self.assertEqual(
+            _origins(self.conn)[
+                ("cursor:PROV", "cursor:b1:1767225601000:message")
+            ],
+            ("master_control", cursor_provenance.SIMULATED_KIND),
         )
 
 

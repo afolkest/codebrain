@@ -10,9 +10,11 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codebrain import cli, codex_control, db, provenance
 from codebrain.adapters.base import EventRow, PlacementRow, SessionRow
@@ -330,6 +332,208 @@ class TestCodexControlProvenance(unittest.TestCase):
                          "codex:S2:9:call_dup")
 
 
+class TestCodexControlIncrementalSync(unittest.TestCase):
+    """The rowid watermark drives extraction; matching always spans the mirror."""
+
+    def setUp(self):
+        self.conn = memory_db()
+        self.addCleanup(self.conn.close)
+
+    def _sync(self, **kw):
+        self.conn.commit()
+        return codex_control.sync(self.conn, **kw)
+
+    def _origin(self, sid, eid):
+        row = self.conn.execute(
+            "SELECT origin, evidence_id FROM event_origins "
+            "WHERE session_id=? AND event_id=?",
+            (sid, eid)).fetchone()
+        return dict(row) if row else None
+
+    def _mirror_count(self):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM codex_control_submissions").fetchone()[0]
+
+    def _state_row(self):
+        row = self.conn.execute(
+            "SELECT mtime, size FROM ingest_state WHERE path=?",
+            (codex_control.STATE_PATH,)).fetchone()
+        return (row["mtime"], row["size"]) if row else None
+
+    def _watermark(self):
+        return self.conn.execute(
+            "SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0]
+
+    def _put_state(self, mtime, size):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) "
+            "VALUES (?, ?, ?, NULL)",
+            (codex_control.STATE_PATH, mtime, size))
+        self.conn.commit()
+
+    def _add_pair(self, *, target, msg_eid, sender_eid, sender_seq, call_id,
+                  text, msg_ts, send_ts):
+        _add_user(self.conn, sid=target, eid=msg_eid, seq=0, ts=msg_ts, text=text)
+        _add_raw_event(self.conn, sid="codex:S", eid=sender_eid, seq=sender_seq,
+                       ts=send_ts, actor="tool", typ="tool_result",
+                       text="[mcp codex.codex-reply]",
+                       raw=_mcp_reply_raw(ts=send_ts, call_id=call_id,
+                                          target=target.removeprefix("codex:"),
+                                          prompt=text))
+
+    def test_second_sync_extracts_only_new_events(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1", sender_eid="codex:S:9",
+                       sender_seq=0, call_id="call_a", text="first send",
+                       msg_ts="2026-01-01T00:00:01Z", send_ts="2026-01-01T00:00:02Z")
+        stats = self._sync()
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+
+        self._add_pair(target="codex:U", msg_eid="codex:U:1", sender_eid="codex:S:10",
+                       sender_seq=1, call_id="call_b", text="second send",
+                       msg_ts="2026-01-01T00:00:05Z", send_ts="2026-01-01T00:00:06Z")
+        stats = self._sync()
+
+        # Only the new sender event was extracted; the mirror keeps both rows,
+        # so this was not a full rebuild.
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(stats["stored"], 1)
+        self.assertEqual(self._mirror_count(), 2)
+        self.assertEqual(self._origin("codex:U", "codex:U:1"), {
+            "origin": "master_control", "evidence_id": "codex:S:10:call_b"})
+        self.assertEqual(self._origin("codex:T", "codex:T:1"), {
+            "origin": "master_control", "evidence_id": "codex:S:9:call_a"})
+
+    def test_receiver_ingested_after_submission_still_matches(self):
+        _add_raw_event(self.conn, sid="codex:S", eid="codex:S:9", seq=0,
+                       ts="2026-01-01T00:00:02Z", actor="tool", typ="tool_result",
+                       text="[mcp codex.codex-reply]",
+                       raw=_mcp_reply_raw(ts="2026-01-01T00:00:02Z",
+                                          call_id="call_late", target="T",
+                                          prompt="late arrival"))
+        stats = self._sync()
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(stats["master_control"], 0)
+
+        _add_user(self.conn, sid="codex:T", eid="codex:T:1", seq=0,
+                  ts="2026-01-01T00:00:03Z", text="late arrival")
+        stats = self._sync()
+
+        # No new submission was extracted; the old mirrored one matched anyway.
+        self.assertEqual(stats["submissions"], 0)
+        self.assertEqual(stats["master_control"], 1)
+        self.assertEqual(self._origin("codex:T", "codex:T:1"), {
+            "origin": "master_control", "evidence_id": "codex:S:9:call_late"})
+
+    def test_new_duplicate_submission_degrades_verdict_to_unknown(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1", sender_eid="codex:S:9",
+                       sender_seq=0, call_id="call_a", text="continue",
+                       msg_ts="2026-01-01T00:00:01Z", send_ts="2026-01-01T00:00:02Z")
+        stats = self._sync()
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+
+        _add_raw_event(self.conn, sid="codex:S", eid="codex:S:10", seq=1,
+                       ts="2026-01-01T00:00:03Z", actor="tool", typ="tool_result",
+                       text="[mcp codex.codex-reply]",
+                       raw=_mcp_reply_raw(ts="2026-01-01T00:00:03Z",
+                                          call_id="call_b", target="T",
+                                          prompt="continue"))
+        stats = self._sync()
+
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(stats["master_control"], 0)
+        self.assertEqual(stats["unknown"], 1)
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"], "unknown")
+
+    def test_unchanged_db_skips_without_writes_despite_changed_hint(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1", sender_eid="codex:S:9",
+                       sender_seq=0, call_id="call_a", text="first send",
+                       msg_ts="2026-01-01T00:00:01Z", send_ts="2026-01-01T00:00:02Z")
+        self._sync()
+
+        before = self.conn.total_changes
+        stats = self._sync(changed_hint=True)
+
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["master_control"], 0)
+        self.assertEqual(self.conn.total_changes, before)
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+
+    def test_absent_state_does_full_extraction_and_stores_watermark(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1", sender_eid="codex:S:9",
+                       sender_seq=0, call_id="call_a", text="first send",
+                       msg_ts="2026-01-01T00:00:01Z", send_ts="2026-01-01T00:00:02Z")
+        self.assertIsNone(self._state_row())
+
+        stats = self._sync()
+
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(self._state_row(),
+                         (float(self._watermark()), -codex_control.DERIVATION_VERSION))
+
+    def test_legacy_state_format_forces_full_rebuild(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1", sender_eid="codex:S:9",
+                       sender_seq=0, call_id="call_a", text="first send",
+                       msg_ts="2026-01-01T00:00:01Z", send_ts="2026-01-01T00:00:02Z")
+        self.conn.commit()
+        # Legacy rows stored (max codex rowid, codex event count) — both
+        # non-negative. mtime is set to the current watermark and size to the
+        # WORST collision: a count equal to DERIVATION_VERSION, which a naive
+        # positive-version encoding would misread as current state and skip
+        # (leaving the mirror empty). The negated-size discriminator must see
+        # through it; an (incorrect) incremental scan from this watermark would
+        # extract nothing, so only a genuine full rebuild classifies the pair.
+        self._put_state(float(self._watermark()), codex_control.DERIVATION_VERSION)
+
+        stats = self._sync()
+
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+
+    def test_custom_window_does_not_poison_the_default_skip_state(self):
+        # default → custom → default: the custom-window run computes
+        # non-standard verdicts (window too narrow to match), and must not
+        # leave a skip marker behind that lets the next default-window sync
+        # skip over them instead of restoring the standard classification.
+        self._add_pair(target="codex:T", msg_eid="codex:T:1", sender_eid="codex:S:9",
+                       sender_seq=0, call_id="call_a", text="first send",
+                       msg_ts="2026-01-01T00:01:00Z", send_ts="2026-01-01T00:00:00Z")
+        self._sync()
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+
+        # 1-second window: the 60s send->message gap no longer matches.
+        stats = self._sync(window_sec=1)
+        self.assertEqual(stats["skipped"], 0)
+        self.assertIsNone(self._origin("codex:T", "codex:T:1"))
+        self.assertIsNone(self._state_row())  # marker dropped, not stored
+
+        stats = self._sync()  # default window must rematch, not skip
+        self.assertEqual(stats["skipped"], 0)
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+
+    def test_derivation_version_mismatch_forces_full_rebuild(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1", sender_eid="codex:S:9",
+                       sender_seq=0, call_id="call_a", text="first send",
+                       msg_ts="2026-01-01T00:00:01Z", send_ts="2026-01-01T00:00:02Z")
+        self.conn.commit()
+        self._put_state(float(self._watermark()),
+                        -(codex_control.DERIVATION_VERSION + 1))
+
+        stats = self._sync()
+
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(self._origin("codex:T", "codex:T:1")["origin"],
+                         "master_control")
+        self.assertEqual(self._state_row(),
+                         (float(self._watermark()), -codex_control.DERIVATION_VERSION))
+
+
 class TestCodexControlCLI(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -351,7 +555,12 @@ class TestCodexControlCLI(unittest.TestCase):
 
     def run_cli(self, *args):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # Redirect the bmux overlay to a nonexistent log: without this the
+        # read-path hook parses the developer's real ~/.bmux events into the
+        # test DB (machine-dependent runtime and data).
+        with mock.patch.dict(os.environ, {"CODEBRAIN_BMUX_LOG": str(
+                Path(self.tmp.name) / "no-bmux.jsonl")}, clear=False), \
+                contextlib.redirect_stdout(out):
             cli.main(["--db", str(self.db_path), *args])
         return out.getvalue()
 

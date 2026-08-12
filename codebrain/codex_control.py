@@ -16,6 +16,15 @@ from codebrain import provenance
 
 EVIDENCE_KIND = "codex_control"
 
+# Bump whenever ANY part of the derivation changes — submission extraction
+# (tool sets, payload/target parsing, evidence ids) OR matching/verdict logic
+# (windows, ambiguity rules, classification). This INCLUDES adapters/codex.py
+# changes that alter the stored raw shape of existing events: a re-parse
+# rewrites those rows in place below the rowid watermark, so only a version
+# bump (or force) makes extraction revisit them. A stored-version mismatch
+# forces one full mirror rebuild + rematch under the new logic.
+DERIVATION_VERSION = 1
+
 # Codex control sends can be queued behind an active turn, unlike bmux terminal
 # paste. A wider window is acceptable because matching still requires target
 # thread + exact prompt hash, and duplicate candidates degrade to unknown.
@@ -36,15 +45,28 @@ def _empty_stats(**extra) -> dict:
     return base
 
 
-def _db_state(conn: sqlite3.Connection) -> tuple:
-    row = conn.execute(
-        "SELECT COALESCE(MAX(rowid), 0) AS max_rowid, COUNT(*) AS n "
-        "FROM events WHERE origin_session_id LIKE 'codex:%'"
-    ).fetchone()
-    return (float(row["max_rowid"] or 0), int(row["n"] or 0))
+def _watermark(conn: sqlite3.Connection) -> int:
+    """Highest events rowid; O(1) via the implicit rowid.
+
+    Sound as an incremental cursor because this codebase never deletes events
+    (auto rowids therefore stay monotonic) and codex event ``raw`` is immutable
+    after insert: rollout files are append-only, so re-parsing a grown file
+    re-upserts identical raw in place without changing the rowid. A VACUUM can
+    renumber implicit rowids and break both properties; ``sessdb
+    codex-control-sync`` (force) rebuilds from scratch and recovers.
+    """
+    return int(conn.execute(
+        "SELECT COALESCE(MAX(rowid), 0) FROM events"
+    ).fetchone()[0])
 
 
 def _state(conn: sqlite3.Connection):
+    # Stored as (mtime=events watermark, size=-DERIVATION_VERSION). The size is
+    # NEGATED as the format discriminator: the previous format stored (max
+    # codex rowid, codex event count) in the same row, and a count CAN equal a
+    # small positive version (a one-event DB stored (1.0, 1)) — but it can
+    # never be negative, so legacy rows always fail the version check in
+    # sync() and force one full rebuild. No migration.
     row = conn.execute(
         "SELECT mtime, size FROM ingest_state WHERE path = ?", (STATE_PATH,)
     ).fetchone()
@@ -217,17 +239,23 @@ def _submission_from_function(row) -> dict | None:
     }
 
 
-def read_submissions(conn: sqlite3.Connection) -> list[dict]:
+def read_submissions(conn: sqlite3.Connection, min_rowid: int = 0) -> list[dict]:
+    """Extract control submissions from codex events with rowid > min_rowid."""
+    # The unary + hints keep the non-rowid terms off indexes: the planner
+    # otherwise picks a MULTI-INDEX OR over ix_ev_actor_type_ts, which visits
+    # every tool row in the DB and defeats the incremental rowid bound.
     rows = conn.execute(
         """
         SELECT event_id, origin_session_id, ts, raw
         FROM events
-        WHERE origin_session_id LIKE 'codex:%'
-          AND ((actor = 'tool' AND type = 'tool_result')
-               OR (actor = 'assistant' AND type = 'tool_call'))
+        WHERE rowid > ?
+          AND +origin_session_id LIKE 'codex:%'
+          AND ((+actor = 'tool' AND type = 'tool_result')
+               OR (+actor = 'assistant' AND type = 'tool_call'))
           AND json_valid(raw)
           AND json_extract(raw, '$.type') IN ('event_msg', 'response_item')
-        """
+        """,
+        (min_rowid,),
     ).fetchall()
     out = []
     for row in rows:
@@ -237,8 +265,10 @@ def read_submissions(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
-def _store_submissions(conn: sqlite3.Connection, subs: list[dict]) -> int:
-    conn.execute("DELETE FROM codex_control_submissions")
+def _store_submissions(conn: sqlite3.Connection, subs: list[dict], *,
+                       full: bool) -> int:
+    if full:
+        conn.execute("DELETE FROM codex_control_submissions")
     for sub in subs:
         conn.execute(
             """
@@ -255,17 +285,53 @@ def _store_submissions(conn: sqlite3.Connection, subs: list[dict]) -> int:
     return len(subs)
 
 
+def _load_submissions(conn: sqlite3.Connection) -> list:
+    """Every mirrored submission, in deterministic order.
+
+    Matching must run over the full mirror, never just newly extracted rows: a
+    new receiver message can match an old submission, and a new duplicate
+    submission must degrade a previously unique master_control verdict to
+    unknown.
+    """
+    return conn.execute(
+        """
+        SELECT evidence_id, kind, submitted_at, target_session_id,
+               payload_sha256
+        FROM codex_control_submissions ORDER BY evidence_id
+        """
+    ).fetchall()
+
+
 def sync(conn: sqlite3.Connection, window_sec: int = DEFAULT_WINDOW_SEC,
          changed_hint: bool = True, force: bool = False) -> dict:
-    cur_state = _db_state(conn)
-    if not force and not changed_hint and _state(conn) == cur_state:
+    """Maintain the overlay: incremental extraction, full re-match.
+
+    Submission extraction scans only events past the stored rowid watermark;
+    verdicts always rebuild from the whole (tiny) submissions mirror.
+    """
+    # Watermark before extraction: rows landing between this read and the scan
+    # are extracted now AND rescanned next run, which INSERT OR REPLACE keyed
+    # on evidence_id makes idempotent.
+    watermark = _watermark(conn)
+    cur_state = (float(watermark), -DERIVATION_VERSION)
+    stored = _state(conn)
+    # The watermark comparison is authoritative, so changed_hint is
+    # deliberately ignored: the hint fires on any transcript growth anywhere,
+    # while the watermark detects exactly the event growth extraction depends
+    # on. The parameter stays for API compatibility with the overlay hooks.
+    # A non-default window changes verdict semantics without changing state,
+    # so it must bypass the skip; rerun with the default window (or force) to
+    # restore standard verdicts afterwards.
+    if not force and window_sec == DEFAULT_WINDOW_SEC and stored == cur_state:
         return _empty_stats(skipped=1)
 
+    full = force or stored is None or stored[1] != -DERIVATION_VERSION
     stats = _empty_stats()
     try:
-        subs = read_submissions(conn)
-        stats["submissions"] = len(subs)
-        stats["stored"] = _store_submissions(conn, subs)
+        new_subs = read_submissions(conn, 0 if full else int(stored[0]))
+        stats["submissions"] = len(new_subs)
+        stats["stored"] = _store_submissions(conn, new_subs, full=full)
+        subs = _load_submissions(conn)
 
         msg_cache: dict[str, list] = {}
         pairs = []
@@ -336,11 +402,17 @@ def sync(conn: sqlite3.Connection, window_sec: int = DEFAULT_WINDOW_SEC,
                 })
 
         provenance.replace_evidence_kind(conn, EVIDENCE_KIND, evidence_rows)
-        conn.execute(
-            "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) "
-            "VALUES (?, ?, ?, NULL)",
-            (STATE_PATH, cur_state[0], cur_state[1]),
-        )
+        if window_sec == DEFAULT_WINDOW_SEC:
+            conn.execute(
+                "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) "
+                "VALUES (?, ?, ?, NULL)",
+                (STATE_PATH, float(watermark), -DERIVATION_VERSION),
+            )
+        else:
+            # A custom window produced non-standard verdicts. Writing the normal
+            # marker would let the next default-window sync skip right over
+            # them; drop the marker instead so that sync must rematch.
+            conn.execute("DELETE FROM ingest_state WHERE path = ?", (STATE_PATH,))
         conn.commit()
     except Exception:
         conn.rollback()

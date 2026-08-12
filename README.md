@@ -80,6 +80,7 @@ sessdb hidden
 sessdb unhide <session>
 sessdb collect --pool ~/codebrain-pool
 sessdb collect --install-launchd --pool ~/codebrain-pool --interval 300
+sessdb sweep --install-launchd --interval 300   # collect + refresh in the background
 sessdb ingest                 # full local rebuild
 sessdb ingest-pool            # explicit synced-pool repair/debug ingest
 sessdb backfill-claude <zip-or-dir>
@@ -171,6 +172,12 @@ codebrain's allowlisted immutable projection, never Cursor's live database.
 Normal read commands use local live logs, the local settled Cursor projection,
 and synced remote pool subtrees. See [SYNCING.md](SYNCING.md) for machine-name
 aliases and stale-local-pool behavior.
+
+`sweep` runs collect and then the same delta refresh the read commands use
+(local sources, synced pool, provenance overlays) in one background pass.
+Installing it with `sessdb sweep --install-launchd` replaces the collect-only
+LaunchAgent (same label); read commands still refresh, but a periodic sweep
+absorbs heavy agent activity in the background so reads stay fast.
 
 Old Claude backups are imported into the pool, not restored into live
 `~/.claude`:

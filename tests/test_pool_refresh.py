@@ -67,6 +67,10 @@ class TestPoolRefresh(unittest.TestCase):
             mock.patch("codebrain.ingest.DEFAULT_CURSOR_ROOT", roots["cursor"]),
             mock.patch("codebrain.ingest.DEFAULT_CURSOR_DB", self.root / "missing-cursor.db"),
             mock.patch("codebrain.cli.DEFAULT_POOL", self.pool),
+            # Keep the read-path bmux overlay off the developer's real ~/.bmux
+            # log — hermetic tests must not depend on (or ingest) local data.
+            mock.patch.dict(os.environ, {"CODEBRAIN_BMUX_LOG": str(
+                self.root / "no-bmux.jsonl")}, clear=False),
         ]
         if env is not None:
             patches.append(mock.patch.dict(os.environ, env, clear=False))
@@ -186,6 +190,62 @@ class TestPoolRefresh(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self.run_cli("ingest-pool", "--pool", str(self.pool), "--machine", "../bad")
         self.assertEqual(cm.exception.code, 2)
+
+    def test_sweep_collects_and_refreshes_local_and_pool(self):
+        live_pi = self.root / "live-pi"
+        _pi_root(live_pi, sid="LIVE", users=("local intent",))
+        _pool_pi(self.pool, "mini", sid="REMOTE", users=("remote intent",))
+        roots = self.empty_live_roots()
+        roots["pi"] = live_pi
+
+        # collect reads its roots from collect.DEFAULT_ROOTS (captured at import),
+        # so the sweep test must redirect those too, not only the ingest defaults.
+        collect_roots = dict(roots)
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", collect_roots):
+            out, _ = self.run_cli("sweep", "--pool", str(self.pool),
+                                  "--machine", "local", "--source", "pi",
+                                  env={"CODEBRAIN_LOCAL_MACHINES": "local"},
+                                  roots=roots)
+
+        self.assertIn("collect:", out)
+        self.assertIn("refresh: local", out)
+        # Durability: the live session was mirrored into this machine's subtree.
+        mirrored = self.pool / "raw" / "local" / "pi" / "agent" / "sessions" / "proj" / "0_LIVE.jsonl"
+        self.assertTrue(mirrored.is_file())
+        # Freshness: both the live session and the synced remote one are queryable.
+        conn = self.conn()
+        rows = conn.execute("SELECT session_id FROM sessions ORDER BY session_id").fetchall()
+        self.assertEqual([r["session_id"] for r in rows], ["pi:LIVE", "pi:REMOTE"])
+
+    def test_sweep_runs_all_three_provenance_overlays(self):
+        # README/sweep contract: the pass covers "provenance overlays", not just
+        # collect + refresh. Deleting those sync calls must fail a test.
+        calls = []
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", self.empty_live_roots()), \
+             mock.patch("codebrain.bmux.sync",
+                        side_effect=lambda conn, **kw: calls.append("bmux") or {}), \
+             mock.patch("codebrain.codex_control.sync",
+                        side_effect=lambda conn, **kw: calls.append("codex") or {}), \
+             mock.patch("codebrain.cursor_provenance.sync",
+                        side_effect=lambda conn, **kw: calls.append("cursor") or {}):
+            self.run_cli("sweep", "--pool", str(self.pool), "--source", "pi",
+                         "--machine", "local",
+                         env={"CODEBRAIN_LOCAL_MACHINES": "local"})
+        self.assertEqual(sorted(calls), ["bmux", "codex", "cursor"])
+
+    def test_sweep_install_launchd_passes_the_sweep_command(self):
+        # A silent regression here installs a collect-only agent while printing
+        # "sweeps (collect + refresh)". Pin the kwarg through the CLI wiring.
+        with mock.patch("codebrain.cli.install_launchd",
+                        return_value=Path("/tmp/agent.plist")) as inst:
+            out, _ = self.run_cli("sweep", "--install-launchd",
+                                  "--pool", str(self.pool), "--interval", "300")
+        self.assertEqual(inst.call_args.kwargs.get("command"), "sweep")
+        self.assertIn("LaunchAgent loaded", out)
+        with mock.patch("codebrain.cli.install_launchd",
+                        return_value=Path("/tmp/agent.plist")) as inst:
+            self.run_cli("collect", "--install-launchd", "--pool", str(self.pool))
+        self.assertNotEqual(inst.call_args.kwargs.get("command"), "sweep")
 
 
 if __name__ == "__main__":

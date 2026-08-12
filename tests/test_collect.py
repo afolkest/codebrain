@@ -280,6 +280,16 @@ class TestLaunchdPlist(unittest.TestCase):
         self.assertEqual(back["StartInterval"], 600)
         self.assertEqual(back["Label"], collect.LAUNCHD_LABEL)
 
+    def test_plist_sweep_command_variant(self):
+        spec = collect._plist_dict(command="sweep")
+        self.assertIn("sweep", spec["ProgramArguments"])
+        self.assertNotIn("collect", spec["ProgramArguments"])
+        # Same label as the collect agent: installing one replaces the other,
+        # so the two maintenance modes can never run side by side.
+        self.assertEqual(spec["Label"], collect.LAUNCHD_LABEL)
+        with self.assertRaises(ValueError):
+            collect._plist_dict(command="refresh; rm -rf /")
+
 
 if __name__ == "__main__":
     unittest.main()
