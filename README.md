@@ -176,8 +176,20 @@ aliases and stale-local-pool behavior.
 `sweep` runs collect and then the same delta refresh the read commands use
 (local sources, synced pool, provenance overlays) in one background pass.
 Installing it with `sessdb sweep --install-launchd` replaces the collect-only
-LaunchAgent (same label); read commands still refresh, but a periodic sweep
-absorbs heavy agent activity in the background so reads stay fast.
+LaunchAgent (same label); a periodic sweep absorbs heavy agent activity in the
+background so reads stay fast.
+
+A clean full sweep also stamps a freshness marker recording when its scan began
+and the events watermark it certified. Read commands inside the marker's window
+(`CODEBRAIN_MAX_STALENESS` seconds, default 600; `0` or an unparsable value
+disables the gate) skip their own refresh entirely, so they never block on
+ingest — they serve a self-consistent snapshot at most one sweep old. `--fresh`
+forces the full refresh on any read. The marker fails toward refreshing: any
+event insert after the stamp voids it, partial sweeps (`--source`, non-default
+`--pool`) never stamp it, a sweep with refresh errors or a failed provenance
+overlay deletes it, and the manual `ingest`/`ingest-pool` commands clear it
+before mutating. Keep the sweep interval (default 300s) under the staleness
+window or reads gate only part of each cycle.
 
 Old Claude backups are imported into the pool, not restored into live
 `~/.claude`:

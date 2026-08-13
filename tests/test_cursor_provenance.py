@@ -255,23 +255,218 @@ class TestCursorProvenanceHeadGating(unittest.TestCase):
                 cursor_provenance.sync(self.conn, changed_hint=False)["skipped"], 1
             )
 
-    def test_legacy_source_fingerprint_state_rebuilds_once_then_skips(self):
-        # Exactly what pre-head-gating sync stored: a _source_rows fingerprint.
-        legacy = cursor_provenance._fingerprint(
-            cursor_provenance._source_rows(self.conn)
-        )
-        self.conn.execute(
-            "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) "
-            "VALUES (?, 0, ?, ?)",
-            (cursor_provenance.STATE_PATH, 1, legacy),
-        )
+    def test_legacy_fingerprint_states_rebuild_once_then_skip(self):
+        # Earlier syncs stored sha256 hex fingerprints at STATE_PATH (first of
+        # _source_rows, later of the heads table). Either legacy shape must be
+        # treated as "not the per-session algo marker": one full rebuild, then
+        # the per-session diff takes over and skips.
+        for label in ("source-rows fingerprint", "head fingerprint"):
+            with self.subTest(label):
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO ingest_state "
+                    "(path, mtime, size, session_id) VALUES (?, 0, ?, ?)",
+                    (cursor_provenance.STATE_PATH, 1, "ab" * 32),
+                )
+                self.conn.execute("DELETE FROM cursor_provenance_state")
+                self.conn.commit()
+                first = cursor_provenance.sync(self.conn, changed_hint=False)
+                self.assertEqual(first["skipped"], 0)
+                self.assertEqual(first["master_control"], 1)
+                self.assertEqual(
+                    cursor_provenance.sync(self.conn, changed_hint=False)["skipped"],
+                    1,
+                )
+
+
+class TestCursorProvenanceIncremental(unittest.TestCase):
+    """A head advance rebuilds that session's branch family, nothing else."""
+
+    def setUp(self):
+        self.conn = memory_db()
+        self.addCleanup(self.conn.close)
+
+    def _flagged_session(self, sid, eid, revision=1):
+        _session(self.conn, sid)
+        _event(self.conn, sid, eid, "generated", {"isSimulatedMsg": True}, seq=0)
+        _advance_head(self.conn, sid, revision)
+
+    def test_incremental_rebuild_scopes_to_the_changed_session(self):
+        self._flagged_session("cursor:A", "cursor:a-ev")
+        self._flagged_session("cursor:B", "cursor:b-ev")
         self.conn.commit()
-        first = cursor_provenance.sync(self.conn, changed_hint=False)
-        self.assertEqual(first["skipped"], 0)
-        self.assertEqual(first["master_control"], 1)
+        self.assertEqual(cursor_provenance.sync(self.conn)["rebuilt_sessions"], 2)
+
+        # Deliberately violate the ingest contract for B: change its event
+        # without advancing its head. A correctly scoped incremental sync must
+        # NOT notice (B is never rescanned) — that stale evidence is exactly
+        # what proves the rebuild did not touch B.
+        _event(self.conn, "cursor:B", "cursor:b-ev", "generated", {}, seq=0)
+        _event(self.conn, "cursor:A", "cursor:a-ev", "generated", {}, seq=0)
+        _advance_head(self.conn, "cursor:A", 2)
+        self.conn.commit()
+
+        stats = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual(stats["skipped"], 0)
+        self.assertEqual(stats["rebuilt_sessions"], 1)
+        origins = _origins(self.conn)
+        self.assertNotIn(("cursor:A", "cursor:a-ev"), origins)
+        self.assertIn(("cursor:B", "cursor:b-ev"), origins)
+        # No temp scaffolding leaks out of sync().
+        leftover = self.conn.execute(
+            "SELECT name FROM sqlite_temp_master WHERE type='table'"
+        ).fetchall()
+        self.assertEqual(leftover, [])
+
+    def test_family_closure_recomputes_sessions_sharing_events(self):
+        parent, child, other = "cursor:P", "cursor:C", "cursor:Z"
+        _session(self.conn, parent)
+        _session(self.conn, child, relation="subagent", parent=parent)
+        _event(self.conn, parent, "cursor:shared", "generated",
+               {"isSimulatedMsg": True}, seq=0)
+        _event(self.conn, child, "cursor:shared", "generated",
+               {"isSimulatedMsg": True}, seq=0, inherited=1)
+        _event(self.conn, child, "cursor:kickoff", "work", seq=1)
+        _advance_head(self.conn, parent, 1)
+        _advance_head(self.conn, child, 1)
+        self._flagged_session(other, "cursor:z-ev")
+        self.conn.commit()
+        cursor_provenance.sync(self.conn)
+        origins = _origins(self.conn)
+        self.assertIn((parent, "cursor:shared"), origins)
+        self.assertIn((child, "cursor:shared"), origins)
+
+        # The flag disappears from the shared event; only the PARENT's head
+        # advances. The child holds an inherited placement of the same event,
+        # so its evidence row must be recomputed too — the closure has to pull
+        # the child in — while the unrelated session stays untouched.
+        _event(self.conn, parent, "cursor:shared", "generated", {}, seq=0)
+        _advance_head(self.conn, parent, 2)
+        self.conn.commit()
+
+        stats = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual(stats["rebuilt_sessions"], 2)
+        origins = _origins(self.conn)
+        self.assertNotIn((parent, "cursor:shared"), origins)
+        self.assertNotIn((child, "cursor:shared"), origins)
+        self.assertIn((other, "cursor:z-ev"), origins)
+        # The child's own subagent-kickoff fallback evidence was recomputed,
+        # not lost, by the family rebuild.
+        self.assertEqual(origins[(child, "cursor:kickoff")][0], "master_control")
+
+    def test_revision_removing_shared_fallback_event_cleans_inherited_evidence(self):
+        # Subagent A's first authored event `old` is inherited by B. A's next
+        # revision REMOVES `old` (making `new` its first authored input) and
+        # only A's head advances. The post-change placement graph no longer
+        # connects A to B, so a placement-only closure would strand B's stale
+        # kickoff evidence forever (watermarks match afterwards, so it would
+        # never be revisited). The evidence-seed edge — sessions holding
+        # our-kind evidence on events AUTHORED by a changed session — must pull
+        # B in, and the incremental result must equal a full rebuild's.
+        top, suba, branch = "cursor:TOP", "cursor:A", "cursor:B"
+        _session(self.conn, top)
+        _session(self.conn, suba, relation="subagent", parent=top)
+        _session(self.conn, branch)
+        _event(self.conn, suba, "cursor:old", "kick", seq=0)
+        _event(self.conn, branch, "cursor:old", "kick", seq=0, inherited=1)
+        _advance_head(self.conn, suba, 1)
+        _advance_head(self.conn, branch, 1)
+        self.conn.commit()
+        cursor_provenance.sync(self.conn)
+        origins = _origins(self.conn)
+        self.assertIn((suba, "cursor:old"), origins)
+        self.assertIn((branch, "cursor:old"), origins)
+
+        self.conn.execute(
+            "DELETE FROM session_events WHERE session_id=? AND event_id=?",
+            (suba, "cursor:old"))
+        _event(self.conn, suba, "cursor:new", "kick2", seq=0)
+        _advance_head(self.conn, suba, 2)
+        self.conn.commit()
+
+        stats = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual(stats["skipped"], 0)
+        incremental = _origins(self.conn)
+        cursor_provenance.sync(self.conn, force=True)
+        self.assertEqual(incremental, _origins(self.conn))
+        self.assertNotIn((branch, "cursor:old"), incremental)
+        self.assertIn((suba, "cursor:new"), incremental)
+
+    def test_flag_gained_on_shared_event_reaches_unchanged_inherited_holder(self):
+        # The load-bearing case for the PLACEMENT closure (the evidence-seed
+        # edge cannot help here — no prior evidence row exists to follow): a
+        # shared event GAINS a control flag via the authoring session's
+        # revision, and the unchanged session holding an inherited copy must be
+        # recomputed too, or its copy keeps reading as human.
+        parent, child = "cursor:GP", "cursor:GC"
+        _session(self.conn, parent)
+        _session(self.conn, child)
+        _event(self.conn, parent, "cursor:g-shared", "generated", {}, seq=0)
+        _event(self.conn, child, "cursor:g-shared", "generated", {}, seq=0,
+               inherited=1)
+        _advance_head(self.conn, parent, 1)
+        _advance_head(self.conn, child, 1)
+        self.conn.commit()
+        cursor_provenance.sync(self.conn)
+        self.assertEqual(_origins(self.conn), {})
+
+        _event(self.conn, parent, "cursor:g-shared", "generated",
+               {"isSimulatedMsg": True}, seq=0)
+        _advance_head(self.conn, parent, 2)
+        self.conn.commit()
+        cursor_provenance.sync(self.conn, changed_hint=False)
+        incremental = _origins(self.conn)
+        cursor_provenance.sync(self.conn, force=True)
+        self.assertEqual(incremental, _origins(self.conn))
+        self.assertIn((child, "cursor:g-shared"), incremental)
+
+    def test_closure_fixpoint_reaches_two_hop_family_members(self):
+        # S shares e1 with M; M holds an inherited copy of subagent N's
+        # kickoff event e2. Rebuilding M (pulled in at hop 1) deletes M's
+        # kickoff row for e2, and recreating it requires re-running N's
+        # lineage rule — N is only reachable at hop 2, so a closure that stops
+        # after one round loses (M, e2) relative to a full rebuild.
+        s, m, n, top = "cursor:S2", "cursor:M2", "cursor:N2", "cursor:TOP2"
+        _session(self.conn, top)
+        _session(self.conn, s)
+        _session(self.conn, m)
+        _session(self.conn, n, relation="subagent", parent=top)
+        _event(self.conn, n, "cursor:e2", "kick", seq=0)
+        _event(self.conn, m, "cursor:e2", "kick", seq=0, inherited=1)
+        _event(self.conn, m, "cursor:e1", "hello", seq=1)
+        _event(self.conn, s, "cursor:e1", "hello", seq=0, inherited=1)
+        for sid in (s, m, n, top):
+            _advance_head(self.conn, sid, 1)
+        self.conn.commit()
+        cursor_provenance.sync(self.conn)
+        self.assertIn((m, "cursor:e2"), _origins(self.conn))
+
+        _event(self.conn, s, "cursor:s-new", "more", seq=1)
+        _advance_head(self.conn, s, 2)
+        self.conn.commit()
+        stats = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual(stats["skipped"], 0)
+        incremental = _origins(self.conn)
+        cursor_provenance.sync(self.conn, force=True)
+        self.assertEqual(incremental, _origins(self.conn))
+        self.assertIn((m, "cursor:e2"), incremental)
+
+    def test_vanished_head_drops_state_and_rearms_skip(self):
+        self._flagged_session("cursor:GONE", "cursor:g-ev")
+        self.conn.commit()
+        cursor_provenance.sync(self.conn)
         self.assertEqual(
-            cursor_provenance.sync(self.conn, changed_hint=False)["skipped"], 1
-        )
+            cursor_provenance.sync(self.conn, changed_hint=True)["skipped"], 1)
+
+        self.conn.execute(
+            "DELETE FROM cursor_session_heads WHERE session_id='cursor:GONE'")
+        self.conn.commit()
+        stats = cursor_provenance.sync(self.conn, changed_hint=False)
+        self.assertEqual(stats["skipped"], 0)
+        rows = self.conn.execute(
+            "SELECT session_id FROM cursor_provenance_state").fetchall()
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            cursor_provenance.sync(self.conn, changed_hint=False)["skipped"], 1)
 
 
 class TestCursorProvenanceIngestInvalidation(unittest.TestCase):

@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,9 +69,14 @@ class TestPoolRefresh(unittest.TestCase):
             mock.patch("codebrain.ingest.DEFAULT_CURSOR_DB", self.root / "missing-cursor.db"),
             mock.patch("codebrain.cli.DEFAULT_POOL", self.pool),
             # Keep the read-path bmux overlay off the developer's real ~/.bmux
-            # log — hermetic tests must not depend on (or ingest) local data.
-            mock.patch.dict(os.environ, {"CODEBRAIN_BMUX_LOG": str(
-                self.root / "no-bmux.jsonl")}, clear=False),
+            # log — hermetic tests must not depend on (or ingest) local data —
+            # and pin the freshness-gate window so an ambient
+            # CODEBRAIN_MAX_STALENESS (a documented user knob) can't flip
+            # gate-dependent assertions. Tests override via env=.
+            mock.patch.dict(os.environ, {
+                "CODEBRAIN_BMUX_LOG": str(self.root / "no-bmux.jsonl"),
+                "CODEBRAIN_MAX_STALENESS": "600",
+            }, clear=False),
         ]
         if env is not None:
             patches.append(mock.patch.dict(os.environ, env, clear=False))
@@ -232,6 +238,271 @@ class TestPoolRefresh(unittest.TestCase):
                          "--machine", "local",
                          env={"CODEBRAIN_LOCAL_MACHINES": "local"})
         self.assertEqual(sorted(calls), ["bmux", "codex", "cursor"])
+
+    def _marker(self):
+        conn = self.conn()
+        return conn.execute(
+            "SELECT mtime, size FROM ingest_state WHERE path = ?",
+            (cli.SWEEP_STATE_PATH,),
+        ).fetchone()
+
+    def _full_sweep(self, roots, collect_roots):
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", collect_roots):
+            return self.run_cli("sweep", "--pool", str(self.pool),
+                                "--machine", "local",
+                                env={"CODEBRAIN_LOCAL_MACHINES": "local"},
+                                roots=roots)
+
+    def _grown_live_pi(self):
+        """A live pi root whose transcript gains a message after the sweep."""
+        live_pi = self.root / "live-pi"
+        path = _pi_root(live_pi, sid="LIVE", users=("first intent",))
+        roots = self.empty_live_roots()
+        roots["pi"] = live_pi
+        return roots, path
+
+    def _last_user(self, *args, roots=None, env=None):
+        # Reads refresh the pool too; without the local-machine env the sweep's
+        # own (possibly stale) pool mirror would be ingested as a remote's data.
+        merged = {"CODEBRAIN_LOCAL_MACHINES": "local", **(env or {})}
+        out, _ = self.run_cli("recent", "--json", *args, roots=roots, env=merged)
+        rows = json.loads(out)
+        return rows[0]["last_user_text"] if rows else None
+
+    def test_fresh_sweep_marker_gates_reads_and_fresh_forces_refresh(self):
+        roots, _ = self._grown_live_pi()
+        before = time.time()
+        self._full_sweep(roots, dict(roots))
+        marker = self._marker()
+        self.assertIsNotNone(marker)
+        # Stamped with the refresh-phase start: files appearing mid-refresh may
+        # be missed by that pass, so staleness counts from before the scan.
+        self.assertGreaterEqual(marker["mtime"], before)
+        self.assertLessEqual(marker["mtime"], time.time())
+
+        _pi_root(self.root / "live-pi", sid="LIVE",
+                 users=("first intent", "second intent"))
+        # Gated read: the recent full sweep lets the read skip its own refresh,
+        # so the post-sweep message is not yet visible.
+        self.assertEqual(self._last_user(roots=roots), "first intent")
+        # --fresh bypasses the gate and ingests the delta.
+        self.assertEqual(self._last_user("--fresh", roots=roots), "second intent")
+        # ...after which the gated read serves the now-current data.
+        self.assertEqual(self._last_user(roots=roots), "second intent")
+
+    def test_stale_marker_and_disabled_gate_let_reads_refresh(self):
+        roots, _ = self._grown_live_pi()
+        self._full_sweep(roots, dict(roots))
+        _pi_root(self.root / "live-pi", sid="LIVE",
+                 users=("first intent", "second intent"))
+
+        with self.subTest("env zero disables the gate"):
+            self.assertEqual(
+                self._last_user(roots=roots, env={"CODEBRAIN_MAX_STALENESS": "0"}),
+                "second intent")
+
+        with self.subTest("an aged-out marker no longer gates"):
+            _pi_root(self.root / "live-pi", sid="LIVE",
+                     users=("first intent", "second intent", "third intent"))
+            conn = self.conn()
+            conn.execute("UPDATE ingest_state SET mtime = mtime - 100000 "
+                         "WHERE path = ?", (cli.SWEEP_STATE_PATH,))
+            conn.commit()
+            self.assertEqual(self._last_user(roots=roots), "third intent")
+
+    def test_event_insert_after_sweep_voids_the_gate(self):
+        # The marker pins the events watermark it certified: any event row
+        # inserted afterwards (manual ingest, --fresh read, an in-flight
+        # sweep's per-file commits) must void the gate even while the marker
+        # is young, or gated readers would see events whose provenance
+        # overlays never ran (defaulting them to human).
+        roots, _ = self._grown_live_pi()
+        self._full_sweep(roots, dict(roots))
+        _pi_root(self.root / "live-pi", sid="LIVE",
+                 users=("first intent", "second intent"))
+        conn = self.conn()
+        conn.execute(
+            "INSERT INTO events (event_id, origin_session_id, ts, actor, type,"
+            " text, refs, raw) VALUES ('x:tip', NULL, '2026-01-01T00:00:00Z',"
+            " 'user', 'message', 'concurrent', '{}', '{}')")
+        conn.commit()
+        self.assertEqual(self._last_user(roots=roots), "second intent")
+
+    def test_future_marker_does_not_gate(self):
+        roots, _ = self._grown_live_pi()
+        self._full_sweep(roots, dict(roots))
+        _pi_root(self.root / "live-pi", sid="LIVE",
+                 users=("first intent", "second intent"))
+        conn = self.conn()
+        conn.execute("UPDATE ingest_state SET mtime = mtime + 100000 "
+                     "WHERE path = ?", (cli.SWEEP_STATE_PATH,))
+        conn.commit()
+        self.assertEqual(self._last_user(roots=roots), "second intent")
+
+    def test_marker_stamps_refresh_start_not_completion(self):
+        # Stamping completion time would over-claim freshness by the whole
+        # refresh duration: files appearing mid-refresh may be missed by the
+        # pass, so staleness must be measured from before the scan began.
+        roots, _ = self._grown_live_pi()
+        real_refresh = cli.refresh
+
+        def slow_refresh(conn, **kw):
+            stats = real_refresh(conn, **kw)
+            time.sleep(0.05)
+            return stats
+
+        with mock.patch("codebrain.cli.refresh", side_effect=slow_refresh):
+            self._full_sweep(roots, dict(roots))
+        finished = time.time()
+        marker = self._marker()
+        self.assertIsNotNone(marker)
+        self.assertLessEqual(marker["mtime"], finished - 0.05)
+
+    def test_manual_ingest_commands_void_the_marker_up_front(self):
+        # ingest/ingest-pool mutate canonical data without overlay syncs, and
+        # in-place event updates don't move the watermark — so they must drop
+        # the marker before touching anything.
+        roots, _ = self._grown_live_pi()
+        for command in (("ingest", "--source", "pi"),
+                        ("ingest-pool", "--pool", str(self.pool))):
+            with self.subTest(command[0]):
+                self._full_sweep(roots, dict(roots))
+                self.assertIsNotNone(self._marker())
+                self.run_cli(*command, roots=roots,
+                             env={"CODEBRAIN_LOCAL_MACHINES": "local"})
+                self.assertIsNone(self._marker())
+
+    def test_incomplete_sweep_deletes_a_previous_marker(self):
+        # A failing pass may have updated events in place beyond what the old
+        # marker certified; the watermark can't catch updates, so the sweep
+        # must not leave the stale marker gating reads.
+        roots, _ = self._grown_live_pi()
+        self._full_sweep(roots, dict(roots))
+        self.assertIsNotNone(self._marker())
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)), \
+             mock.patch("codebrain.cursor_provenance.sync",
+                        side_effect=RuntimeError("boom")):
+            self.run_cli("sweep", "--pool", str(self.pool), "--machine", "local",
+                         env={"CODEBRAIN_LOCAL_MACHINES": "local"}, roots=roots)
+        self.assertIsNone(self._marker())
+
+    def test_refresh_errors_block_the_stamp(self):
+        roots, _ = self._grown_live_pi()
+        errored = {"files": 1, "sessions": 0, "events": 0, "placements": 0,
+                   "skipped": 0, "conflicts": 0, "errors": 1}
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)), \
+             mock.patch("codebrain.cli.refresh", return_value=errored):
+            self.run_cli("sweep", "--pool", str(self.pool), "--machine", "local",
+                         env={"CODEBRAIN_LOCAL_MACHINES": "local"}, roots=roots)
+        self.assertIsNone(self._marker())
+
+    def test_writer_racing_the_overlay_phase_is_not_certified(self):
+        # An event committed after the overlays' snapshot (e.g. a manual
+        # ingest racing the sweep) must not be folded into the stamped
+        # watermark — the overlays never processed it. The sweep skips the
+        # stamp; the gate must be off afterwards.
+        roots, _ = self._grown_live_pi()
+
+        def racing_sync(conn, **kw):
+            conn.execute(
+                "INSERT INTO events (event_id, origin_session_id, ts, actor,"
+                " type, text, refs, raw) VALUES ('x:racer', NULL,"
+                " '2026-01-01T00:00:00Z', 'user', 'message', 'raced', '{}',"
+                " '{}')")
+            conn.commit()
+            return {}
+
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)), \
+             mock.patch("codebrain.cursor_provenance.sync",
+                        side_effect=racing_sync):
+            self.run_cli("sweep", "--pool", str(self.pool), "--machine", "local",
+                         env={"CODEBRAIN_LOCAL_MACHINES": "local"}, roots=roots)
+        conn = self.conn()
+        with mock.patch.dict(os.environ, {"CODEBRAIN_MAX_STALENESS": "600"}):
+            self.assertFalse(cli._sweep_is_fresh(conn))
+
+    def test_cursor_head_advance_after_sweep_voids_the_gate(self):
+        # Cursor rewrites events IN PLACE (no new rowids), but every accepted
+        # Cursor mutation advances its session's head revision — the
+        # generation's second component. A head advance after the stamp must
+        # void the gate.
+        roots, _ = self._grown_live_pi()
+        self._full_sweep(roots, dict(roots))
+        conn = self.conn()
+        with mock.patch.dict(os.environ, {"CODEBRAIN_MAX_STALENESS": "600"}):
+            self.assertTrue(cli._sweep_is_fresh(conn))
+            conn.execute(
+                "INSERT INTO cursor_session_heads (session_id, revision,"
+                " digest) VALUES ('cursor:raced', 1, ?)", ("0" * 64,))
+            conn.commit()
+            self.assertFalse(cli._sweep_is_fresh(conn))
+
+    def test_interrupt_during_overlays_deletes_a_previous_marker(self):
+        # KeyboardInterrupt escapes the per-overlay except Exception; the
+        # sweep's refresh may have committed in-place updates the generation
+        # can't see, so the old marker must not survive the escape.
+        roots, _ = self._grown_live_pi()
+        self._full_sweep(roots, dict(roots))
+        self.assertIsNotNone(self._marker())
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)), \
+             mock.patch("codebrain.cursor_provenance.sync",
+                        side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli("sweep", "--pool", str(self.pool),
+                             "--machine", "local",
+                             env={"CODEBRAIN_LOCAL_MACHINES": "local"},
+                             roots=roots)
+        self.assertIsNone(self._marker())
+
+    def test_refresh_exception_deletes_a_previous_marker(self):
+        # An exception escaping refresh may leave partially committed
+        # in-place updates the watermark can't see; the old marker must not
+        # survive to certify them.
+        roots, _ = self._grown_live_pi()
+        self._full_sweep(roots, dict(roots))
+        self.assertIsNotNone(self._marker())
+        with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)), \
+             mock.patch("codebrain.cli.refresh",
+                        side_effect=RuntimeError("mid-refresh crash")):
+            with self.assertRaises(RuntimeError):
+                self.run_cli("sweep", "--pool", str(self.pool),
+                             "--machine", "local",
+                             env={"CODEBRAIN_LOCAL_MACHINES": "local"},
+                             roots=roots)
+        self.assertIsNone(self._marker())
+
+    def test_max_staleness_parsing_fails_toward_disabled(self):
+        cases = {"": 600.0, "42.5": 42.5, "0": 0.0,
+                 "off": 0.0, "inf": 0.0, "nan": 0.0}
+        for raw, expected in cases.items():
+            with self.subTest(repr(raw)):
+                with mock.patch.dict(os.environ,
+                                     {"CODEBRAIN_MAX_STALENESS": raw}):
+                    self.assertEqual(cli._max_staleness_sec(), expected)
+
+    def test_partial_or_failed_sweeps_do_not_stamp_the_marker(self):
+        roots, _ = self._grown_live_pi()
+        with self.subTest("partial --source sweep"):
+            with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)):
+                self.run_cli("sweep", "--pool", str(self.pool), "--source", "pi",
+                             "--machine", "local",
+                             env={"CODEBRAIN_LOCAL_MACHINES": "local"}, roots=roots)
+            self.assertIsNone(self._marker())
+
+        with self.subTest("non-default pool sweep"):
+            other = self.root / "other-pool"
+            with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)):
+                self.run_cli("sweep", "--pool", str(other), "--machine", "local",
+                             env={"CODEBRAIN_LOCAL_MACHINES": "local"}, roots=roots)
+            self.assertIsNone(self._marker())
+
+        with self.subTest("failing provenance overlay"):
+            with mock.patch("codebrain.collect.DEFAULT_ROOTS", dict(roots)), \
+                 mock.patch("codebrain.cursor_provenance.sync",
+                            side_effect=RuntimeError("boom")):
+                self.run_cli("sweep", "--pool", str(self.pool), "--machine", "local",
+                             env={"CODEBRAIN_LOCAL_MACHINES": "local"}, roots=roots)
+            self.assertIsNone(self._marker())
 
     def test_sweep_install_launchd_passes_the_sweep_command(self):
         # A silent regression here installs a collect-only agent while printing

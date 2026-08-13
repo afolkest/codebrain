@@ -31,7 +31,10 @@ Read commands refresh first: changed/new local source files (or Cursor's safe
 codebrain-owned export) and synced remote pool files are delta-ingested before
 the query runs. Results stay current for this machine and include synced remote
 history after Syncthing arrives. --no-refresh skips source refresh, but still
-rebuilds structured provenance overlays when needed.
+rebuilds structured provenance overlays when needed. When the background sweep
+agent is installed (sessdb sweep --install-launchd), reads inside its freshness
+window (CODEBRAIN_MAX_STALENESS seconds, default 600; 0 disables) skip the
+refresh entirely; --fresh forces one.
 
 Raw SQL escape hatch: just open the DB with any sqlite3 client (see --schema).
 """
@@ -39,13 +42,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -72,9 +79,85 @@ def _refresh_notice(local_stats, pool_stats):
         print(f"(refreshed {'; '.join(parts)})", file=sys.stderr)
 
 
+# The background sweep (cmd_sweep) stamps this after a pass that refreshed every
+# source, the default pool, and all provenance overlays. Reads inside the
+# freshness window skip their own refresh entirely — bounded staleness instead
+# of open-ended latency when a read lands mid-storm. mtime holds the wall-clock
+# time the sweep's *refresh phase started* (everything on disk by then is
+# covered), size holds the marker format version.
+SWEEP_STATE_PATH = "__codebrain_sweep_complete__"
+DEFAULT_MAX_STALENESS_SEC = 600.0
+
+
+def _max_staleness_sec() -> float:
+    raw = os.environ.get("CODEBRAIN_MAX_STALENESS", "")
+    if not raw.strip():
+        return DEFAULT_MAX_STALENESS_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0  # garbage ("off", "no") disables the gate rather than
+    if not math.isfinite(value):  # silently enabling a 600s one; inf would
+        return 0.0                # make a marker permanently fresh
+    return value
+
+
+def _canonical_generation(conn) -> str:
+    """A cheap monotone fingerprint of canonical data: the events tip catches
+    every insert; the head-revision sum catches Cursor's in-place rewrites,
+    because every accepted Cursor mutation advances its session's head
+    revision (rank-monotonic, so the sum strictly grows). Not covered: in-place
+    updates to non-Cursor events (a rewritten transcript prefix re-ingested by
+    a manual command racing a sweep) — that residue is why manual ingest
+    commands clear the marker up front and failed sweeps delete it."""
+    return conn.execute(
+        "SELECT (SELECT COALESCE(MAX(rowid), 0) FROM events) || ':' || "
+        "(SELECT COALESCE(SUM(revision), 0) FROM cursor_session_heads)"
+    ).fetchone()[0]
+
+
+def _sweep_is_fresh(conn) -> bool:
+    limit = _max_staleness_sec()
+    if limit <= 0:  # CODEBRAIN_MAX_STALENESS=0 disables the gate
+        return False
+    row = conn.execute(
+        "SELECT mtime, session_id FROM ingest_state WHERE path = ? AND size = 1",
+        (SWEEP_STATE_PATH,),
+    ).fetchone()
+    if row is None or not 0 <= time.time() - row["mtime"] < limit:
+        return False
+    # The marker also pins the events watermark it certified. Any event insert
+    # since — a --fresh read, a manual ingest, an in-flight sweep's per-file
+    # commits — voids the gate, so a gated reader can never see events whose
+    # provenance overlays have not run ("no event_origins row" would read as
+    # human). In-place event updates don't move the watermark; the writers
+    # cover those instead (manual ingest commands clear the marker up front,
+    # a sweep that fails mid-pass deletes it). Two accepted residual windows:
+    # a writer committing between this check and the command's own queries is
+    # visible without overlays for the command's duration — identical to the
+    # pre-gate window between _open's overlay syncs and the query — and a
+    # wall-clock rollback extends a marker's life by the rollback amount
+    # (cross-process monotonic time isn't available; bound: rollback size).
+    return row["session_id"] == _canonical_generation(conn)
+
+
+def _void_sweep_marker(conn) -> None:
+    """Called BEFORE a manual ingest mutates canonical data: those paths run no
+    overlay syncs, so gated reads must fall back to refreshing (which does)."""
+    conn.execute("DELETE FROM ingest_state WHERE path = ?", (SWEEP_STATE_PATH,))
+    conn.commit()
+
+
 def _open(args, sync_bmux=True, sync_codex_control=True, sync_cursor=True):
     """Connect and (unless --no-refresh) delta-ingest whatever changed on disk."""
     conn = connect(args.db)
+    # Freshness gate: a recent full background sweep already ingested sources,
+    # pool, and provenance overlays as one consistent pass, so this read can
+    # skip all of it. --fresh forces the full refresh; the overlays are safe to
+    # skip *together with* ingest because the DB then holds a self-consistent
+    # as-of-last-sweep snapshot (no newly ingested events with stale origins).
+    if not getattr(args, "fresh", False) and _sweep_is_fresh(conn):
+        return conn
     transcripts_changed = False
     if not getattr(args, "no_refresh", False):
         local_stats = refresh(conn)
@@ -225,6 +308,15 @@ def _add_visibility_args(parser) -> None:
                        help="only show sessions hidden from default retrieval")
 
 
+def _add_refresh_args(parser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--no-refresh", action="store_true",
+                       help="skip the delta ingest")
+    group.add_argument("--fresh", action="store_true",
+                       help="force a full refresh even if a background sweep "
+                            "ran recently")
+
+
 ORIGIN_CHOICES = ("human", "master-control", "unknown", "all")
 # CLI origin token -> stored event_origins.origin value. A strict whitelist so the
 # value interpolated into SQL below can never be attacker/caller controlled.
@@ -279,6 +371,7 @@ def cmd_ingest(args):
             print(f"--raw-root requires --source {'|'.join(SOURCES)}", file=sys.stderr)
             sys.exit(2)
     conn = connect(args.db)
+    _void_sweep_marker(conn)
     print(f"ingesting [{', '.join(sources)}] → {args.db}")
     if args.raw_root:
         total = ingest_source(conn, args.source, raw_root=Path(args.raw_root),
@@ -335,19 +428,82 @@ def cmd_sweep(args):
     print("collect: " + ", ".join(f"{k}={v}" for k, v in collect_total.items()))
     conn = connect(args.db)
     try:
-        local_stats = refresh(conn, sources=sources)
-        pool_stats = {}
-        if (Path(args.pool) / "raw").is_dir():
-            pool_stats = refresh_pool(conn, Path(args.pool), sources=sources,
-                                      include_local=False,
-                                      local_machines=local_machine_names())
-        changed = bool(local_stats.get("events") or pool_stats.get("events"))
-        for label, sync in (("bmux", bmux.sync), ("Codex control", codex_control.sync),
-                            ("Cursor", cursor_provenance.sync)):
+        refresh_started = time.time()
+        try:
+            local_stats = refresh(conn, sources=sources)
+            pool_stats = {}
+            if (Path(args.pool) / "raw").is_dir():
+                pool_stats = refresh_pool(conn, Path(args.pool), sources=sources,
+                                          include_local=False,
+                                          local_machines=local_machine_names())
+            changed = bool(local_stats.get("events") or pool_stats.get("events"))
+            # The generation the stamp certifies is the one the overlays are
+            # about to see; captured here so a writer racing the overlay phase
+            # (e.g. a manual ingest committing overlay-less events) can never
+            # have its mutations folded into the certification.
+            overlay_gen = _canonical_generation(conn)
+            overlays_ok = True
+            for label, sync in (("bmux", bmux.sync),
+                                ("Codex control", codex_control.sync),
+                                ("Cursor", cursor_provenance.sync)):
+                try:
+                    sync(conn, changed_hint=changed)
+                except Exception as exc:  # noqa: BLE001 — stays best-effort
+                    overlays_ok = False
+                    print(f"({label} provenance skipped: {exc})", file=sys.stderr)
+        except BaseException:
+            # Anything escaping the mutation phase — a refresh error,
+            # KeyboardInterrupt mid-overlay — may leave partially committed
+            # canonical mutations (including in-place updates the generation
+            # check cannot see) that an older marker never certified. Drop the
+            # marker before bailing so gated reads fall back to refreshing.
             try:
-                sync(conn, changed_hint=changed)
-            except Exception as exc:  # noqa: BLE001 — maintenance stays best-effort
-                print(f"({label} provenance skipped: {exc})", file=sys.stderr)
+                conn.rollback()
+                conn.execute("DELETE FROM ingest_state WHERE path = ?",
+                             (SWEEP_STATE_PATH,))
+                conn.commit()
+            except sqlite3.Error:
+                pass
+            raise
+        # Stamp the freshness marker (read by cli._open) only when this pass
+        # covered everything a default read would have refreshed, error-free:
+        # every source, the default pool, all three overlays, no per-file
+        # refresh errors. Collect errors deliberately don't block the stamp —
+        # the marker certifies "a read's own refresh would find nothing", and
+        # reads never collect, so a collect failure leaves reads and sweep
+        # seeing the same disk. Stamped with the refresh START time (files
+        # appearing mid-refresh may be missed by this pass, so staleness is
+        # measured from before the scan began) and the certified generation.
+        # Clean partial sweeps leave the marker alone to age out; a pass with
+        # errors DELETES it, because this sweep may have updated non-Cursor
+        # events in place beyond what an older marker certified, which the
+        # generation check cannot catch.
+        complete = (overlays_ok and not local_stats.get("errors")
+                    and not pool_stats.get("errors"))
+        full_scope = (args.source == "all"
+                      and Path(args.pool).resolve() == Path(DEFAULT_POOL).resolve())
+        if complete and full_scope:
+            # Compare-and-stamp under the write lock: if any writer advanced
+            # the generation after the overlays' snapshot was taken, stamping
+            # the current one would certify mutations no overlay processed.
+            # Skip the stamp instead — the previous marker then auto-voids on
+            # generation mismatch, and the next clean pass re-certifies.
+            try:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                if _canonical_generation(conn) == overlay_gen:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO ingest_state "
+                        "(path, mtime, size, session_id) VALUES (?, ?, 1, ?)",
+                        (SWEEP_STATE_PATH, refresh_started, overlay_gen),
+                    )
+                conn.commit()
+            except sqlite3.OperationalError:
+                conn.rollback()  # lock contention: skip the stamp this pass
+        elif not complete:
+            conn.execute("DELETE FROM ingest_state WHERE path = ?",
+                         (SWEEP_STATE_PATH,))
+            conn.commit()
     finally:
         conn.close()
     print("refresh: local " + ", ".join(f"{k}={v}" for k, v in local_stats.items()))
@@ -359,6 +515,7 @@ def cmd_ingest_pool(args):
     sources = SOURCES if args.source == "all" else (args.source,)
     machines = (args.machine,) if args.machine else None
     conn = connect(args.db)
+    _void_sweep_marker(conn)
     local_names = local_machine_names()
     print(f"ingesting pool [{', '.join(sources)}] from {args.pool}")
     try:
@@ -1824,8 +1981,10 @@ def main(argv=None):
     sp.add_argument("--install-launchd", action="store_true",
                     help="install a LaunchAgent running sweep periodically "
                          "(macOS; replaces a collect-only agent — same label)")
-    sp.add_argument("--interval", type=int, default=1800,
-                    help="LaunchAgent sweep period in seconds (default 1800)")
+    sp.add_argument("--interval", type=int, default=300,
+                    help="LaunchAgent sweep period in seconds (default 300; "
+                         "keep it under CODEBRAIN_MAX_STALENESS so reads stay "
+                         "gated between sweeps)")
     sp.set_defaults(func=cmd_sweep)
 
     sp = sub.add_parser("ingest-pool", help="debug/repair ingest of synced pool subtrees")
@@ -1853,12 +2012,12 @@ def main(argv=None):
     sp = sub.add_parser("hide", help="hide sessions from default retrieval")
     sp.add_argument("sessions", nargs="+", help="session id or unique prefix")
     sp.add_argument("--reason", required=True, help="why this session is hidden")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_hide)
 
     sp = sub.add_parser("unhide", help="restore sessions to default retrieval")
     sp.add_argument("sessions", nargs="+", help="session id or unique prefix")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_unhide)
 
     sp = sub.add_parser("hidden", help="list sessions hidden from default retrieval")
@@ -1866,13 +2025,13 @@ def main(argv=None):
     sp.add_argument("--source", choices=SOURCES, help="filter by source")
     sp.add_argument("--cwd", help="substring filter on session cwd")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_hidden)
 
     sp = sub.add_parser("list", help="recent sessions")
     sp.add_argument("--limit", type=int, default=30)
     _add_visibility_args(sp)
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("recent", help="sessions by latest live user message")
@@ -1890,7 +2049,7 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     _add_visibility_args(sp)
     _add_origin_args(sp)
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_recent)
 
     sp = sub.add_parser("userlog", help="recent live user messages (intent-first)")
@@ -1909,7 +2068,7 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     _add_visibility_args(sp)
     _add_origin_args(sp)
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_userlog)
 
     sp = sub.add_parser("turns", help="display a session as user-centered turns")
@@ -1932,13 +2091,13 @@ def main(argv=None):
     sp.add_argument("--show-tools", action="store_true", help="include tool calls/results")
     sp.add_argument("--all", action="store_true", help="include rolled-back events")
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_turns)
 
     sp = sub.add_parser("show", help="a session's transcript")
     sp.add_argument("session")
     sp.add_argument("--all", action="store_true", help="include rolled-back events")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_show)
 
     sp = sub.add_parser("search", help="FTS over event text")
@@ -1971,7 +2130,7 @@ def main(argv=None):
     sp.add_argument("--json", action="store_true", help="emit a JSON array")
     _add_visibility_args(sp)
     _add_origin_args(sp)  # defaults only under --actor user; explicit non-human implies user
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("lineage", help="factual parent/child session lineage")
@@ -1979,7 +2138,7 @@ def main(argv=None):
     sp.add_argument("--limit", type=int, default=50,
                     help="maximum children/siblings to show (default 50)")
     sp.add_argument("--json", action="store_true", help="emit a JSON object")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_lineage)
 
     sp = sub.add_parser("refs", help="files/commands/commits referenced by a session")
@@ -1989,7 +2148,7 @@ def main(argv=None):
                     help="turns before/after --around-seq (default 2)")
     sp.add_argument("--all", action="store_true", help="include rolled-back events")
     sp.add_argument("--json", action="store_true", help="emit a JSON object")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_refs)
 
     sp = sub.add_parser("touched", help="sessions/events with structured file refs")
@@ -2014,7 +2173,7 @@ def main(argv=None):
     sp.add_argument("--all", action="store_true", help="include rolled-back events")
     sp.add_argument("--json", action="store_true", help="emit a JSON object")
     _add_visibility_args(sp)
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_touched)
 
     sp = sub.add_parser(
@@ -2037,20 +2196,19 @@ def main(argv=None):
     sp = sub.add_parser("bmux-sync",
                         help="rebuild the bmux provenance overlay from the bmux event log")
     sp.add_argument("--log", help=f"bmux event log path (default {bmux.DEFAULT_BMUX_LOG})")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_bmux_sync)
 
     sp = sub.add_parser("codex-control-sync",
                         help="rebuild Codex control-message provenance from indexed transcripts")
-    sp.add_argument("--no-refresh", action="store_true", help="skip the delta ingest")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_codex_control_sync)
 
     sp = sub.add_parser(
         "cursor-provenance-sync",
         help="rebuild Cursor structured user-message provenance",
     )
-    sp.add_argument("--no-refresh", action="store_true",
-                    help="skip delta ingest before rebuilding provenance")
+    _add_refresh_args(sp)
     sp.set_defaults(func=cmd_cursor_provenance_sync)
 
     sp = sub.add_parser("schema", help="print the DDL")

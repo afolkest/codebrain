@@ -106,6 +106,16 @@ CREATE TABLE IF NOT EXISTS cursor_session_heads (
   )
 );
 
+-- Per-session Cursor provenance watermark: the cursor_session_heads
+-- (revision, digest) each session's origin evidence was last derived from.
+-- cursor_provenance.sync diffs this against the live heads so a head advance
+-- rebuilds only that session's branch family, not every Cursor session.
+CREATE TABLE IF NOT EXISTS cursor_provenance_state (
+  session_id TEXT PRIMARY KEY,
+  revision   INTEGER NOT NULL,
+  digest     TEXT NOT NULL
+);
+
 -- Rebuildable Cursor archive discovery cache. This is deliberately root- and
 -- session-directory-scoped: one synced session arrival invalidates only its own
 -- revision chain. selected_* records the validated reconstructible head, while
@@ -190,6 +200,8 @@ CREATE INDEX IF NOT EXISTS ix_bcs_session_sha
 CREATE INDEX IF NOT EXISTS ix_eo_origin ON event_origins(origin);
 CREATE INDEX IF NOT EXISTS ix_eoe_event ON event_origin_evidence(session_id, event_id);
 CREATE INDEX IF NOT EXISTS ix_eoe_kind ON event_origin_evidence(evidence_kind);
+-- Event-first lookup for cursor_provenance's evidence-seed closure edge.
+CREATE INDEX IF NOT EXISTS ix_eoe_event_id ON event_origin_evidence(event_id);
 CREATE INDEX IF NOT EXISTS ix_ccs_target_sha
   ON codex_control_submissions(target_session_id, payload_sha256);
 
