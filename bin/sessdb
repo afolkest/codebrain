@@ -1,0 +1,6 @@
+#!/bin/sh
+# sessdb — run the codebrain CLI straight from this checkout, no install step.
+# Put it on PATH with:  ln -sf ~/code/codebrain/bin/sessdb ~/.local/bin/sessdb
+self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+root="$(dirname "$(dirname "$self")")"
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m codebrain "$@"

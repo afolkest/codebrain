@@ -18,9 +18,14 @@ contract, [SYNCING.md](SYNCING.md) for cross-machine sync, and
 ## Quick Start
 
 ```bash
-pip install -e .
+# No-install: symlink the checkout launcher onto PATH (survives git pull;
+# sidesteps PEP 668 on Homebrew/system Pythons)
+ln -sf "$(pwd)/bin/sessdb" ~/.local/bin/sessdb
 sessdb ingest
 ```
+
+`pip install -e .` also works where the environment allows it (same `sessdb`
+entry point).
 
 Daily read commands refresh first: changed local live logs, a safe projection of
 settled Cursor sessions, and synced remote pool logs are delta-ingested before the
