@@ -1,4 +1,4 @@
-# codebrain - for and by humans
+# codebrain - for humans by human
 
 `codebrain` indexes your coding agent sessions across different harnesses and
 makes the raw transcripts searchable. It is a memory system based on two core
@@ -11,9 +11,9 @@ observations:
 With codebrain, your agents can look up your exact previous words to reconstruct
 your intent, opinions, emphasis, etc. However, the memories do not claim to be
 authoritative about what you want it the future. It is a good old log of
-everything you've said.
-
-It works surprisingly well as an 80-20 memory system--at least for my workflow.
+everything you've said. That's not how you'd construct a memory system for a human, 
+but agents aren't humans. Until we figure out proper agentic associative memory, I much 
+prefer agents consulting raw data. 
 
 # codebrain - for and by agents
 
