@@ -8,6 +8,9 @@ dist/
 .venv/
 venv/
 
+# Editor state
+*.swp
+
 # Local DB / cache (rebuildable; never synced — see DESIGN.md)
 *.db
 *.db-wal
