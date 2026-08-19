@@ -1,4 +1,21 @@
-# codebrain
+# codebrain - for and by humans
+
+`codebrain` indexes your coding agent sessions across different harnesses and
+makes the raw transcripts searchable. It is a memory system based on two core
+observations:
+- Agent summaries are usually bad. Agents don't triage information well, and they don't know what needs
+  emphasis and what should be ignored. LLM constructed memories invariably turn stale. 
+- It's not important to remember what your agent did--that's in the git history.
+  It is important to remember what you said, how you said it, and why you said it.
+
+With codebrain, your agents can look up your exact previous words to reconstruct
+your intent, opinions, emphasis, etc. However, the memories do not claim to be
+authoritative about what you want it the future. It is a good old log of
+everything you've said.
+
+It works surprisingly well as an 80-20 memory system--at least for my workflow.
+
+# codebrain - for and by agents
 
 `codebrain` is a local, searchable store of coding-agent sessions from Claude,
 Codex, Cursor, and pi. It is meant for future agents trying to reconstruct user
