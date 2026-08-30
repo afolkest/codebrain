@@ -195,6 +195,15 @@ CREATE TABLE IF NOT EXISTS codex_control_submissions (
   raw_event            TEXT NOT NULL
 );
 
+-- Paginated Codex reconciliation may revise/delete an already-indexed
+-- session below the global events rowid watermark. Queue only that structured
+-- sender session for targeted submission re-extraction; deleting the global
+-- watermark would turn every active Desktop rollover into a corpus scan.
+CREATE TABLE IF NOT EXISTS codex_control_dirty_sessions (
+  session_id TEXT PRIMARY KEY,
+  revision   INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS ix_bcs_session_sha
   ON bmux_control_submissions(codebrain_session_id, payload_sha256);
 CREATE INDEX IF NOT EXISTS ix_eo_origin ON event_origins(origin);

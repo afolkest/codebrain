@@ -533,6 +533,161 @@ class TestCodexControlIncrementalSync(unittest.TestCase):
         self.assertEqual(self._state_row(),
                          (float(self._watermark()), -codex_control.DERIVATION_VERSION))
 
+    def test_dirty_sender_replaces_below_watermark_submission_without_full_scan(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1",
+                       sender_eid="codex:S:9", sender_seq=0, call_id="call_a",
+                       text="old payload", msg_ts="2026-01-01T00:00:01Z",
+                       send_ts="2026-01-01T00:00:02Z")
+        self._sync()
+        old_watermark = self._watermark()
+        _add_user(self.conn, sid="codex:U", eid="codex:U:1", seq=0,
+                  ts="2026-01-01T00:00:03Z", text="new payload")
+        self.conn.execute(
+            "UPDATE events SET raw=? WHERE event_id=?",
+            (json.dumps(_mcp_reply_raw(
+                ts="2026-01-01T00:00:02Z", call_id="call_a", target="U",
+                prompt="new payload",
+            )), "codex:S:9"),
+        )
+        codex_control.invalidate(self.conn, "codex:S")
+
+        with mock.patch.object(
+                codex_control, "read_submissions",
+                wraps=codex_control.read_submissions) as reader:
+            stats = self._sync()
+
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(reader.call_args_list[0].args[1], old_watermark)
+        self.assertEqual(
+            reader.call_args_list[1].kwargs["sender_session_ids"], ("codex:S",),
+        )
+        self.assertIsNone(self._origin("codex:T", "codex:T:1"))
+        self.assertEqual(self._origin("codex:U", "codex:U:1"), {
+            "origin": "master_control", "evidence_id": "codex:S:9:call_a",
+        })
+        self.assertEqual(self.conn.execute(
+            "SELECT target_session_id FROM codex_control_submissions"
+        ).fetchone()[0], "codex:U")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM codex_control_dirty_sessions"
+        ).fetchone()[0], 0)
+
+    def test_dirty_deleted_max_row_removes_submission_and_reused_rowid_is_seen(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1",
+                       sender_eid="codex:S:9", sender_seq=0, call_id="call_a",
+                       text="payload", msg_ts="2026-01-01T00:00:01Z",
+                       send_ts="2026-01-01T00:00:02Z")
+        self._sync()
+        old_watermark = self._watermark()
+        self.conn.execute(
+            "DELETE FROM session_events WHERE event_id='codex:S:9'"
+        )
+        self.conn.execute("DELETE FROM events WHERE event_id='codex:S:9'")
+        codex_control.invalidate(self.conn, "codex:S")
+
+        stats = self._sync()
+
+        self.assertEqual(stats["submissions"], 0)
+        self.assertEqual(self._mirror_count(), 0)
+        self.assertIsNone(self._origin("codex:T", "codex:T:1"))
+        self.assertLess(self._watermark(), old_watermark)
+        self.assertEqual(self._state_row()[0], float(self._watermark()))
+
+        # SQLite reuses the deleted maximum rowid. The lowered cursor must see
+        # it; retaining the old high-water mark would silently miss this send.
+        _add_raw_event(
+            self.conn, sid="codex:S", eid="codex:S:10", seq=0,
+            ts="2026-01-01T00:00:03Z", actor="tool", typ="tool_result",
+            text="[mcp codex.codex-reply]",
+            raw=_mcp_reply_raw(ts="2026-01-01T00:00:03Z", call_id="call_b",
+                               target="T", prompt="payload"),
+        )
+        stats = self._sync()
+        self.assertEqual(stats["submissions"], 1)
+        self.assertEqual(self._origin("codex:T", "codex:T:1"), {
+            "origin": "master_control", "evidence_id": "codex:S:10:call_b",
+        })
+
+    def test_dirty_receiver_placement_only_change_rematches_existing_mirror(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1",
+                       sender_eid="codex:S:9", sender_seq=0, call_id="call_a",
+                       text="payload", msg_ts="2026-01-01T00:00:01Z",
+                       send_ts="2026-01-01T00:00:02Z")
+        self._sync()
+        self.conn.execute(
+            "UPDATE session_events SET live=0 "
+            "WHERE session_id='codex:T' AND event_id='codex:T:1'"
+        )
+        codex_control.invalidate(self.conn, "codex:T")
+
+        stats = self._sync()
+
+        self.assertEqual(stats["submissions"], 0)
+        self.assertEqual(self._mirror_count(), 1)
+        self.assertIsNone(self._origin("codex:T", "codex:T:1"))
+
+    def test_dirty_tail_and_session_extraction_deduplicate_same_submission(self):
+        self._sync()  # establish the versioned cursor on an empty cache
+        self._add_pair(target="codex:T", msg_eid="codex:T:1",
+                       sender_eid="codex:S:9", sender_seq=0, call_id="call_a",
+                       text="payload", msg_ts="2026-01-01T00:00:01Z",
+                       send_ts="2026-01-01T00:00:02Z")
+        codex_control.invalidate(self.conn, "codex:S")
+
+        stats = self._sync()
+
+        self.assertEqual((stats["submissions"], stats["stored"]), (1, 1))
+        self.assertEqual(self._mirror_count(), 1)
+
+    def test_dirty_generation_survives_invalidation_after_capture(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1",
+                       sender_eid="codex:S:9", sender_seq=0, call_id="call_a",
+                       text="payload", msg_ts="2026-01-01T00:00:01Z",
+                       send_ts="2026-01-01T00:00:02Z")
+        self._sync()
+        codex_control.invalidate(self.conn, "codex:S")
+        codex_control.invalidate(self.conn, "codex:S")
+        original = provenance.replace_evidence_kind
+
+        def invalidate_during_sync(conn, evidence_kind, rows):
+            original(conn, evidence_kind, rows)
+            codex_control.invalidate(conn, "codex:S")
+
+        with mock.patch.object(
+                provenance, "replace_evidence_kind",
+                side_effect=invalidate_during_sync):
+            self._sync()
+
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT session_id,revision FROM codex_control_dirty_sessions"
+        ).fetchone()), ("codex:S", 3))
+        self._sync()
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM codex_control_dirty_sessions"
+        ).fetchone()[0], 0)
+
+    def test_failed_dirty_sync_rolls_back_and_retains_queue(self):
+        self._add_pair(target="codex:T", msg_eid="codex:T:1",
+                       sender_eid="codex:S:9", sender_seq=0, call_id="call_a",
+                       text="payload", msg_ts="2026-01-01T00:00:01Z",
+                       send_ts="2026-01-01T00:00:02Z")
+        self._sync()
+        state = self._state_row()
+        codex_control.invalidate(self.conn, "codex:S")
+        self.conn.commit()
+
+        with mock.patch.object(
+                provenance, "replace_evidence_kind",
+                side_effect=RuntimeError("injected")):
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                codex_control.sync(self.conn)
+
+        self.assertEqual(self._state_row(), state)
+        self.assertEqual(self._mirror_count(), 1)
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT session_id,revision FROM codex_control_dirty_sessions"
+        ).fetchone()), ("codex:S", 1))
+
 
 class TestCodexControlCLI(unittest.TestCase):
     def setUp(self):

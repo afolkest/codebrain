@@ -617,9 +617,13 @@ class TestCodexPaginatedIngest(unittest.TestCase):
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM ingest_state WHERE path=?", (str(bmux_log),)
         ).fetchone())
-        self.assertIsNone(self.conn.execute(
-            "SELECT 1 FROM ingest_state WHERE path=?", (codex_control.STATE_PATH,)
-        ).fetchone())
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT mtime,size FROM ingest_state WHERE path=?",
+            (codex_control.STATE_PATH,),
+        ).fetchone()), (1.0, -1))
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT session_id,revision FROM codex_control_dirty_sessions"
+        ).fetchone()), (f"codex:{UUID}", 1))
 
         unchanged = self.refresh()
         self.assertEqual(unchanged["files"], 0)
@@ -749,6 +753,7 @@ class TestCodexPaginatedIngest(unittest.TestCase):
             "INSERT INTO ingest_state(path,mtime,size,session_id) VALUES (?,?,?,NULL)",
             (codex_control.STATE_PATH, 1, -1),
         )
+        self.conn.execute("DELETE FROM codex_control_dirty_sessions")
         with second_path.open(encoding="utf-8") as handle:
             records = [json.loads(line) for line in handle]
         records.append({**_rollback(1, "2026-01-01T00:00:11Z"), "ordinal": 108})
@@ -773,9 +778,13 @@ class TestCodexPaginatedIngest(unittest.TestCase):
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM ingest_state WHERE path=?", (str(bmux_log),)
         ).fetchone())
-        self.assertIsNone(self.conn.execute(
-            "SELECT 1 FROM ingest_state WHERE path=?", (codex_control.STATE_PATH,)
-        ).fetchone())
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT mtime,size FROM ingest_state WHERE path=?",
+            (codex_control.STATE_PATH,),
+        ).fetchone()), (1.0, -1))
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT session_id,revision FROM codex_control_dirty_sessions"
+        ).fetchone()), (f"codex:{UUID}", 1))
 
 
 if __name__ == "__main__":

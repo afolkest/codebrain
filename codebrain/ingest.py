@@ -239,7 +239,7 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
                 # rows. A rollover can revise either below their watermarks, so
                 # every processed paginated unit invalidates both derivations.
                 bmux.invalidate(conn)
-                codex_control.invalidate(conn)
+                codex_control.invalidate(conn, parsed.session.session_id)
             else:
                 for e in parsed.events:
                     accepted = upsert_cursor_event(conn, e) if is_cursor \

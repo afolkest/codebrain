@@ -38,9 +38,25 @@ FUNCTION_SEND_TOOLS = {"send_input"}
 MULTI_AGENT_V1_NAMESPACE = "multi_agent_v1"
 
 
-def invalidate(conn: sqlite3.Connection) -> None:
-    """Make the next sync fully re-extract transcript-backed submissions."""
-    conn.execute("DELETE FROM ingest_state WHERE path = ?", (STATE_PATH,))
+def invalidate(conn: sqlite3.Connection, session_id: str | None = None) -> None:
+    """Make the next sync revisit changed transcript-backed submissions.
+
+    A structured session id keeps invalidation local: authoritative Codex
+    pagination can rewrite old rows below the global rowid watermark, but it
+    cannot change another session's authored events. Callers without that
+    scope retain the conservative full-rebuild behavior.
+    """
+    if session_id is None:
+        conn.execute("DELETE FROM ingest_state WHERE path = ?", (STATE_PATH,))
+        return
+    if not isinstance(session_id, str) or not session_id.startswith("codex:"):
+        raise ValueError("Codex control invalidation requires a Codex session id")
+    conn.execute(
+        "INSERT INTO codex_control_dirty_sessions(session_id, revision) "
+        "VALUES (?, 1) ON CONFLICT(session_id) DO UPDATE "
+        "SET revision=revision+1",
+        (session_id,),
+    )
 
 
 def _empty_stats(**extra) -> dict:
@@ -53,12 +69,12 @@ def _empty_stats(**extra) -> dict:
 def _watermark(conn: sqlite3.Connection) -> int:
     """Highest events rowid; O(1) via the implicit rowid.
 
-    Sound as an incremental cursor because this codebase never deletes events
-    (auto rowids therefore stay monotonic) and codex event ``raw`` is immutable
-    after insert: rollout files are append-only, so re-parsing a grown file
-    re-upserts identical raw in place without changing the rowid. A VACUUM can
-    renumber implicit rowids and break both properties; ``sessdb
-    codex-control-sync`` (force) rebuilds from scratch and recovers.
+    Ordinary ingestion is append-only. Authoritative paginated reconciliation
+    may revise or delete old rows, including the current maximum; its durable
+    dirty-session revision supplies the below-watermark repair, and this cursor
+    is allowed to decrease so a reused rowid is seen next time. A VACUUM can
+    renumber arbitrary rows without queuing their sessions; ``sessdb
+    codex-control-sync`` (force) rebuilds from scratch after one.
     """
     return int(conn.execute(
         "SELECT COALESCE(MAX(rowid), 0) FROM events"
@@ -76,6 +92,21 @@ def _state(conn: sqlite3.Connection):
         "SELECT mtime, size FROM ingest_state WHERE path = ?", (STATE_PATH,)
     ).fetchone()
     return (row["mtime"], row["size"]) if row else None
+
+
+def _dirty_sessions(conn: sqlite3.Connection) -> tuple[tuple[str, int], ...]:
+    return tuple(
+        (row["session_id"], row["revision"])
+        for row in conn.execute(
+            "SELECT session_id,revision FROM codex_control_dirty_sessions "
+            "ORDER BY session_id"
+        )
+    )
+
+
+def _session_chunks(session_ids: tuple[str, ...], size: int = 400):
+    for start in range(0, len(session_ids), size):
+        yield session_ids[start:start + size]
 
 
 def _parse_json(value):
@@ -244,24 +275,45 @@ def _submission_from_function(row) -> dict | None:
     }
 
 
-def read_submissions(conn: sqlite3.Connection, min_rowid: int = 0) -> list[dict]:
-    """Extract control submissions from codex events with rowid > min_rowid."""
+def read_submissions(conn: sqlite3.Connection, min_rowid: int = 0, *,
+                     sender_session_ids: tuple[str, ...] = ()) -> list[dict]:
+    """Extract control submissions from a rowid tail or exact sender sessions."""
     # The unary + hints keep the non-rowid terms off indexes: the planner
     # otherwise picks a MULTI-INDEX OR over ix_ev_actor_type_ts, which visits
     # every tool row in the DB and defeats the incremental rowid bound.
-    rows = conn.execute(
-        """
-        SELECT event_id, origin_session_id, ts, raw
-        FROM events
-        WHERE rowid > ?
-          AND +origin_session_id LIKE 'codex:%'
-          AND ((+actor = 'tool' AND type = 'tool_result')
-               OR (+actor = 'assistant' AND type = 'tool_call'))
-          AND json_valid(raw)
-          AND json_extract(raw, '$.type') IN ('event_msg', 'response_item')
-        """,
-        (min_rowid,),
-    ).fetchall()
+    if sender_session_ids:
+        rows = []
+        for chunk in _session_chunks(sender_session_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            # Exact structured origins make ix_ev_origin a narrow probe even
+            # when the changed events predate the global rowid cursor.
+            rows.extend(conn.execute(
+                f"""
+                SELECT event_id, origin_session_id, ts, raw
+                FROM events INDEXED BY ix_ev_origin
+                WHERE origin_session_id IN ({placeholders})
+                  AND ((actor = 'tool' AND type = 'tool_result')
+                       OR (actor = 'assistant' AND type = 'tool_call'))
+                  AND json_valid(raw)
+                  AND json_extract(raw, '$.type')
+                      IN ('event_msg', 'response_item')
+                """,
+                chunk,
+            ).fetchall())
+    else:
+        rows = conn.execute(
+            """
+            SELECT event_id, origin_session_id, ts, raw
+            FROM events
+            WHERE rowid > ?
+              AND +origin_session_id LIKE 'codex:%'
+              AND ((+actor = 'tool' AND type = 'tool_result')
+                   OR (+actor = 'assistant' AND type = 'tool_call'))
+              AND json_valid(raw)
+              AND json_extract(raw, '$.type') IN ('event_msg', 'response_item')
+            """,
+            (min_rowid,),
+        ).fetchall()
     out = []
     for row in rows:
         sub = _submission_from_mcp(row) or _submission_from_function(row)
@@ -271,9 +323,18 @@ def read_submissions(conn: sqlite3.Connection, min_rowid: int = 0) -> list[dict]
 
 
 def _store_submissions(conn: sqlite3.Connection, subs: list[dict], *,
-                       full: bool) -> int:
+                       full: bool,
+                       replace_sender_sessions: tuple[str, ...] = ()) -> int:
     if full:
         conn.execute("DELETE FROM codex_control_submissions")
+    elif replace_sender_sessions:
+        for chunk in _session_chunks(replace_sender_sessions):
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM codex_control_submissions "
+                f"WHERE sender_session_id IN ({placeholders})",
+                chunk,
+            )
     for sub in subs:
         conn.execute(
             """
@@ -320,6 +381,8 @@ def sync(conn: sqlite3.Connection, window_sec: int = DEFAULT_WINDOW_SEC,
     watermark = _watermark(conn)
     cur_state = (float(watermark), -DERIVATION_VERSION)
     stored = _state(conn)
+    dirty = _dirty_sessions(conn)
+    dirty_sessions = tuple(session_id for session_id, _revision in dirty)
     # The watermark comparison is authoritative, so changed_hint is
     # deliberately ignored: the hint fires on any transcript growth anywhere,
     # while the watermark detects exactly the event growth extraction depends
@@ -327,15 +390,28 @@ def sync(conn: sqlite3.Connection, window_sec: int = DEFAULT_WINDOW_SEC,
     # A non-default window changes verdict semantics without changing state,
     # so it must bypass the skip; rerun with the default window (or force) to
     # restore standard verdicts afterwards.
-    if not force and window_sec == DEFAULT_WINDOW_SEC and stored == cur_state:
+    if (not force and window_sec == DEFAULT_WINDOW_SEC
+            and stored == cur_state and not dirty_sessions):
         return _empty_stats(skipped=1)
 
     full = force or stored is None or stored[1] != -DERIVATION_VERSION
     stats = _empty_stats()
     try:
         new_subs = read_submissions(conn, 0 if full else int(stored[0]))
+        if dirty_sessions and not full:
+            # A dirty row can also sit above the old watermark. Deduplicate the
+            # two extraction routes by globally unique evidence id.
+            dirty_subs = read_submissions(
+                conn, sender_session_ids=dirty_sessions,
+            )
+            new_subs = list({
+                sub["evidence_id"]: sub for sub in (*new_subs, *dirty_subs)
+            }.values())
         stats["submissions"] = len(new_subs)
-        stats["stored"] = _store_submissions(conn, new_subs, full=full)
+        stats["stored"] = _store_submissions(
+            conn, new_subs, full=full,
+            replace_sender_sessions=dirty_sessions,
+        )
         subs = _load_submissions(conn)
 
         msg_cache: dict[str, list] = {}
@@ -412,6 +488,11 @@ def sync(conn: sqlite3.Connection, window_sec: int = DEFAULT_WINDOW_SEC,
                 "INSERT OR REPLACE INTO ingest_state (path, mtime, size, session_id) "
                 "VALUES (?, ?, ?, NULL)",
                 (STATE_PATH, float(watermark), -DERIVATION_VERSION),
+            )
+            conn.executemany(
+                "DELETE FROM codex_control_dirty_sessions "
+                "WHERE session_id=? AND revision=?",
+                dirty,
             )
         else:
             # A custom window produced non-standard verdicts. Writing the normal
