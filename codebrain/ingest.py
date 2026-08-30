@@ -40,8 +40,8 @@ DEFAULT_CURSOR_ROOT = cursor_export.DEFAULT_CURSOR_ROOT
 SOURCES = ("claude", "codex", "pi", "cursor")
 STATS_KEYS = ("files", "sessions", "events", "placements", "skipped", "conflicts", "errors")
 CURSOR_ARCHIVE_VALIDATOR_VERSION = 1
-CODEX_PAGINATION_VERSION = 1
-_CODEX_PAGINATION_STATE_PREFIX = "__codebrain_codex_pagination__"
+CODEX_ADAPTER_VERSION = 2
+_CODEX_ADAPTER_STATE_PREFIX = "__codebrain_codex_adapter__"
 
 
 class _CursorHeadSuperseded(RuntimeError):
@@ -138,15 +138,15 @@ def _record_state(conn, path: Path, st, session_id: Optional[str]) -> None:
     )
 
 
-def _codex_pagination_state_path(root: Path) -> str:
-    return f"{_CODEX_PAGINATION_STATE_PREFIX}:{os.path.abspath(os.fspath(root))}"
+def _codex_adapter_state_path(root: Path) -> str:
+    return f"{_CODEX_ADAPTER_STATE_PREFIX}:{os.path.abspath(os.fspath(root))}"
 
 
-def _record_codex_pagination_state(conn, root: Path) -> None:
+def _record_codex_adapter_state(conn, root: Path) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO ingest_state(path,mtime,size,session_id) "
         "VALUES (?,0,?,NULL)",
-        (_codex_pagination_state_path(root), CODEX_PAGINATION_VERSION),
+        (_codex_adapter_state_path(root), CODEX_ADAPTER_VERSION),
     )
 
 
@@ -485,7 +485,7 @@ def ingest_source(conn: sqlite3.Connection, source: str,
     stats = _ingest(conn, units, parse_fn, enrich)
     stats["errors"] += export_errors
     if source == "codex" and not stats["errors"]:
-        _record_codex_pagination_state(
+        _record_codex_adapter_state(
             conn, Path(raw_root or DEFAULT_CODEX_ROOT),
         )
         conn.commit()
@@ -729,17 +729,15 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
                 for row in conn.execute("SELECT path, mtime, size FROM ingest_state")
             }
         codex_root = Path(raw_root or DEFAULT_CODEX_ROOT) if src == "codex" else None
-        codex_state_path = _codex_pagination_state_path(codex_root) \
+        codex_state_path = _codex_adapter_state_path(codex_root) \
             if codex_root is not None else None
         codex_migration = (
             codex_state_path is not None
-            and state.get(codex_state_path) != (0.0, CODEX_PAGINATION_VERSION)
+            and state.get(codex_state_path) != (0.0, CODEX_ADAPTER_VERSION)
         )
         changed = []
         for unit in units:
-            unit_changed = bool(
-                codex_migration and getattr(unit, "is_paginated", False)
-            )
+            unit_changed = False
             for path in _ingest_unit_paths(unit):
                 try:
                     st = path.stat()
@@ -748,6 +746,9 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
                     break
                 if state.get(str(path)) != (st.st_mtime, st.st_size):
                     unit_changed = True
+            if not unit_changed and codex_migration \
+                    and codex.rollout_group_needs_upgrade(unit):
+                unit_changed = True
             if unit_changed:
                 changed.append(unit)
         if changed:
@@ -757,9 +758,9 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
         else:
             stats = {"errors": 0}
         if codex_migration and not stats["errors"]:
-            _record_codex_pagination_state(conn, codex_root)
+            _record_codex_adapter_state(conn, codex_root)
             conn.commit()
-            state[codex_state_path] = (0.0, CODEX_PAGINATION_VERSION)
+            state[codex_state_path] = (0.0, CODEX_ADAPTER_VERSION)
     return total
 
 

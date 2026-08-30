@@ -236,6 +236,35 @@ def group_rollout_files(paths) -> list[RolloutGroup]:
     return groups
 
 
+def rollout_group_needs_upgrade(group: RolloutGroup) -> bool:
+    """Whether a pre-grouping/pre-UserMessage cache must reparse this unit.
+
+    Pagination is identified by source-generated fragment ids. Ordinary files
+    are candidates only when their JSON carries the exact structured user-item
+    shape the older adapter skipped. This one-time scanner deliberately does not
+    classify from prompt text.
+    """
+    if group.is_paginated:
+        return True
+    for path in group.paths:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict) or record.get("type") != "event_msg":
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict) \
+                        or payload.get("type") != "item_completed":
+                    continue
+                item = payload.get("item")
+                if isinstance(item, dict) and item.get("type") == "UserMessage":
+                    return True
+    return False
+
+
 def _payload(rec) -> dict:
     """Envelope payloads are always objects for the types we read; guard against
     drift so one valid-JSON record with a non-dict payload can't sink the whole file."""

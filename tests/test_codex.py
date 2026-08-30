@@ -659,7 +659,7 @@ class TestCodexPaginatedIngest(unittest.TestCase):
         self.assertGreater(legacy["conflicts"], 0)
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM ingest_state WHERE path=?",
-            (ingest._codex_pagination_state_path(self.root),),
+            (ingest._codex_adapter_state_path(self.root),),
         ).fetchone())
 
         repaired = self.refresh()
@@ -673,9 +673,62 @@ class TestCodexPaginatedIngest(unittest.TestCase):
         self.assertEqual(tuple(row), ("tool", "tool_result", "patched", eid(2)))
         marker = self.conn.execute(
             "SELECT mtime,size FROM ingest_state WHERE path=?",
-            (ingest._codex_pagination_state_path(self.root),),
+            (ingest._codex_adapter_state_path(self.root),),
         ).fetchone()
-        self.assertEqual(tuple(marker), (0.0, ingest.CODEX_PAGINATION_VERSION))
+        self.assertEqual(tuple(marker), (0.0, ingest.CODEX_ADAPTER_VERSION))
+
+    def test_upgrade_marker_reparses_unchanged_structured_user_item_file(self):
+        stat = self.first.stat()
+        ingest._record_state(self.conn, self.first, stat, None)
+        self.conn.commit()
+
+        repaired = self.refresh()
+
+        self.assertEqual((repaired["files"], repaired["errors"]), (1, 0))
+        row = self.conn.execute(
+            "SELECT text,raw FROM events WHERE event_id=?", (eid(1),)
+        ).fetchone()
+        self.assertEqual(row["text"], "first")
+        self.assertEqual(
+            json.loads(row["raw"])["payload"]["item"]["type"], "UserMessage",
+        )
+        marker = self.conn.execute(
+            "SELECT mtime,size FROM ingest_state WHERE path=?",
+            (ingest._codex_adapter_state_path(self.root),),
+        ).fetchone()
+        self.assertEqual(tuple(marker), (0.0, ingest.CODEX_ADAPTER_VERSION))
+
+    def test_upgrade_selector_does_not_treat_other_item_types_as_user(self):
+        other_root = Path(tempfile.mkdtemp()) / ".codex"
+        session_dir = other_root / "sessions" / "2026" / "01" / "01"
+        session_dir.mkdir(parents=True)
+        path = write_jsonl(
+            session_dir, f"rollout-2026-01-01T00-00-00-{UUID}.jsonl", [
+                _meta(),
+                {"type": "event_msg", "timestamp": "2026-01-01T00:00:01Z",
+                 "payload": {"type": "item_completed",
+                             "item": {"type": "AgentMessage",
+                                      "content": [{"type": "text",
+                                                   "text": "not user input"}]}}},
+            ],
+        )
+        ingest._record_state(self.conn, path, path.stat(), None)
+        self.conn.commit()
+
+        stats = ingest.refresh(
+            self.conn, sources=("codex",), machine="mini",
+            roots={"codex": other_root},
+        )
+
+        self.assertEqual(stats["files"], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE origin_session_id=?",
+            (f"codex:{UUID}",),
+        ).fetchone()[0], 0)
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM ingest_state WHERE path=?",
+            (ingest._codex_adapter_state_path(other_root),),
+        ).fetchone())
 
     def test_placement_only_refresh_invalidates_provenance(self):
         second_path = _write_rollover_successor(self.root, self.first)
