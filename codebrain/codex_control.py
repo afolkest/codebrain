@@ -38,6 +38,11 @@ FUNCTION_SEND_TOOLS = {"send_input"}
 MULTI_AGENT_V1_NAMESPACE = "multi_agent_v1"
 
 
+def invalidate(conn: sqlite3.Connection) -> None:
+    """Make the next sync fully re-extract transcript-backed submissions."""
+    conn.execute("DELETE FROM ingest_state WHERE path = ?", (STATE_PATH,))
+
+
 def _empty_stats(**extra) -> dict:
     base = {"submissions": 0, "stored": 0, "resolved": 0, "unresolved": 0,
             "master_control": 0, "unknown": 0, "skipped": 0}

@@ -197,6 +197,12 @@ def _log_state(conn: sqlite3.Connection, path: Path):
     return (row["mtime"], row["size"]) if row else None
 
 
+def invalidate(conn: sqlite3.Connection, path=None) -> None:
+    """Make the next default sync rematch transcript-dependent evidence."""
+    path = Path(path) if path else _default_log()
+    conn.execute("DELETE FROM ingest_state WHERE path = ?", (str(path),))
+
+
 def _empty_stats(**extra) -> dict:
     base = {"submissions": 0, "stored": 0, "resolved": 0, "unresolved": 0,
             "master_control": 0, "unknown": 0, "skipped": 0}

@@ -242,8 +242,9 @@ Source adapters normalize different raw shapes into that model:
 
 - Claude: `parentUuid` tree, compaction reconnection, parallel tool results,
   sidechain de-duplication.
-- Codex: flat append-only log, synthesized turn forest, rollback markers,
-  control-message provenance, apply-patch refs, sub-agent/fork lineage.
+- Codex: flat append-only fragments, structured pagination handoffs, synthesized
+  turn forest, rollback markers, control-message provenance, apply-patch refs,
+  sub-agent/fork lineage.
 - Cursor: ordered composer bubbles from an immutable safe projection, structured
   tool pairing/control provenance, copied-prefix inheritance, sub-agent lineage.
 - pi: `parentId` tree, resume/branch copied prefixes, cross-file dedup,

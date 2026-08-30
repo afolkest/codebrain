@@ -505,6 +505,163 @@ def upsert_event(conn: sqlite3.Connection, e: EventRow) -> bool:
     return True
 
 
+def reconcile_codex_events(conn: sqlite3.Connection, session_id: str,
+                           events: list[EventRow]) -> bool:
+    """Apply one paginated Codex session as authoritative source evidence.
+
+    A Desktop rollover can leave a short, superseded tail in the predecessor
+    journal. Its successor deliberately reuses those logical line coordinates,
+    so ordinary first-writer-wins event upserts would preserve the abandoned
+    content forever. For a fully validated fragment chain, same-origin rows may
+    therefore be revised and no-longer-emitted rows may be removed.
+
+    The authority is narrowly scoped: every incoming id and existing row must
+    belong to ``session_id``. Any placement/reference from another session makes
+    the rewrite fail closed instead of changing evidence visible elsewhere.
+    Returns whether canonical event rows changed.
+    """
+    prefix = f"{session_id}:"
+    desired: dict[str, EventRow] = {}
+    for event in events:
+        if event.origin_session_id != session_id \
+                or not event.event_id.startswith(prefix):
+            raise ValueError(
+                f"paginated Codex event {event.event_id} is outside {session_id}"
+            )
+        if event.event_id in desired:
+            raise ValueError(f"duplicate paginated Codex event id {event.event_id}")
+        desired[event.event_id] = event
+
+    columns = (
+        "event_id, origin_session_id, ts, actor, type, text, refs, "
+        "tool_call_event_id, raw"
+    )
+    # Both reads stay indexed on very large caches. OR-ing the origin lookup
+    # with an event-id prefix probe makes SQLite choose a full events scan; this
+    # reconciliation runs under BEGIN IMMEDIATE, so that would hold the writer
+    # lock for minutes. Fetch owned rows through ix_ev_origin, then probe only
+    # incoming ids through the primary key in bounded batches.
+    existing = {
+        row["event_id"]: row
+        for row in conn.execute(
+            f"SELECT {columns} FROM events WHERE origin_session_id=?",
+            (session_id,),
+        )
+    }
+    for chunk in _id_chunks(desired):
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+                f"SELECT {columns} FROM events "
+                f"WHERE event_id IN ({placeholders})", chunk):
+            existing[row["event_id"]] = row
+    for event_id in desired:
+        row = existing.get(event_id)
+        if row is not None and row["origin_session_id"] not in (None, session_id):
+            raise ValueError(
+                f"paginated Codex id {event_id} is authored by "
+                f"{row['origin_session_id']}"
+            )
+
+    stale = {
+        event_id for event_id, row in existing.items()
+        if row["origin_session_id"] == session_id and event_id not in desired
+    }
+    revised = {
+        event_id for event_id, event in desired.items()
+        if event_id in existing
+        and not _stored_event_matches(existing[event_id], event)
+    }
+    unsafe = stale | revised
+    if unsafe:
+        _reject_foreign_codex_references(conn, session_id, unsafe)
+        _delete_id_chunks(
+            conn,
+            "DELETE FROM event_origins WHERE session_id=? AND event_id IN ({})",
+            unsafe, (session_id,),
+        )
+        _delete_id_chunks(
+            conn,
+            "DELETE FROM event_origin_evidence "
+            "WHERE session_id=? AND event_id IN ({})",
+            unsafe, (session_id,),
+        )
+
+    for event in events:
+        _store_event(conn, event, existing.get(event.event_id))
+
+    if stale:
+        _delete_id_chunks(
+            conn,
+            "DELETE FROM session_events WHERE session_id=? AND event_id IN ({})",
+            stale, (session_id,),
+        )
+        _delete_id_chunks(conn, "DELETE FROM file_refs WHERE event_id IN ({})", stale)
+        _delete_id_chunks(
+            conn,
+            "DELETE FROM events WHERE origin_session_id=? AND event_id IN ({})",
+            stale, (session_id,),
+        )
+    return bool(stale or revised or set(desired) - set(existing))
+
+
+def _id_chunks(event_ids, size: int = 400):
+    ordered = sorted(event_ids)
+    for start in range(0, len(ordered), size):
+        yield ordered[start:start + size]
+
+
+def _delete_id_chunks(conn: sqlite3.Connection, template: str, event_ids,
+                      leading=()) -> None:
+    for chunk in _id_chunks(event_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(template.format(placeholders), (*leading, *chunk))
+
+
+def _reject_foreign_codex_references(conn: sqlite3.Connection, session_id: str,
+                                     event_ids) -> None:
+    """Refuse authoritative rewrites with cross-session dependants.
+
+    ``events.tool_call_event_id`` deliberately has no global index (normal
+    queries resolve pairing from an already-selected event). Put the whole
+    unsafe set in one indexed temp table so that migration performs at most one
+    scan of any dependency table, rather than one 22GB events scan per id chunk.
+    """
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _codex_unsafe_event_ids "
+        "(event_id TEXT PRIMARY KEY) WITHOUT ROWID"
+    )
+    conn.execute("DELETE FROM _codex_unsafe_event_ids")
+    conn.executemany(
+        "INSERT INTO _codex_unsafe_event_ids(event_id) VALUES (?)",
+        [(event_id,) for event_id in event_ids],
+    )
+    checks = (
+        ("session placement", "session_events", "event_id", "session_id"),
+        ("session parent", "session_events", "parent_event_id", "session_id"),
+        ("origin verdict", "event_origins", "event_id", "session_id"),
+        ("origin evidence", "event_origin_evidence", "event_id", "session_id"),
+        ("tool result", "events", "tool_call_event_id", "origin_session_id"),
+        ("session tip", "sessions", "tip_event_id", "session_id"),
+        ("session spawn", "sessions", "spawn_event_id", "session_id"),
+        ("session branch", "sessions", "branch_point_event_id", "session_id"),
+    )
+    try:
+        for label, table, column, owner_column in checks:
+            row = conn.execute(
+                f"SELECT 1 FROM {table} AS dependency "
+                f"JOIN _codex_unsafe_event_ids AS unsafe "
+                f"ON unsafe.event_id=dependency.{column} "
+                f"WHERE dependency.{owner_column} IS NOT ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is not None:
+                raise ValueError(
+                    f"paginated Codex rewrite has a foreign {label} reference"
+                )
+    finally:
+        conn.execute("DELETE FROM _codex_unsafe_event_ids")
+
+
 def upsert_cursor_event(conn: sqlite3.Connection, e: EventRow) -> bool:
     """Apply Cursor's origin-authoritative event merge contract.
 

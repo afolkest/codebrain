@@ -19,10 +19,11 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
-from codebrain import cursor_archive, cursor_export
+from codebrain import bmux, codex_control, cursor_archive, cursor_export
 from codebrain.adapters import claude, codex, cursor, pi
 from codebrain.db import (
     cursor_head_is_newer,
+    reconcile_codex_events,
     record_cursor_head,
     upsert_cursor_event,
     upsert_event,
@@ -39,6 +40,8 @@ DEFAULT_CURSOR_ROOT = cursor_export.DEFAULT_CURSOR_ROOT
 SOURCES = ("claude", "codex", "pi", "cursor")
 STATS_KEYS = ("files", "sessions", "events", "placements", "skipped", "conflicts", "errors")
 CURSOR_ARCHIVE_VALIDATOR_VERSION = 1
+CODEX_PAGINATION_VERSION = 1
+_CODEX_PAGINATION_STATE_PREFIX = "__codebrain_codex_pagination__"
 
 
 class _CursorHeadSuperseded(RuntimeError):
@@ -135,34 +138,63 @@ def _record_state(conn, path: Path, st, session_id: Optional[str]) -> None:
     )
 
 
+def _codex_pagination_state_path(root: Path) -> str:
+    return f"{_CODEX_PAGINATION_STATE_PREFIX}:{os.path.abspath(os.fspath(root))}"
+
+
+def _record_codex_pagination_state(conn, root: Path) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO ingest_state(path,mtime,size,session_id) "
+        "VALUES (?,0,?,NULL)",
+        (_codex_pagination_state_path(root), CODEX_PAGINATION_VERSION),
+    )
+
+
+def _ingest_unit_paths(unit) -> tuple[Path, ...]:
+    paths = getattr(unit, "paths", None)
+    if paths is None:
+        return (Path(unit),)
+    return tuple(Path(path) for path in paths)
+
+
+def _ingest_unit_name(unit) -> str:
+    name = getattr(unit, "name", None)
+    return str(name) if name is not None else Path(unit).name
+
+
 def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
             processed_paths: Optional[set[Path]] = None) -> dict:
     stats = {"files": 0, "sessions": 0, "events": 0, "placements": 0,
              "skipped": 0, "conflicts": 0, "errors": 0}
-    for path in files:
-        stats["files"] += 1
+    for unit in files:
+        paths = _ingest_unit_paths(unit)
+        label = _ingest_unit_name(unit)
+        stats["files"] += len(paths)
+        states = {}
         try:
             # Stat BEFORE parsing: if the file grows mid-parse, the recorded state
             # is already stale and the next refresh re-parses it. Never the reverse.
-            st = path.stat()
+            states = {path: path.stat() for path in paths}
         except OSError:
             continue  # vanished between discovery and now; retried next run
         try:
-            parsed = parse_fn(path)
+            parsed = parse_fn(unit)
         except Exception as exc:  # noqa: BLE001 — one bad file shouldn't sink the run
-            print(f"  ! parse error {path.name}: {exc}")
+            print(f"  ! parse error {label}: {exc}")
             stats["errors"] += 1
-            _record_state(conn, path, st, None)  # don't re-error every refresh; a
-            conn.commit()                        # changed file is retried anyway
+            for path, st in states.items():
+                _record_state(conn, path, st, None)  # don't re-error every refresh; a
+            conn.commit()                           # changed file is retried anyway
             if processed_paths is not None:
-                processed_paths.add(path)
+                processed_paths.update(paths)
             continue
         if parsed is None:
             stats["skipped"] += 1  # contentless file (empty / no emittable events)
-            _record_state(conn, path, st, None)
+            for path, st in states.items():
+                _record_state(conn, path, st, None)
             conn.commit()
             if processed_paths is not None:
-                processed_paths.add(path)
+                processed_paths.update(paths)
             continue
         conflicts = 0
         try:
@@ -177,6 +209,10 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
             if not conn.in_transaction:
                 conn.execute("BEGIN IMMEDIATE")
             is_cursor = parsed.session.source == "cursor"
+            is_paginated_codex = (
+                parsed.session.source == "codex"
+                and bool(getattr(unit, "is_paginated", False))
+            )
             if is_cursor:
                 if parsed.source_head is None:
                     raise ValueError("Cursor archive parse has no validated source head")
@@ -186,24 +222,35 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
                     # is missing or corrupt, and pool roots can arrive out of order.
                     # Record that this file was handled, but never regress canonical
                     # data below the greatest accepted source rank.
-                    _record_state(conn, path, st, parsed.session.session_id)
+                    for path, st in states.items():
+                        _record_state(conn, path, st, parsed.session.session_id)
                     conn.commit()
                     stats["skipped"] += 1
                     if processed_paths is not None:
-                        processed_paths.add(path)
+                        processed_paths.update(paths)
                     continue
             upsert_session(conn, parsed.session)
             skipped: set = set()
-            for e in parsed.events:
-                accepted = upsert_cursor_event(conn, e) if is_cursor \
-                    else upsert_event(conn, e)
-                if not accepted:  # copy-consistency conflict (SCHEMA.md)
-                    conflicts += 1
-                    skipped.add(e.event_id)
-                    print(
-                        f"  ~ conflict {path.name}: kept authoritative content "
-                        f"for {e.event_id}"
-                    )
+            if is_paginated_codex:
+                reconcile_codex_events(
+                    conn, parsed.session.session_id, parsed.events,
+                )
+                # Both overlays depend on placement/live state as well as event
+                # rows. A rollover can revise either below their watermarks, so
+                # every processed paginated unit invalidates both derivations.
+                bmux.invalidate(conn)
+                codex_control.invalidate(conn)
+            else:
+                for e in parsed.events:
+                    accepted = upsert_cursor_event(conn, e) if is_cursor \
+                        else upsert_event(conn, e)
+                    if not accepted:  # copy-consistency conflict (SCHEMA.md)
+                        conflicts += 1
+                        skipped.add(e.event_id)
+                        print(
+                            f"  ~ conflict {label}: kept authoritative content "
+                            f"for {e.event_id}"
+                        )
             # A re-parse is authoritative for this session's placements: the DB
             # must end up exactly matching the parse (no stale placement survives
             # a rewritten/shrunk file). But write only the difference — a grown
@@ -230,7 +277,8 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
                                                 p.live, p.inherited):
                     continue
                 upsert_placement(conn, p)
-            _record_state(conn, path, st, parsed.session.session_id)
+            for path, st in states.items():
+                _record_state(conn, path, st, parsed.session.session_id)
             if is_cursor and not record_cursor_head(
                     conn, parsed.session.session_id, parsed.source_head):
                 raise _CursorHeadSuperseded
@@ -242,10 +290,10 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
             conn.rollback()
             stats["skipped"] += 1
             if processed_paths is not None:
-                processed_paths.add(path)
+                processed_paths.update(paths)
             continue
         except Exception as exc:  # noqa: BLE001 — a genuine DB error isolates one file
-            print(f"  ! write error {path.name}: {exc}")
+            print(f"  ! write error {label}: {exc}")
             stats["errors"] += 1
             conn.rollback()
             continue
@@ -254,7 +302,7 @@ def _ingest(conn, files, parse_fn: Callable, enrich: Optional[Callable] = None,
         stats["placements"] += len(parsed.placements)
         stats["conflicts"] += conflicts
         if processed_paths is not None:
-            processed_paths.add(path)
+            processed_paths.update(paths)
     return stats
 
 
@@ -394,7 +442,11 @@ def refresh_pool(conn: sqlite3.Connection, pool_root: Path, sources=SOURCES, mac
 
 
 def _source_jobs(source: str, machine: Optional[str], raw_root: Optional[Path] = None):
-    """(files, parse_fn, enrich) for one source — shared by full ingest and refresh."""
+    """(units, parse_fn, enrich) for one source — shared by ingest and refresh.
+
+    Most units are one physical file. Codex units are logical rollout groups so
+    paginated journal fragments are parsed and authoritatively placed together.
+    """
     machine = _machine_for_root(source, raw_root, machine)
     if source == "claude":
         root = raw_root or DEFAULT_CLAUDE_ROOT
@@ -403,14 +455,15 @@ def _source_jobs(source: str, machine: Optional[str], raw_root: Optional[Path] =
     if source == "codex":
         root = raw_root or DEFAULT_CODEX_ROOT
         titles = _load_codex_titles(root)
+        groups = codex.group_rollout_files(discover_codex_files(root))
 
         def enrich(parsed):
             uuid = parsed.session.session_id.split(":", 1)[-1]
             if uuid in titles:
                 parsed.session.title = titles[uuid]
 
-        return (discover_codex_files(root),
-                lambda p: codex.parse_file(p, machine=machine), enrich)
+        return (groups,
+                lambda group: codex.parse_rollout_group(group, machine=machine), enrich)
     if source == "pi":
         root = raw_root or DEFAULT_PI_ROOT
         return (discover_pi_files(root),
@@ -428,9 +481,14 @@ def ingest_source(conn: sqlite3.Connection, source: str,
     if source == "cursor" and raw_root is None:
         raw_root, export_stats = export_local_cursor_archive()
         export_errors = export_stats["errors"]
-    files, parse_fn, enrich = _source_jobs(source, machine, raw_root)
-    stats = _ingest(conn, files, parse_fn, enrich)
+    units, parse_fn, enrich = _source_jobs(source, machine, raw_root)
+    stats = _ingest(conn, units, parse_fn, enrich)
     stats["errors"] += export_errors
+    if source == "codex" and not stats["errors"]:
+        _record_codex_pagination_state(
+            conn, Path(raw_root or DEFAULT_CODEX_ROOT),
+        )
+        conn.commit()
     return stats
 
 
@@ -664,24 +722,44 @@ def refresh(conn: sqlite3.Connection, sources=SOURCES, machine: Optional[str] = 
             for key, value in stats.items():
                 total[key] += value
             continue
-        files, parse_fn, enrich = _source_jobs(src, machine, raw_root)
+        units, parse_fn, enrich = _source_jobs(src, machine, raw_root)
         if state is None:
             state = {
                 row["path"]: (row["mtime"], row["size"])
                 for row in conn.execute("SELECT path, mtime, size FROM ingest_state")
             }
+        codex_root = Path(raw_root or DEFAULT_CODEX_ROOT) if src == "codex" else None
+        codex_state_path = _codex_pagination_state_path(codex_root) \
+            if codex_root is not None else None
+        codex_migration = (
+            codex_state_path is not None
+            and state.get(codex_state_path) != (0.0, CODEX_PAGINATION_VERSION)
+        )
         changed = []
-        for f in files:
-            try:
-                st = f.stat()
-            except OSError:
-                continue
-            if state.get(str(f)) != (st.st_mtime, st.st_size):
-                changed.append(f)
+        for unit in units:
+            unit_changed = bool(
+                codex_migration and getattr(unit, "is_paginated", False)
+            )
+            for path in _ingest_unit_paths(unit):
+                try:
+                    st = path.stat()
+                except OSError:
+                    unit_changed = False
+                    break
+                if state.get(str(path)) != (st.st_mtime, st.st_size):
+                    unit_changed = True
+            if unit_changed:
+                changed.append(unit)
         if changed:
             stats = _ingest(conn, changed, parse_fn, enrich)
             for k, v in stats.items():
                 total[k] += v
+        else:
+            stats = {"errors": 0}
+        if codex_migration and not stats["errors"]:
+            _record_codex_pagination_state(conn, codex_root)
+            conn.commit()
+            state[codex_state_path] = (0.0, CODEX_PAGINATION_VERSION)
     return total
 
 

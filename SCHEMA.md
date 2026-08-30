@@ -94,7 +94,7 @@ All ids are `<source>:`-prefixed (globally unique across sources, self-describin
 | | `session_id` | `event_id` |
 |---|---|---|
 | **Claude** | `claude:<sessionUuid>` | `claude:<uuid>` (already globally unique) |
-| **Codex** | `codex:<sessionUuid>` | `codex:<sessionUuid>:<lineIndex>` (file is append-only, never copied across files) |
+| **Codex** | `codex:<sessionUuid>` | `codex:<sessionUuid>:<lineIndex>` (root physical line, then synthetic physical-line continuation across structured pagination cuts) |
 | **Cursor** | `cursor:<composerId>` | Timestamped: `cursor:<escapedBubbleId>:<epochMs>:<kind>`; untimed legacy: `cursor:<escapedComposerId>:<escapedBubbleId>:untimed:<kind>` |
 | **pi** | `pi:<sessionUuid>` | `pi:<8hex>:<ts>` (+ block discriminator below) |
 
@@ -126,6 +126,13 @@ inherited. Components are percent-escaped before joining.
   row, and skip just that placement. Two distinct non-null
   `origin_session_id` values are always a hard conflict, even if their content
   matches.
+- **Codex pagination authority**: after validating one complete, unbranched
+  fragment chain from structured filename ids, `session_meta.id`,
+  `history_base`, ordinals, and exact byte-prefix cuts, its grouped parse may
+  replace or remove same-origin tail events. The successor structurally
+  supersedes the predecessor's uncommitted suffix and can reuse those logical
+  line coordinates. Any cross-session placement or reference makes the rewrite
+  fail closed.
 - **Cursor revision authority**: a validated Cursor head carries the total rank
   `(revision, snapshotDigest)`. `cursor_session_heads` records the greatest rank
   accepted for each canonical session in the same transaction as its session,
@@ -140,7 +147,7 @@ inherited. Components are percent-escaped before joining.
   do not include a payload or revision hash.
 - **No content-hashing for identity** (two identical `ls` calls are distinct). Content hashing belongs to the derivations cache, not here.
 - **Refresh-on-read (delta ingest)**: the internal `ingest_state` table (NOT part of the canonical model — bookkeeping, rebuildable) records each raw file's `(mtime, size)` at last parse. Cursor additionally uses root-scoped `cursor_archive_heads` rows: a no-follow metadata signature per hashed session directory, its validated selected head, and the last selection deliberately handled by ingest. An unchanged directory opens no revision JSON; a changed directory revalidates only its own chain. Selection and handled state remain separate so out-of-order predecessors, corruption fallback, and failed writes retry correctly. Both tables are disposable cache state. `refresh()` runs in front of every CLI read; full `ingest` remains the first-build / disaster-recovery pass.
-- **Re-parse is authoritative for placements**: re-ingesting a file *replaces* that session's `session_events` rows (delete-then-insert) — `seq`/`live`/`parent` are whole-session properties, so a grown file (e.g. a rollback appended later) must be able to flip earlier placements. `events` rows are never deleted: upstream file deletion never deletes from the archive.
+- **Re-parse is authoritative for placements**: re-ingesting a file *replaces* that session's `session_events` rows (delete-then-insert) — `seq`/`live`/`parent` are whole-session properties, so a grown file (e.g. a rollback appended later) must be able to flip earlier placements. Ordinarily, `events` rows are never deleted when an upstream file disappears. The structured Codex pagination exception above may atomically remove same-origin events from a superseded handoff tail while retaining every raw file as evidence.
 - **FTS**: `events_fts` is an external-content FTS5 index kept current by triggers on `events` — incremental by construction; `rebuild_fts` exists only as repair.
 
 ## Per-event normalization
@@ -203,7 +210,10 @@ Per source (mechanics in the format docs):
 ## Sessions: lineage & sub-agents
 
 - **pi resume/branch** → new `sessions` row; `parent_session_id` from the `parentSession` **filename uuid** (immediate parent; that's all that's needed); `relation=resume|branch`; `branch_point_event_id` = last inherited event. Inherited events get `session_events` rows here (`inherited=1`); they dedup to the shared `events` row owned by the ancestor.
-- **Codex resume** → same file/same id → no new row; events continue.
+- **Codex resume** → usually same file/same id; events continue. A structured
+  Desktop pagination handoff keeps the same session id across physical fragments,
+  cuts the predecessor at `history_base.end_byte_offset`, and continues the
+  synthetic line coordinate in the successor.
 - **Sub-agents (all sources)** → own `sessions` row, `relation=subagent`, `parent_session_id`=spawner, `spawn_event_id`=launching `tool_call`:
   - Claude `<sessionId>/subagents/agent-<hash>.jsonl` ↔ parent `Task` tool_use. Sub-agent records carry the *parent's* sessionId, so mint `session_id = claude:<parentUuid>:sub:<hash>` from the `agent-<hash>` filename. **Ignore the inline `isSidechain:true` copies in the parent file** — the same records (same uuid) live in the sub-agent file, their canonical home; placing the inline copies would wrongly graft them into the parent transcript. (Event-id dedup is the backstop if both are ingested anyway.)
   - Codex separate rollout ↔ `forked_from_id` / `spawn_agent` `agent_id`.

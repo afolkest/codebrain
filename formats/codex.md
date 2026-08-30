@@ -1,11 +1,14 @@
 # Format notes — Codex
 
-Reverse-engineered from real logs on this machine (`~/.codex`), spanning **2025-09 → 2026-06** (cli `0.x`, latest observed `0.137.0-alpha.4`). Empirical, not spec — and it **drifts hard across versions** (see the timeline; it is the headline of this doc). Read alongside `claude.md`: the two formats are structurally opposite — Claude is a `uuid` tree, Codex is a flat append-only log with explicit event markers.
+Reverse-engineered from real logs on this machine (`~/.codex`), spanning **2025-09 → 2026-08** (cli `0.x`, latest observed `0.151.0`). Empirical, not spec — and it **drifts hard across versions** (see the timeline; it is the headline of this doc). Read alongside `claude.md`: the two formats are structurally opposite — Claude is a `uuid` tree, Codex is a flat append-only log with explicit event markers.
 
 ## Location & layout
 
 - Transcripts: `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<localTs>-<sessionId>.jsonl`
-  - One flat JSONL file per session. **No sibling dirs, no tree** — a session is exactly one file.
+  - Older/unpaginated sessions use one flat JSONL file. Newer Codex Desktop can
+    continue the same logical session in
+    `rollout-<localTs>-<sessionId>_<fragmentId>.jsonl`; see Pagination below.
+    There is still no source parent tree inside a fragment.
   - `<localTs>` in the filename is **local time** (e.g. `16-33-14`); the `timestamp` inside records is **UTC** (`…Z`). The date-tree dirs are local-date. Don't derive UTC from the filename.
   - `<sessionId>` is a **UUIDv7** (sortable, embeds creation time). Equals `session_meta.id`; the join key into `history.jsonl` / `session_index.jsonl`.
 - `~/.codex/archived_sessions/` — flat dir of the **same** `rollout-*.jsonl` format (archived/aged-out threads). The collector must capture this too.
@@ -18,8 +21,9 @@ Reverse-engineered from real logs on this machine (`~/.codex`), spanning **2025-
 
 A *single tool* changed its log schema repeatedly over 9 months. The adapter **must branch on version** — detect by field presence (robust) and/or `session_meta.cli_version`. Observed transitions (single-file monthly samples, so month boundaries are approximate):
 
-| concern | 2025-09 → 2025-10 | 2025-11 → 2026-03 | 2026-04 → 2026-06 (current) |
+| concern | 2025-09 → 2025-10 | 2025-11 → 2026-03 | 2026-04 → 2026-08 (current) |
 |---|---|---|---|
+| **clean user prompt** | `event_msg.user_message` | `event_msg.user_message` | Field-presence split: `event_msg.user_message`, or `event_msg.item_completed` with `item.type=UserMessage` in paginated/TUI logs (observed as early as cli 0.147.0) |
 | **reasoning text** | **readable** (`agent_reasoning` events + `reasoning.summary[].text`) | **readable** (same) | **encrypted only** — `summary:[]`, `content:null`, opaque `encrypted_content` |
 | **shell/exec tool** | `shell` | `shell` → `shell_command` (≈2025-12) → `exec_command` (≈2026-02) | `exec_command` |
 | **structured edits** | none — edits go through `shell` | `apply_patch` custom_tool_call (from 2025-11) | `apply_patch` |
@@ -29,7 +33,7 @@ A *single tool* changed its log schema repeatedly over 9 months. The adapter **m
 
 Stable across all versions: the `{type,timestamp,payload}` envelope; `session_meta`/`turn_context`/`response_item`/`event_msg`/`compacted` partition; `function_call`↔`function_call_output` pairing by `call_id`; `turn_aborted`; `compacted`; `update_plan`.
 
-**Correction (verified against 0.39, 2025-09):** `task_started`/`task_complete` are **not** universal — the earliest logs have neither (and no `thread_rolled_back` either). So an adapter must **not** anchor turns on `task_started`. The codebrain adapter instead anchors a turn on the clean `event_msg.user_message`, which is present in every version; `thread_rolled_back{n}` (when present) pops the last `n` of those user-turns.
+**Correction (verified against 0.39, 2025-09 and paginated/TUI logs from 0.147.0 onward):** `task_started`/`task_complete` are **not** universal — the earliest logs have neither (and no `thread_rolled_back` either). So an adapter must **not** anchor turns on `task_started`. The codebrain adapter instead anchors a turn on the clean structured user item: `event_msg.user_message`, or `event_msg.item_completed` with `item.type=UserMessage`. This is a field-presence distinction, not a cli-version cutoff: later legacy/guardian logs can retain `user_message`. `thread_rolled_back{n}` (when present) pops the last `n` of those user-turns.
 
 ## The file is a flat append-only event log (no uuid tree)
 
@@ -101,6 +105,7 @@ Tool pairing is by **`call_id`** (Codex's analog of Claude's `tool_use_id`) — 
 | `payload.type` | shape / use |
 |---|---|
 | `user_message` | **the clean human prompt**: `{message, images, local_images, text_elements}`. Use this, not the bloated `response_item` user message. |
+| `item_completed` | Completed UI items in paginated/TUI logs (observed as early as cli 0.147.0). A clean human prompt is `item.type="UserMessage"` with `item.content[]` text blocks; other item types include `AgentMessage`, `Reasoning`, and `CommandExecution`. Classify by the structured item type, not version or text. |
 | `agent_message` | streamed assistant text: `{message, phase: commentary\|final, memory_citation}`. `commentary`=interim, `final`=answer. |
 | `agent_reasoning` | **(old only, ≤2026-03)** readable reasoning: `{text}` (markdown summary headers). Gone in current versions. |
 | `task_started` | turn start: `{turn_id, started_at (unix), model_context_window, collaboration_mode_kind}`. |
@@ -115,7 +120,7 @@ Tool pairing is by **`call_id`** (Codex's analog of Claude's `tool_use_id`) — 
 
 ## Turn structure
 
-A turn is bracketed by `task_started{turn_id}` … `task_complete{turn_id}` (or `turn_aborted{turn_id}`). The same `turn_id` tags `turn_context` and `patch_apply_end`. Human turns have exactly one clean `user_message`; native inter-agent messages start non-human/userless turns. Within a turn, the `response_item`s are the model-facing sequence; the `event_msg`s interleave the clean prompt, streamed text, usage, and tool/patch/turn events.
+A turn is bracketed by `task_started{turn_id}` … `task_complete{turn_id}` (or `turn_aborted{turn_id}`). The same `turn_id` tags `turn_context` and `patch_apply_end`. Human turns have exactly one clean structured user item (`user_message`, or `item_completed → UserMessage`); native inter-agent messages start non-human/userless turns. Within a turn, the `response_item`s are the model-facing sequence; the `event_msg`s interleave the clean prompt, streamed text, usage, and tool/patch/turn events.
 
 ## Rollback — in-file, append-only, explicit marker (semantics verified)
 
@@ -125,11 +130,35 @@ No tree; a rewind is an `event_msg` `thread_rolled_back {num_turns:N}` appended 
 
 So **`num_turns` counts live turns popped from the current tip** (usually human-prompt turns; native inter-agent records also start non-human turns), and **rollbacks stack** (an `n=2` operates on the tip left by an earlier rollback, not on physical line position). The popped turns remain physically above the marker — abandoned, but retained.
 
-**Reconstruction:** maintain a stack of turns while replaying in file order; each clean `event_msg.user_message` pushes a human turn, and each `response_item.agent_message` or top-level `inter_agent_communication` pushes a non-human/userless turn; each `thread_rolled_back{n}` pops the last `n`. Final stack = canonical conversation; popped turns = full-history-only. (Linear-log equivalent of excluding Claude's abandoned rollback subtree.)
+**Reconstruction:** maintain a stack of turns while replaying in file order; each clean structured `event_msg` user item pushes a human turn, and each `response_item.agent_message` or top-level `inter_agent_communication` pushes a non-human/userless turn; each `thread_rolled_back{n}` pops the last `n`. Final stack = canonical conversation; popped turns = full-history-only. (Linear-log equivalent of excluding Claude's abandoned rollback subtree.)
 
 ## Resume — same file, same id, re-emitted header
 
-A resumed thread **appends to the same `sessionId.jsonl`** and re-emits `session_meta` (identical `id` + original `timestamp`) plus the developer/environment preamble. Observed: one file with **24 identical `session_meta`** = 23 resumes. One file = one session = one id; resumes are in-file markers, and the repeated preamble is re-injected context (tag synthetic). No dedup needed.
+A resumed nonpaginated thread **appends to the same `sessionId.jsonl`** and re-emits `session_meta` (identical `id` + original `timestamp`) plus the developer/environment preamble. Observed: one file with **24 identical `session_meta`** = 23 resumes. Those resumes are in-file markers, and the repeated preamble is re-injected context (tag synthetic). No dedup needed; a physical pagination handoff is the distinct case below.
+
+## Pagination — structured committed-prefix handoff
+
+Newer Codex Desktop can paginate one logical thread across a root rollout and
+one or more composite-name successor files. `session_meta.id` remains the stable
+logical session id. The composite filename's second UUID is the current physical
+fragment id, while `session_meta.history_base` names the predecessor fragment in
+`thread_id` and carries `end_ordinal_exclusive` plus `end_byte_offset`.
+
+The byte offset is the authoritative committed-prefix boundary. A predecessor
+can retain several records beyond it from an aborted handoff; the successor
+replays that work, so the predecessor tail is raw evidence but not part of the
+canonical transcript. Validate a single, unbranched fragment chain using these
+structured fields and exact byte-prefix copies. A single-UUID file whose
+`history_base.thread_id` belongs to another session is a new fork/root, not a
+same-session continuation.
+
+Canonical event ids use one synthetic physical-line coordinate: root-file line
+numbers are preserved, and each successor starts after the predecessor's
+committed physical-line count. Source `ordinal` validates ordering and fragment
+boundaries, but is not itself the event id: observed control records can share an
+ordinal. On rollover, the validated grouped parse is authoritative for that
+session's same-origin events and placements, allowing reused tail coordinates to
+replace the superseded predecessor records.
 
 ## Compaction — append-only, full history retained
 
@@ -173,8 +202,12 @@ Three sources, in order of universality:
 
 ## Dedup & canonical-source rules
 
-- **No raw-record dedup needed anywhere** (cleaner than Claude): sub-agents are separate files (not inlined), forks inject summaries (not records), resume is in-file (one file, one id).
-- **The one duplication is in-file**: `response_item` (model truth) vs `event_msg` (UI truth). Rule: backbone = `response_item` sequence; clean human prompt = `event_msg.user_message.message`; assistant text = `response_item.message` with `role=assistant`; final answer also appears in streamed `event_msg.agent_message`/`task_complete.last_agent_message` and must not be double-counted.
+- **No content-based raw-record dedup**: sub-agents are separate files (not
+  inlined), forks inject summaries, and resume is in-file. Paginated physical
+  fragments are instead composed by the structured `history_base` committed
+  prefix; exact archived prefix copies of a fragment collapse to the longest
+  append-authoritative copy.
+- **The one duplication is in-file**: `response_item` (model truth) vs `event_msg` (UI truth). Rule: backbone = `response_item` sequence; clean human prompt = the structured `event_msg` user item (`user_message.message`, or `item_completed.item.content[]` when `item.type=UserMessage`); assistant text = `response_item.message` with `role=assistant`; final answer also appears in streamed `event_msg.agent_message`/`task_complete.last_agent_message` and must not be double-counted.
 
 ## Mapping → canonical envelope
 
@@ -185,10 +218,10 @@ Three sources, in order of universality:
 | lineage | `forked_from_id`; `agent_role`+`agent_nickname` (sub-agent); parent's `spawn_agent` output `agent_id` |
 | `actor` | `message.role` (developer→system/synthetic, user, assistant); tool_result→tool |
 | `type` message/tool_call/tool_result | response_item: message→message, function_call/custom_tool_call→tool_call, *_output→tool_result, reasoning→message(synthetic; text only if old) |
-| message text (human) | `event_msg.user_message.message` (clean) — not the bloated `response_item` user message |
+| message text (human) | clean structured `event_msg` user item: `user_message.message`, or `item_completed.item.content[].text` when `item.type=UserMessage` — not the bloated `response_item` user message |
 | message text (assistant) | `response_item.message` with `role=assistant`; streamed `event_msg.agent_message` and `task_complete.last_agent_message` are duplicate UI/final-answer views |
 | reasoning text | old: `agent_reasoning.text` / `reasoning.summary[].text`; current: none (encrypted) |
-| `seq` | file/line order, after applying rollback popping + compaction handling |
+| `seq` | logical fragment/line order after structured pagination cuts, rollback popping, and compaction handling |
 | `ts` | record `timestamp` (UTC) |
 | `refs.files` | parse `apply_patch` `input` (`*** Add/Update/Delete File:`); enrich via `patch_apply_end.changes` |
 | `refs.commands` | `function_call` `shell`/`shell_command`/`exec_command` → `arguments.command`/`.cmd` |
@@ -200,6 +233,9 @@ Three sources, in order of universality:
 - **Reasoning unreadable in current versions** (encrypted); readable only ≤2026-03.
 - **Files-touched is weakest for old/shell-heavy sessions**; `patch_apply_end` is newer and not guaranteed — prefer parsing the `apply_patch` envelope.
 - **Two parallel views in-file** — canonical-source-per-field or double-count.
+- **Paginated handoffs can supersede a predecessor tail** — compose fragments by
+  `history_base` and exact byte offsets; do not ingest composite rollout files as
+  independent sessions.
 - Classify by parsed JSON fields, **never raw substring grep** (same self-contamination caution as `claude.md`; `rg -l` is fine for *locating* candidate files, but confirm structurally).
 
 ## Resolved / still open
