@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Optional
 
 from codebrain import cursor_archive
+from codebrain import claude_roots
 from codebrain.ingest import (
     DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_CURSOR_ROOT, DEFAULT_PI_ROOT,
     SOURCES, export_local_cursor_archive,
@@ -132,6 +133,14 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
              "errors": export_errors}
     if source == "cursor":
         return _collect_cursor_revisions(root, Path(pool_root), machine, stats)
+    roots = claude_roots.local_roots(root) if source == "claude" and raw_root is None else [root]
+    for index, home in enumerate(roots):
+        destination = dest_root if index == 0 else dest_root / "profiles" / claude_roots.archive_key(home)
+        _collect_files(source, home, destination, stats)
+    return stats
+
+
+def _collect_files(source: str, root: Path, dest_root: Path, stats: dict) -> None:
     if dest_root.is_dir():
         _prune_stale_parts(dest_root)
     for f in discover(source, root):
@@ -174,7 +183,6 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
             tmp.unlink(missing_ok=True)
             continue
         stats["new" if dst_st is None else "updated"] += 1
-    return stats
 
 
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \

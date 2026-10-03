@@ -221,6 +221,23 @@ sessdb backfill-claude ~/claude-restore --dry-run
 sessdb backfill-claude ~/claude-restore
 ```
 
+## Additional Claude accounts
+
+To collect and search another Claude home alongside `~/.claude`, create
+`~/.codebrain/claude-roots.json` containing an array of extra home paths:
+
+```json
+["~/.claude-personal"]
+```
+
+The existing sweep and refresh-on-read use these homes automatically. Run
+`sessdb sweep --source claude` once to collect and index existing sessions.
+Extra homes use separate `profiles/<key>/` directories inside the machine's
+Claude pool, so account files cannot overwrite each other. Synced machines
+need this version of codebrain to discover that layout. Explicit `--raw-root`
+imports still read only the supplied root. Credentials and settings are not
+collected.
+
 ## Model
 
 The normalized DB has one content table and one placement table:

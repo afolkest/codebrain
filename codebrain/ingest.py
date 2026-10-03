@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
-from codebrain import bmux, codex_control, cursor_archive, cursor_export
+from codebrain import bmux, claude_roots, codex_control, cursor_archive, cursor_export
 from codebrain.adapters import claude, codex, cursor, pi
 from codebrain.db import (
     cursor_head_is_newer,
@@ -62,8 +62,11 @@ def _add_stats(total: dict, stats: dict) -> None:
 # ---- discovery (top-level transcripts only; sub-agent files live deeper) ----
 
 def discover_claude_files(raw_root: Path):
-    projects = Path(raw_root) / "projects"
-    return sorted(projects.glob("*/*.jsonl")) if projects.is_dir() else []
+    root = Path(raw_root)
+    files = sorted((root / "projects").glob("*/*.jsonl"))
+    # Extra account homes are archived under profiles/<key>, on every machine.
+    files += sorted((root / "profiles").glob("*/projects/*/*.jsonl"))
+    return files
 
 
 def discover_codex_files(raw_root: Path):
@@ -449,8 +452,8 @@ def _source_jobs(source: str, machine: Optional[str], raw_root: Optional[Path] =
     """
     machine = _machine_for_root(source, raw_root, machine)
     if source == "claude":
-        root = raw_root or DEFAULT_CLAUDE_ROOT
-        return (discover_claude_files(root),
+        roots = [raw_root] if raw_root is not None else claude_roots.local_roots(DEFAULT_CLAUDE_ROOT)
+        return ([path for root in roots for path in discover_claude_files(root)],
                 lambda p: claude.parse_file(p, machine=machine), None)
     if source == "codex":
         root = raw_root or DEFAULT_CODEX_ROOT

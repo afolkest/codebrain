@@ -56,7 +56,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from codebrain import bmux, codex_control, cursor_provenance
+from codebrain import bmux, claude_roots, codex_control, cursor_provenance
 from codebrain.backfill_claude import DEFAULT_ORIGIN, backfill as backfill_claude
 from codebrain.collect import DEFAULT_POOL, LAUNCHD_LABEL, collect_all, install_launchd
 from codebrain.db import DEFAULT_DB, connect, has_fts5
@@ -1841,7 +1841,7 @@ def cmd_grep(args):
 
 def _default_grep_roots():
     roots = [
-        DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT,
+        *claude_roots.local_roots(DEFAULT_CLAUDE_ROOT), DEFAULT_CODEX_ROOT, DEFAULT_PI_ROOT,
     ]
     cursor_root = Path(DEFAULT_CURSOR_ROOT)
     if _is_nofollow_directory(cursor_root, cursor_root.parent):
