@@ -465,8 +465,14 @@ def _source_jobs(source: str, machine: Optional[str], raw_root: Optional[Path] =
             if uuid in titles:
                 parsed.session.title = titles[uuid]
 
-        return (groups,
-                lambda group: codex.parse_rollout_group(group, machine=machine), enrich)
+        def parse(group):
+            # `codex exec` runs are skipped like contentless files: _ingest records
+            # their stat, so refresh never reopens them until they change.
+            if codex.rollout_group_is_exec(group):
+                return None
+            return codex.parse_rollout_group(group, machine=machine)
+
+        return (groups, parse, enrich)
     if source == "pi":
         root = raw_root or DEFAULT_PI_ROOT
         return (discover_pi_files(root),
