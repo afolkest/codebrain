@@ -15,6 +15,9 @@ A sweep is a one-way valve with archive guarantees:
   descriptor-relative no-follow traversal, and create-only links.
 - **Never deletes evidence** — cleanup removes only age-gated collector-owned
   temp names; no source revision or pool evidence is pruned.
+- **No scripted Codex runs** — `codex exec` rollouts (structured session_meta
+  header, adapters/codex.py `rollout_is_exec`) are skipped, not pooled; a
+  machine-local memo keeps that from re-reading their headers every sweep.
 
 This is durability only. Freshness is refresh-on-read (ingest.refresh), which
 reads live homes and refreshes the local safe Cursor archive directly — a
@@ -22,6 +25,7 @@ periodic launchd sweep is plenty here.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import socket
@@ -33,6 +37,8 @@ from typing import Optional
 
 from codebrain import cursor_archive
 from codebrain import claude_roots
+from codebrain.adapters import codex as codex_adapter
+from codebrain.db import DEFAULT_DB
 from codebrain.ingest import (
     DEFAULT_CLAUDE_ROOT, DEFAULT_CODEX_ROOT, DEFAULT_CURSOR_ROOT, DEFAULT_PI_ROOT,
     SOURCES, export_local_cursor_archive,
@@ -40,6 +46,8 @@ from codebrain.ingest import (
 
 DEFAULT_POOL = Path.home() / "codebrain-pool"
 LAUNCHD_LABEL = "com.codebrain.collect"
+# Machine-local collector state. Never part of the pool: it is a cache, not evidence.
+COLLECT_STATE_DIR = DEFAULT_DB.parent / "collect"
 
 DEFAULT_ROOTS = {
     "claude": DEFAULT_CLAUDE_ROOT,
@@ -130,7 +138,7 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
         root = Path(raw_root or DEFAULT_ROOTS[source])
     dest_root = Path(pool_root) / "raw" / machine / source
     stats = {"files": 0, "new": 0, "updated": 0, "unchanged": 0, "shrunk": 0,
-             "errors": export_errors}
+             "skipped": 0, "errors": export_errors}
     if source == "cursor":
         return _collect_cursor_revisions(root, Path(pool_root), machine, stats)
     roots = claude_roots.local_roots(root) if source == "claude" and raw_root is None else [root]
@@ -140,16 +148,129 @@ def collect_source(source: str, raw_root: Optional[Path] = None,
     return stats
 
 
+_EXEC_MEMO_VERSION = 1  # bump when the exec rule changes: old verdicts are dropped
+
+
+def _is_rollout(rel: Path) -> bool:
+    return rel.parts[0] in ("sessions", "archived_sessions") and rel.suffix == ".jsonl"
+
+
+class _CodexExecMemo:
+    """Rollouts of one Codex home already found to be `codex exec` runs.
+
+    Exec runs are never pooled, so their pool path never exists and every sweep
+    would otherwise re-read their ~20 KB headers. The verdict follows ingest's
+    rule (adapters/codex.py `rollout_group_is_exec`): a session's root rollout
+    decides for all of its pages. Headers never change, so one structured read
+    per session suffices; this memo remembers skipped files. After a complete
+    sweep, entries whose file is no longer discovered are dropped.
+    """
+
+    def __init__(self, root: Path, files):
+        self.root = root
+        key = hashlib.sha256(os.path.abspath(os.fspath(root)).encode("utf-8")).hexdigest()
+        self.key = key[:16]
+        self.path = COLLECT_STATE_DIR / f"codex-exec-v{_EXEC_MEMO_VERSION}-{self.key}.txt"
+        _prune_stale_memo_parts(COLLECT_STATE_DIR)
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        self.loaded = {line for line in text.splitlines() if line}
+        self.seen: set = set()
+        self.verdicts: dict = {}  # session uuid -> exec?
+        # Root rollout copies per session, from filenames alone (no reads).
+        self.roots: dict = {}
+        for f in files:
+            if _is_rollout(f.relative_to(root)) and codex_adapter.rollout_is_root(f):
+                self.roots.setdefault(codex_adapter.rollout_session_uuid(f), []).append(f)
+
+    def known(self, rel: Path) -> bool:
+        key = rel.as_posix()
+        if key in self.loaded:
+            self.seen.add(key)
+            return True
+        return False
+
+    def check(self, f: Path, rel: Path) -> bool:
+        """Decide a new/changed rollout by its session root's header."""
+        if not _is_rollout(rel):
+            return False
+        session = codex_adapter.rollout_session_uuid(f)
+        verdict = self.verdicts.get(session)
+        if verdict is None:
+            roots = self.roots.get(session, [])
+            # No root on hand: keep (fail open), matching ingest.
+            verdict = bool(roots) and all(
+                root.relative_to(self.root).as_posix() in self.loaded
+                or codex_adapter.rollout_is_exec(root)
+                for root in roots
+            )
+            self.verdicts[session] = verdict
+        if verdict:
+            self.seen.add(rel.as_posix())
+        return verdict
+
+    def save(self, complete: bool = True) -> None:
+        # Only a complete sweep may forget entries; an interrupted one keeps them.
+        entries = self.seen if complete else self.loaded | self.seen
+        if entries == self.loaded:
+            return
+        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.part")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            for stale in self.path.parent.glob(f"codex-exec-*-{self.key}.txt"):
+                if stale != self.path:   # an older memo version for this root
+                    stale.unlink(missing_ok=True)
+            tmp.write_text("".join(f"{key}\n" for key in sorted(entries)),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            # Only a cache: losing it costs re-reading headers next sweep.
+            print(f"  ! could not save exec memo {self.path}: {exc}")
+            tmp.unlink(missing_ok=True)
+
+
+def _prune_stale_memo_parts(state_dir: Path, max_age_s: int = 3600) -> None:
+    cutoff = time.time() - max_age_s
+    try:
+        for p in state_dir.glob(".codex-exec-*.part"):
+            try:
+                if p.lstat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _collect_files(source: str, root: Path, dest_root: Path, stats: dict) -> None:
     if dest_root.is_dir():
         _prune_stale_parts(dest_root)
-    for f in discover(source, root):
+    files = discover(source, root)
+    exec_memo = _CodexExecMemo(root, files) if source == "codex" else None
+    complete = False
+    try:
+        _copy_files(source, root, dest_root, stats, files, exec_memo)
+        complete = True
+    finally:
+        if exec_memo is not None:
+            exec_memo.save(complete=complete)
+
+
+def _copy_files(source: str, root: Path, dest_root: Path, stats: dict, files,
+                exec_memo: Optional[_CodexExecMemo]) -> None:
+    for f in files:
         stats["files"] += 1
+        rel = f.relative_to(root)
+        if exec_memo is not None and exec_memo.known(rel):
+            stats["skipped"] += 1
+            continue
         try:
             sst = f.stat()
         except OSError:
             continue  # vanished between discovery and now; next sweep
-        dst = dest_root / f.relative_to(root)
+        dst = dest_root / rel
         try:
             dst_st = dst.stat()
         except OSError:
@@ -168,6 +289,10 @@ def _collect_files(source: str, root: Path, dest_root: Path, stats: dict) -> Non
                       f"{dst_st.st_size}B — keeping pool copy")
                 stats["shrunk"] += 1
                 continue
+        # Only new/changed files pay for a header read; unchanged ones never do.
+        if exec_memo is not None and exec_memo.check(f, rel):
+            stats["skipped"] += 1
+            continue
         # Dot-prefixed + per-process tmp: hidden from globs, and overlapping
         # sweeps (manual + launchd) can never write through the same tmp path.
         tmp = dst.with_name(f".{dst.name}.{os.getpid()}.part")
@@ -494,7 +619,8 @@ def _collector_part_destination(name: str) -> Optional[str]:
 
 def collect_all(sources=SOURCES, machine: Optional[str] = None,
                 pool_root: Path = DEFAULT_POOL, roots: Optional[dict] = None) -> dict:
-    total = {"files": 0, "new": 0, "updated": 0, "unchanged": 0, "shrunk": 0, "errors": 0}
+    total = {"files": 0, "new": 0, "updated": 0, "unchanged": 0, "shrunk": 0,
+             "skipped": 0, "errors": 0}
     for src in sources:
         stats = collect_source(src, (roots or {}).get(src), pool_root, machine)
         print(f"  {src}: " + ", ".join(f"{k}={v}" for k, v in stats.items()))

@@ -44,6 +44,10 @@ class TestPoolRefresh(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.pool = self.root / "pool"
         self.db_path = self.root / "codebrain.db"
+        # collect's exec memo must never land in the real ~/.codebrain
+        state = mock.patch("codebrain.collect.COLLECT_STATE_DIR", self.root / "collect-state")
+        state.start()
+        self.addCleanup(state.stop)
 
     def conn(self):
         c = db.connect(self.db_path)

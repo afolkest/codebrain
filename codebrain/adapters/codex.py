@@ -112,6 +112,76 @@ def _rollout_filename_ids(path: Path) -> tuple[str, str]:
     return session_uuid, fragment_uuid
 
 
+# `codex exec` stamps its rollouts in the structured session_meta header:
+# ``source == "exec"`` for the run itself, and ``originator == "codex_exec"``
+# for everything that process creates (including its guardian/subagent
+# threads, whose ``source`` is a subagent object). These are scripted runs
+# (eval harnesses, review bots), not sessions anyone works in — a single
+# harness can emit tens of thousands — so codebrain neither collects nor
+# ingests them.
+_EXEC_SOURCE = "exec"
+_EXEC_ORIGINATOR = "codex_exec"
+# session_meta is the first record of every rollout; tolerate a few leading
+# blank/odd lines but never scan a whole transcript looking for it.
+_HEADER_SCAN_LINES = 4
+
+
+def _leading_session_meta(path: Path) -> Optional[dict]:
+    """The rollout's leading ``session_meta`` payload, or None if it has none."""
+    with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+        for _ in range(_HEADER_SCAN_LINES):
+            line = handle.readline()
+            if not line:
+                return None
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("type") == "session_meta":
+                payload = record.get("payload")
+                return payload if isinstance(payload, dict) else None
+    return None
+
+
+def rollout_is_exec(path: Path) -> bool:
+    """Whether a rollout's structured header marks it as a `codex exec` run.
+
+    Fails open: an unreadable or headerless file is kept, never dropped.
+    """
+    try:
+        payload = _leading_session_meta(path)
+    except OSError:
+        return False
+    if payload is None:
+        return False
+    return payload.get("source") == _EXEC_SOURCE \
+        or payload.get("originator") == _EXEC_ORIGINATOR
+
+
+def rollout_is_root(path: Path) -> bool:
+    """Whether a rollout file is its logical session's root (not a later page)."""
+    session_uuid, fragment_uuid = _rollout_filename_ids(Path(path))
+    return session_uuid == fragment_uuid
+
+
+def rollout_session_uuid(path: Path) -> str:
+    return _rollout_filename_ids(Path(path))[0]
+
+
+def rollout_group_is_exec(group: "RolloutGroup") -> bool:
+    """A logical session is an exec run when its root rollout says so.
+
+    Continuation pages inherit the root's verdict, so the collector (which sees
+    files one at a time) and ingest (which sees whole groups) agree. With no
+    root file on hand the session is kept (fail open).
+    """
+    roots = [path for path in group.paths if rollout_is_root(path)]
+    return bool(roots) and all(rollout_is_exec(path) for path in roots)
+
+
 def _fragment_header(path: Path) -> RolloutFragment:
     """Read only enough source JSON to identify a physical rollout fragment."""
     filename_session, fragment_uuid = _rollout_filename_ids(path)
@@ -244,6 +314,8 @@ def rollout_group_needs_upgrade(group: RolloutGroup) -> bool:
     shape the older adapter skipped. This one-time scanner deliberately does not
     classify from prompt text.
     """
+    if rollout_group_is_exec(group):
+        return False  # never ingested, so never upgraded — and never read in full
     if group.is_paginated:
         return True
     for path in group.paths:

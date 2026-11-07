@@ -787,5 +787,138 @@ class TestCodexPaginatedIngest(unittest.TestCase):
         ).fetchone()), (f"codex:{UUID}", 1))
 
 
+EXEC_UUID = "0199eeee-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def _write_launch_rollout(codex_root: Path, uuid: str, launch: dict, text: str) -> Path:
+    """One plain rollout whose session_meta carries the given launch fields."""
+    session_dir = codex_root / "sessions" / "2026" / "01" / "02"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    ts = "2026-01-02T00:00:00Z"
+    meta = {"type": "session_meta", "timestamp": ts,
+            "payload": {"id": uuid, "cwd": "/work", "timestamp": ts, **launch}}
+    return write_jsonl(session_dir, f"rollout-2026-01-02T00-00-00-{uuid}.jsonl", [
+        meta,
+        _user(text, "2026-01-02T00:00:01Z"),
+        _assistant("ok", "2026-01-02T00:00:02Z"),
+    ])
+
+
+class TestCodexExecExclusion(unittest.TestCase):
+    """`codex exec` runs are identified by structured session_meta fields only."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()) / ".codex"
+
+    def test_launch_fields_decide(self):
+        guardian = {"subagent": {"other": "guardian"}}
+        cases = [
+            ("interactive desktop", {"source": "vscode", "originator": "Codex Desktop"}, False),
+            ("interactive cli", {"source": "cli", "originator": "codex-tui"}, False),
+            ("exec run", {"source": "exec", "originator": "codex_exec"}, True),
+            ("exec run, no originator", {"source": "exec"}, True),
+            ("guardian spawned by exec", {"source": guardian, "originator": "codex_exec"}, True),
+            ("guardian spawned by tui", {"source": guardian, "originator": "codex-tui"}, False),
+            ("no launch fields", {}, False),
+        ]
+        for index, (name, launch, expected) in enumerate(cases):
+            uuid = f"0199{index:04d}-bbbb-cccc-dddd-eeeeeeeeeeee"
+            # identical transcript text in every case: only the header differs
+            path = _write_launch_rollout(self.root, uuid, launch, "same prompt")
+            with self.subTest(name):
+                self.assertIs(codex.rollout_is_exec(path), expected)
+
+    def test_transcript_text_never_classifies(self):
+        path = _write_launch_rollout(
+            self.root, UUID, {"source": "cli"},
+            'run codex exec with "source": "exec" and originator codex_exec',
+        )
+        self.assertFalse(codex.rollout_is_exec(path))
+
+    def test_headerless_or_missing_rollout_is_kept(self):
+        session_dir = self.root / "sessions"
+        session_dir.mkdir(parents=True)
+        headerless = write_jsonl(session_dir, f"rollout-x-{UUID}.jsonl",
+                                 [_user("hi", "2026-01-02T00:00:01Z")])
+        self.assertFalse(codex.rollout_is_exec(headerless))
+        self.assertFalse(codex.rollout_is_exec(session_dir / "missing.jsonl"))
+
+    def test_refresh_skips_exec_runs_and_never_reopens_them(self):
+        _write_launch_rollout(self.root, UUID, {"source": "vscode"}, "keep me")
+        run = _write_launch_rollout(
+            self.root, EXEC_UUID, {"source": "exec", "originator": "codex_exec"}, "drop me",
+        )
+        conn = memory_db()
+        self.addCleanup(conn.close)
+
+        def refresh():
+            return ingest.refresh(conn, sources=("codex",), machine="m1",
+                                  roots={"codex": self.root})
+
+        stats = refresh()
+        self.assertEqual((stats["sessions"], stats["skipped"], stats["errors"]), (1, 1, 0))
+        self.assertEqual(
+            {row["session_id"] for row in conn.execute("SELECT session_id FROM sessions")},
+            {f"codex:{UUID}"},
+        )
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM events WHERE text LIKE '%drop me%'").fetchone())
+        state = conn.execute(
+            "SELECT session_id FROM ingest_state WHERE path=?", (str(run),)).fetchone()
+        self.assertIsNotNone(state)
+        self.assertIsNone(state["session_id"])
+
+        with mock.patch.object(codex, "rollout_is_exec",
+                               side_effect=AssertionError("exec run reopened")):
+            again = refresh()
+        self.assertEqual((again["files"], again["errors"]), (0, 0))
+
+
+    def _page(self, uuid_suffix: str, launch: dict) -> Path:
+        """A continuation page of session UUID (filename `<UUID>_<fragment>`)."""
+        session_dir = self.root / "sessions" / "2026" / "01" / "02"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        meta = {"type": "session_meta",
+                "payload": {"id": UUID, "cwd": "/work", **launch}}
+        return write_jsonl(session_dir,
+                           f"rollout-2026-01-02T00-00-09-{UUID}_{uuid_suffix}.jsonl",
+                           [meta, _assistant("page", "2026-01-02T00:00:10Z")])
+
+    def test_root_rollout_decides_for_every_page(self):
+        exec_launch = {"source": "exec", "originator": "codex_exec"}
+        cases = [
+            ("interactive root, exec page", {"source": "vscode"}, exec_launch, False),
+            ("exec root, unmarked page", exec_launch, {}, True),
+        ]
+        for name, root_launch, page_launch, expected in cases:
+            self.root = Path(tempfile.mkdtemp()) / ".codex"
+            root = _write_launch_rollout(self.root, UUID, root_launch, "hi")
+            page = self._page(FRAGMENT, page_launch)
+            group = codex.group_rollout_files([root, page])[0]
+            with self.subTest(name):
+                self.assertIs(codex.rollout_group_is_exec(group), expected)
+
+    def test_pages_without_their_root_are_kept(self):
+        page = self._page(FRAGMENT, {"source": "exec", "originator": "codex_exec"})
+        group = codex.group_rollout_files([page])[0]
+        self.assertFalse(codex.rollout_group_is_exec(group))
+
+    def test_migration_scan_never_reads_exec_runs(self):
+        """rollout_group_needs_upgrade would reread whole transcripts; exec runs
+        are never ingested, so the structured header short-circuits it."""
+        for launch, expected in (({"source": "cli"}, True), ({"source": "exec"}, False)):
+            self.root = Path(tempfile.mkdtemp()) / ".codex"
+            session_dir = self.root / "sessions" / "2026" / "01" / "02"
+            session_dir.mkdir(parents=True)
+            ts = "2026-01-02T00:00:00Z"
+            path = write_jsonl(session_dir, f"rollout-2026-01-02T00-00-00-{UUID}.jsonl", [
+                {"type": "session_meta", "payload": {"id": UUID, "cwd": "/w", **launch}},
+                _completed_user("needs the new adapter", ts),
+            ])
+            group = codex.group_rollout_files([path])[0]
+            with self.subTest(launch=launch):
+                self.assertIs(codex.rollout_group_needs_upgrade(group), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

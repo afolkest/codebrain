@@ -32,6 +32,10 @@ class CollectBase(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
         self.pool = Path(tempfile.mkdtemp())
+        self.state = Path(tempfile.mkdtemp())   # never the real ~/.codebrain
+        patcher = mock.patch.object(collect, "COLLECT_STATE_DIR", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def sweep(self, source="pi"):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -204,6 +208,105 @@ class TestAllowlists(CollectBase):
         self.assertIn("rollout-a.jsonl", names)
         self.assertNotIn("auth.json", names)
         self.assertNotIn("logs_2.sqlite", names)
+
+
+KEEP_UUID = "0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+RUN_UUID = "0199bbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def _codex_rollout(home: Path, uuid: str, launch: dict) -> Path:
+    d = home / "sessions" / "2026" / "01" / "02"
+    d.mkdir(parents=True, exist_ok=True)
+    return write_jsonl(d, f"rollout-2026-01-02T00-00-00-{uuid}.jsonl", [
+        {"type": "session_meta", "payload": {"id": uuid, "cwd": "/work", **launch}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "hi"}},
+    ])
+
+
+class TestCodexExecSkip(CollectBase):
+    """`codex exec` runs (structured session_meta) are never pooled."""
+
+    def test_exec_runs_are_not_pooled(self):
+        keep = _codex_rollout(self.home, KEEP_UUID, {"source": "vscode"})
+        run = _codex_rollout(self.home, RUN_UUID,
+                             {"source": "exec", "originator": "codex_exec"})
+        stats = self.sweep(source="codex")
+        self.assertEqual((stats["files"], stats["new"], stats["skipped"], stats["errors"]),
+                         (2, 1, 1, 0))
+        self.assertTrue(self.pooled(keep.relative_to(self.home), "codex").is_file())
+        self.assertFalse(self.pooled(run.relative_to(self.home), "codex").exists())
+
+    def test_memo_spares_header_reads_and_forgets_deleted_runs(self):
+        run = _codex_rollout(self.home, RUN_UUID, {"source": "exec"})
+        self.sweep(source="codex")
+        memo = list(self.state.glob("codex-exec-*.txt"))
+        self.assertEqual(len(memo), 1)
+        self.assertEqual(memo[0].read_text(encoding="utf-8").split(),
+                         [run.relative_to(self.home).as_posix()])
+        with mock.patch.object(collect.codex_adapter, "rollout_is_exec",
+                               side_effect=AssertionError("header re-read")):
+            stats = self.sweep(source="codex")
+        self.assertEqual((stats["skipped"], stats["new"]), (1, 0))
+        run.unlink()
+        self.sweep(source="codex")
+        self.assertEqual(memo[0].read_text(encoding="utf-8"), "")
+
+    def test_unchanged_files_never_pay_for_a_header_read(self):
+        _codex_rollout(self.home, KEEP_UUID, {"source": "vscode"})
+        self.sweep(source="codex")
+        with mock.patch.object(collect.codex_adapter, "rollout_is_exec",
+                               side_effect=AssertionError("header read")):
+            stats = self.sweep(source="codex")
+        self.assertEqual(stats["unchanged"], 1)
+
+    def _page(self, uuid: str, fragment: str, launch: dict) -> Path:
+        d = self.home / "sessions" / "2026" / "01" / "03"
+        d.mkdir(parents=True, exist_ok=True)
+        return write_jsonl(d, f"rollout-2026-01-03T00-00-00-{uuid}_{fragment}.jsonl", [
+            {"type": "session_meta", "payload": {"id": uuid, "cwd": "/work", **launch}},
+        ])
+
+    def test_session_root_decides_for_its_pages(self):
+        """Same rule as ingest: per file here, per logical session there."""
+        exec_launch = {"source": "exec", "originator": "codex_exec"}
+        keep_root = _codex_rollout(self.home, KEEP_UUID, {"source": "vscode"})
+        keep_page = self._page(KEEP_UUID, "0199cccc-1111-2222-3333-444444444444",
+                               exec_launch)
+        run_root = _codex_rollout(self.home, RUN_UUID, exec_launch)
+        run_page = self._page(RUN_UUID, "0199dddd-1111-2222-3333-444444444444", {})
+        stats = self.sweep(source="codex")
+        self.assertEqual((stats["new"], stats["skipped"]), (2, 2))
+        for kept in (keep_root, keep_page):
+            self.assertTrue(self.pooled(kept.relative_to(self.home), "codex").is_file())
+        for skipped in (run_root, run_page):
+            self.assertFalse(self.pooled(skipped.relative_to(self.home), "codex").exists())
+
+    def test_interrupted_sweep_never_forgets_memo_entries(self):
+        run = _codex_rollout(self.home, RUN_UUID, {"source": "exec"})
+        self.sweep(source="codex")
+        memo = next(self.state.glob("codex-exec-*.txt"))
+        before = memo.read_text(encoding="utf-8")
+        _codex_rollout(self.home, KEEP_UUID, {"source": "vscode"})
+        # KEEP sorts before RUN, so the sweep dies before revisiting the run
+        with mock.patch.object(collect.shutil, "copy2", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sweep(source="codex")
+        self.assertEqual(memo.read_text(encoding="utf-8"), before)
+        self.assertIn(run.relative_to(self.home).as_posix(), before)
+
+    def test_existing_pool_copy_of_a_run_is_left_alone(self):
+        """The collector still never deletes: a run pooled before the filter
+        existed stays until removed deliberately, and is no longer updated."""
+        run = _codex_rollout(self.home, RUN_UUID, {"source": "exec"})
+        dst = self.pooled(run.relative_to(self.home), "codex")
+        dst.parent.mkdir(parents=True)
+        dst.write_bytes(run.read_bytes())
+        with open(run, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {}}) + "\n")
+        stats = self.sweep(source="codex")
+        self.assertEqual((stats["skipped"], stats["updated"]), (1, 0))
+        self.assertTrue(dst.is_file())
+        self.assertLess(dst.stat().st_size, run.stat().st_size)
 
 
 class TestPoolAsIngestRoot(CollectBase):
