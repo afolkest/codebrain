@@ -881,6 +881,20 @@ class TestCursorCollectionIntegration(unittest.TestCase):
                 )
                 self.assertEqual(set(outside.iterdir()), {victim, owned_victim})
 
+    def test_machine_without_cursor_leaves_symlinked_pool_untouched(self):
+        # A Mac without Cursor, whose pool is a symlink onto an external drive:
+        # with nothing to publish, collection must not open the pool at all.
+        target = self.root / "external-pool"
+        target.mkdir()
+        self.pool.symlink_to(target, target_is_directory=True)
+        with mock.patch.object(ingest, "DEFAULT_CURSOR_DB", self.root / "no.vscdb"), \
+             mock.patch.object(ingest, "DEFAULT_CURSOR_ROOT", self.archive), \
+             mock.patch("codebrain.ingest.cursor_archive.export_cursor") as export:
+            stats = collect.collect_source("cursor", pool_root=self.pool, machine="mini")
+        export.assert_not_called()
+        self.assertEqual((stats["files"], stats["errors"]), (0, 0))
+        self.assertEqual(list(target.iterdir()), [])
+
     def test_stale_prune_removes_only_owned_cursor_temp_names(self):
         revision = cursor_archive.publish_snapshot(_snapshot(), self.archive)
         collect.collect_source(
