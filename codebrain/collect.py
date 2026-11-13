@@ -318,6 +318,12 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 def _collect_cursor_revisions(root: Path, pool_root: Path, machine: str,
                               stats: dict) -> dict:
     """Create-only Cursor replication anchored beneath a no-follow pool fd."""
+    revisions = discover("cursor", root)
+    if not revisions:
+        # Nothing to publish (e.g. Cursor isn't installed here): leave the pool
+        # untouched, so a machine without Cursor never trips the no-follow
+        # destination checks — say, when its pool sits behind a symlink.
+        return stats
     destination_fd = None
     try:
         try:
@@ -331,7 +337,7 @@ def _collect_cursor_revisions(root: Path, pool_root: Path, machine: str,
             stats["errors"] += 1
             return stats
 
-        for source_path in discover("cursor", root):
+        for source_path in revisions:
             stats["files"] += 1
             try:
                 revision_bytes = cursor_archive.read_revision_bytes(source_path)
